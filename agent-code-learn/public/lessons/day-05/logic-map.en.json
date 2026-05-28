@@ -1,0 +1,513 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 5 · Bash + Permission Engine",
+  "subtitle": "This map focuses on Day 5's harness boundaries: every tool_use becomes a PermissionRequest, the permission engine returns allow / ask / deny, and bash, ask_user_question, and background jobs all pass through the same gate.",
+  "diagrams": [
+    {
+      "id": "permission-gate",
+      "label": "Permission gate",
+      "title": "Every tool passes through one permission gate",
+      "summary": "Day 5 turns Day 4's edit-only interceptor into a general permission gate: the model only proposes a tool_use, and agent.py wraps it into PermissionRequest before tools.run.",
+      "defaultActiveNodeId": "decide",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "bash / file_edit / web",
+          "detail": "The model only names a tool and arguments. It cannot directly run shell commands, write files, or access the outside network.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "request",
+          "kind": "data",
+          "label": "PermissionRequest",
+          "eyebrow": "agent.py",
+          "body": "tool_name + args + mode",
+          "detail": "The Agent Loop wraps each tool_use into PermissionRequest, including the current cwd and permission_mode.",
+          "position": { "x": 280, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "decide",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "harness gate",
+          "body": "triage before tools.run",
+          "detail": "This is Day 5's core boundary: read-only tools, dangerous bash, ask tools, and all three permission modes are routed here.",
+          "position": { "x": 560, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "decision",
+          "kind": "data",
+          "label": "PermissionDecision",
+          "eyebrow": "allow / ask / deny",
+          "body": "behavior + optional reason",
+          "detail": "The permission engine only returns a verdict. Executing tools, asking for confirmation, or returning an error observation still happens in the Agent Loop.",
+          "position": { "x": 840, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "prompt-ui",
+          "kind": "runtime",
+          "label": "prompt_ui",
+          "eyebrow": "ask",
+          "body": "preview + y/N",
+          "detail": "This general ask branch renders command previews, diffs, or network-access confirmation. ask_user_question uses a separate menu branch and does not reach tools.run.",
+          "position": { "x": 560, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "allow",
+          "body": "execute approved tool",
+          "detail": "The harness calls the real tool function only on the allow branch, or after the ask branch receives explicit confirmation.",
+          "position": { "x": 840, "y": 330 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "error-result",
+          "kind": "response",
+          "label": "error ToolResult",
+          "eyebrow": "deny / rejected",
+          "body": "structured observation",
+          "detail": "Dangerous commands, write attempts in plan mode, and rejected confirmations all become is_error=True observations for the model.",
+          "position": { "x": 280, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "stdout or tool output",
+          "detail": "Tool results are appended back into messages, so the model can only continue from the observation.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-request", "source": "tool-use", "target": "request", "label": "wrap", "mobileLabel": "" },
+        { "id": "request-decide", "source": "request", "target": "decide", "label": "check", "mobileLabel": "" },
+        { "id": "decide-decision", "source": "decide", "target": "decision", "label": "returns", "mobileLabel": "" },
+        { "id": "decision-run", "source": "decision", "target": "tools-run", "label": "allow", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "decision-prompt", "source": "decision", "target": "prompt-ui", "label": "ask", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "decision-error", "source": "decision", "target": "error-result", "label": "deny", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "prompt-run", "source": "prompt-ui", "target": "tools-run", "label": "confirmed", "mobileLabel": "", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "prompt-error", "source": "prompt-ui", "target": "error-result", "label": "rejected", "mobileLabel": "", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "run-result", "source": "tools-run", "target": "result", "label": "ToolResult", "mobileLabel": "", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "bash-safety",
+      "label": "Bash safety",
+      "title": "How bash moves from preview to execution",
+      "summary": "bash is a high-risk tool: dangerous commands are blocked by regex first; normal commands show a command preview and only reach bash_runner.run_sync after y.",
+      "defaultActiveNodeId": "patterns",
+      "nodes": [
+        {
+          "id": "bash-call",
+          "kind": "response",
+          "label": "bash tool_use",
+          "eyebrow": "model",
+          "body": "command + timeout + background",
+          "detail": "The model only proposes a shell string and arguments. background=True changes execution style, not the permission policy.",
+          "position": { "x": 0, "y": 100 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "patterns",
+          "kind": "data",
+          "label": "_DANGEROUS_PATTERNS",
+          "eyebrow": "deny list",
+          "body": "rm -rf / sudo / git push ...",
+          "detail": "The permission engine checks dangerous-command patterns before any confirmation UI. A match denies the command immediately.",
+          "position": { "x": 300, "y": 100 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "denied",
+          "kind": "response",
+          "label": "deny ToolResult",
+          "eyebrow": "blocked",
+          "body": "Dangerous command blocked",
+          "detail": "For example, git push --force origin main short-circuits to an error observation and never shows a command preview.",
+          "position": { "x": 600, "y": 0 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "confirm_command",
+          "eyebrow": "ask",
+          "body": "show command preview",
+          "detail": "Normal bash still asks for confirmation in default and acceptEdits modes. acceptEdits affects file edits, not shell commands.",
+          "position": { "x": 600, "y": 200 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "runner",
+          "kind": "tool",
+          "label": "bash_runner.run_sync",
+          "eyebrow": "tool runtime",
+          "body": "subprocess.run(cwd=ctx.cwd)",
+          "detail": "The harness tool function actually runs shell. It uses a minimal env, pins cwd to the project, enforces timeout, and truncates output.",
+          "position": { "x": 900, "y": 200 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "process",
+          "kind": "output",
+          "label": "child process",
+          "eyebrow": "world",
+          "body": "stdout / stderr / exit code",
+          "detail": "The command result is collected as text. Non-zero exits include the exit code; long output is shortened by truncate_output.",
+          "position": { "x": 900, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "command output",
+          "detail": "The model sees an observation, not direct terminal control. Any test analysis or follow-up command starts from this result.",
+          "position": { "x": 600, "y": 420 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "bash-patterns", "source": "bash-call", "target": "patterns", "label": "inspect" },
+        { "id": "patterns-denied", "source": "patterns", "target": "denied", "label": "match", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "patterns-confirm", "source": "patterns", "target": "confirm", "label": "safe enough", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-runner", "source": "confirm", "target": "runner", "label": "y", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "runner-process", "source": "runner", "target": "process", "label": "spawn", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "process-result", "source": "process", "target": "result", "label": "capture", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-reject", "source": "confirm", "target": "result", "label": "n -> error", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "permission-modes",
+      "label": "Permission modes",
+      "title": "How --permission-mode changes decisions",
+      "summary": "Day 5 modes are hard constraints, not prompt hints: _ASK_TOOLS ask first; default asks for writes, acceptEdits only skips file-edit confirmation, and plan denies writes plus local execution.",
+      "defaultActiveNodeId": "plan",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "--permission-mode",
+          "detail": "The CLI passes default / acceptEdits / plan into run_agent, then into each PermissionRequest.",
+          "position": { "x": 0, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "decide",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "mode triage",
+          "body": "readonly / ask / write policy",
+          "detail": "Permission mode takes effect here. The code checks _ASK_TOOLS before the plan branch, so ask_user_question can still ask in plan mode.",
+          "position": { "x": 300, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "ask-tools",
+          "kind": "data",
+          "label": "_ASK_TOOLS",
+          "eyebrow": "ask first",
+          "body": "ask_user_question / web_*",
+          "detail": "_ASK_TOOLS returns ask before the plan check. ask_user_question opens a menu; web_fetch / web_search tell the user the Agent wants network access.",
+          "position": { "x": 600, "y": 0 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "ask-ui",
+          "kind": "runtime",
+          "label": "prompt_ui",
+          "eyebrow": "ask",
+          "body": "menu or confirmation",
+          "detail": "This branch is not write permission. ask_user_question constructs ToolResult directly; web tools run only after user confirmation.",
+          "position": { "x": 900, "y": 0 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "readonly",
+          "kind": "data",
+          "label": "_READONLY_TOOLS",
+          "eyebrow": "always allow",
+          "body": "read_file / grep / git_status",
+          "detail": "The read-only allowlist can run directly in all three modes. It stays separate from _ASK_TOOLS so network access is not treated as local read-only work.",
+          "position": { "x": 600, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "default",
+          "kind": "data",
+          "label": "default",
+          "eyebrow": "ask writes",
+          "body": "write / bash ask",
+          "detail": "In default mode, non-read-only and non-dangerous writes or local execution go through ask. Only confirmation can move them to tools.run.",
+          "position": { "x": 600, "y": 280 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "accept",
+          "kind": "data",
+          "label": "acceptEdits",
+          "eyebrow": "edit fast path",
+          "body": "file_write / file_edit allow",
+          "detail": "acceptEdits only skips the file-edit confirmation UI. Day 4 checks still run: read-before-edit, mtime conflicts, and unique replacement.",
+          "position": { "x": 600, "y": 420 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        },
+        {
+          "id": "plan",
+          "kind": "data",
+          "label": "plan",
+          "eyebrow": "deny writes",
+          "body": "deny writes + local exec",
+          "detail": "plan mode denies writes and local execution, including file_write, file_edit, bash, and local write tools; _ASK_TOOLS already returned ask earlier.",
+          "position": { "x": 300, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 540 }
+        },
+        {
+          "id": "run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "allowed",
+          "body": "execute after policy",
+          "detail": "Read-only allow, acceptEdits edit allow, and default ask after confirmation all eventually reach the real tool function.",
+          "position": { "x": 900, "y": 220 },
+          "mobilePosition": { "x": 0, "y": 720 }
+        },
+        {
+          "id": "blocked",
+          "kind": "response",
+          "label": "error ToolResult",
+          "eyebrow": "blocked",
+          "body": "mode policy denied",
+          "detail": "A write request in plan mode returns an error observation, nudging the model to analyze read-only or ask the user to switch modes.",
+          "position": { "x": 900, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 720 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-decide", "source": "cli", "target": "decide", "label": "mode" },
+        { "id": "decide-ask-tools", "source": "decide", "target": "ask-tools", "label": "ask tools", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "ask-tools-ui", "source": "ask-tools", "target": "ask-ui", "label": "ask", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-readonly", "source": "decide", "target": "readonly", "label": "read-only", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-default", "source": "decide", "target": "default", "label": "default", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-accept", "source": "decide", "target": "accept", "label": "acceptEdits", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-plan", "source": "decide", "target": "plan", "label": "plan", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "readonly-run", "source": "readonly", "target": "run", "label": "allow", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "default-run", "source": "default", "target": "run", "label": "ask + y", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "accept-run", "source": "accept", "target": "run", "label": "allow edit", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "plan-blocked", "source": "plan", "target": "blocked", "label": "deny", "sourceHandle": "source-right", "targetHandle": "target-left" }
+      ]
+    },
+    {
+      "id": "human-background",
+      "label": "Human + background",
+      "title": "User questions and background bash are harness branches",
+      "summary": "ask_user_question opens a menu and constructs ToolResult inside the harness; bash(background=True) starts a subprocess via bg_manager and writes output to .bg files for later polling.",
+      "defaultActiveNodeId": "prompt-choice",
+      "nodes": [
+        {
+          "id": "ask-call",
+          "kind": "response",
+          "label": "ask_user_question",
+          "eyebrow": "tool_use",
+          "body": "prompt + options",
+          "detail": "When the model needs the user's decision, it proposes ask_user_question. It is a first-class tool, not a slash command.",
+          "position": { "x": 0, "y": 60 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "ask-gate",
+          "kind": "runtime",
+          "label": "permission gate",
+          "eyebrow": "ask branch",
+          "body": "decision.behavior == ask",
+          "detail": "ask_user_question is not in the read-only allowlist, but its ask branch is a choice menu rather than a y/N confirmation.",
+          "position": { "x": 300, "y": 60 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "prompt-choice",
+          "kind": "runtime",
+          "label": "prompt_single_choice",
+          "eyebrow": "human input",
+          "body": "numbered menu",
+          "detail": "The harness pauses the Agent Loop, waits for 1/2/3, then sends the selected label back as the tool result.",
+          "position": { "x": 600, "y": 60 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "ask-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "selected option",
+          "body": "choice label",
+          "detail": "ask_user_question's entire job is to collect an answer, so this branch does not call tools.run.",
+          "position": { "x": 900, "y": 60 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "bg-call",
+          "kind": "response",
+          "label": "bash background=True",
+          "eyebrow": "tool_use",
+          "body": "long-running command",
+          "detail": "Background bash still passes through the same permission engine; background=True is not a permission bypass.",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "bg-gate",
+          "kind": "runtime",
+          "label": "permission gate",
+          "eyebrow": "same policy",
+          "body": "dangerous check + confirm",
+          "detail": "Long commands such as sleep or npm run build follow the same policy as synchronous bash: dangerous commands deny, normal commands ask.",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "start",
+          "kind": "tool",
+          "label": "start_background",
+          "eyebrow": "bg_manager",
+          "body": "Popen + daemon thread",
+          "detail": "The tool starts a subprocess and returns immediately, so the Agent Loop is not blocked. stdout and stderr stream to .bg.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "bg-files",
+          "kind": "data",
+          "label": ".bg/<id>.out/.err",
+          "eyebrow": "output files",
+          "body": "background_id + pid",
+          "detail": "The observation gives the model a background_id, pid, and output paths. The files may be empty at first.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        },
+        {
+          "id": "later-cat",
+          "kind": "tool",
+          "label": "later bash cat",
+          "eyebrow": "follow-up",
+          "body": "read .bg output",
+          "detail": "The model later calls bash(\"cat .bg/<id>.out\") or bash(\"kill <pid>\") to inspect or stop the background job.",
+          "position": { "x": 900, "y": 520 },
+          "mobilePosition": { "x": 0, "y": 760 }
+        }
+      ],
+      "edges": [
+        { "id": "ask-gate-edge", "source": "ask-call", "target": "ask-gate", "label": "wrap" },
+        { "id": "gate-choice", "source": "ask-gate", "target": "prompt-choice", "label": "menu" },
+        { "id": "choice-result", "source": "prompt-choice", "target": "ask-result", "label": "selected" },
+        { "id": "bg-gate-edge", "source": "bg-call", "target": "bg-gate", "label": "wrap" },
+        { "id": "bg-start", "source": "bg-gate", "target": "start", "label": "confirmed" },
+        { "id": "start-files", "source": "start", "target": "bg-files", "label": "write streams" },
+        { "id": "files-cat", "source": "bg-files", "target": "later-cat", "label": "query later", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "official-background-lifecycle",
+      "label": "Background lifecycle",
+      "title": "What a full background-task lifecycle looks like",
+      "summary": "Production background bash is not just starting a thread. It is a task lifecycle: the same Bash tool enters background mode, the harness registers a task, streams output, returns a task id immediately, and later reads, cancels, or notifies through that id.",
+      "defaultActiveNodeId": "local-task",
+      "nodes": [
+        {
+          "id": "background-call",
+          "kind": "response",
+          "label": "Bash tool_use",
+          "eyebrow": "model",
+          "body": "run_in_background: true",
+          "detail": "The production shape is not a separate bg tool. It is the same Bash tool with a background flag. The teaching version calls this background=True.",
+          "position": { "x": 0, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission-gate",
+          "kind": "runtime",
+          "label": "Permission gate",
+          "eyebrow": "harness",
+          "body": "same bash policy",
+          "detail": "Background mode does not bypass permission. Dangerous commands still deny first, normal commands still ask; the difference is that a confirmed command does not block until completion.",
+          "position": { "x": 260, "y": 140 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "local-task",
+          "kind": "runtime",
+          "label": "LocalShellTask",
+          "eyebrow": "task registry",
+          "body": "task id + process handle",
+          "detail": "A full lifecycle needs a task object: task id, process handle, output path, and running status. Without this registry, status, cancel, and completion notifications are hard to build.",
+          "position": { "x": 520, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "output-file",
+          "kind": "data",
+          "label": "task output file",
+          "eyebrow": "disk output",
+          "body": "stream stdout/stderr",
+          "detail": "Output streams into a task file. The model does not need to wait for process exit; it can read the file later. Day 5 approximates this with .bg/<id>.out and .bg/<id>.err.",
+          "position": { "x": 780, "y": 140 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "immediate return",
+          "body": "backgroundTaskId + path",
+          "detail": "A successful background launch immediately returns the task id and output path, so the model knows what to inspect later instead of blocking on the current tool call.",
+          "position": { "x": 520, "y": 380 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "follow-up",
+          "kind": "tool",
+          "label": "read / cancel",
+          "eyebrow": "later actions",
+          "body": "read output or kill task",
+          "detail": "The full system uses the task id for later actions: read output, inspect status, or cancel. The official shape does not expose separate bg_read/bg_cancel tools; Day 5 uses cat output file or kill pid.",
+          "position": { "x": 780, "y": 380 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "notification",
+          "kind": "response",
+          "label": "completion notification",
+          "eyebrow": "task done",
+          "body": "message back to model",
+          "detail": "A complete lifecycle can notify the model when a task finishes. Day 5 does not implement a notification queue; it keeps the minimal model-pulls-output path.",
+          "position": { "x": 260, "y": 380 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "bg-permission", "source": "background-call", "target": "permission-gate", "label": "check" },
+        { "id": "permission-task", "source": "permission-gate", "target": "local-task", "label": "confirmed" },
+        { "id": "task-output", "source": "local-task", "target": "output-file", "label": "stream output" },
+        { "id": "task-result", "source": "local-task", "target": "tool-result", "label": "return id", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "result-follow-up", "source": "tool-result", "target": "follow-up", "label": "later", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "output-follow-up", "source": "output-file", "target": "follow-up", "label": "read file", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "task-notification", "source": "local-task", "target": "notification", "label": "done", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    }
+  ]
+}

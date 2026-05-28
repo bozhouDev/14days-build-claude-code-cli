@@ -1,0 +1,415 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 2 · Real model + tool_use / tool_result",
+  "subtitle": "A compact map of Day 2's core changes: a real Provider, Anthropic content blocks, and tool_result returning as the next user message.",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "The real-model tool-calling loop",
+      "summary": "The prompt enters messages, AnthropicProvider returns tool_use, ToolRegistry runs system_date, tool_result returns to messages, and the model produces final text.",
+      "defaultActiveNodeId": "provider",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "parse prompt",
+          "detail": "CLI Runtime still only catches user input. Day 2 changes the provider and the messages protocol shape, not the CLI boundary.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "role='user'",
+          "detail": "messages is the context sent to the Messages API. The first round has only the user question; after tool execution, it also contains assistant tool_use and user tool_result.",
+          "position": { "x": 300, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "provider",
+          "body": "messages.create(...)",
+          "detail": "AnthropicProvider is only a protocol adapter: it sends messages and tool schemas to an Anthropic-compatible API, then translates content blocks into the internal ModelResponse. It does not execute tools.",
+          "position": { "x": 600, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "tool_use",
+          "body": "tool_call: system_date",
+          "detail": "The model sees the system_date input_schema, knows it has no wall clock, and returns a tool_use content block. This is a proposal, not execution.",
+          "position": { "x": 900, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run system_date",
+          "detail": "The harness-side ToolRegistry is what actually executes system_date. Day 2 still only does registry lookup; permission checks arrive in Day 5.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "current datetime",
+          "detail": "ToolResult stores the system_date return value. The next step is not role='tool'; it is a tool_result content block inside the next user message.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "final answer",
+          "detail": "After the second complete(messages), the model reads the tool_result and returns final text. The CLI prints final and the Agent Loop exits.",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "cli-messages",
+          "source": "cli",
+          "target": "messages",
+          "label": "prompt"
+        },
+        {
+          "id": "messages-provider",
+          "source": "messages",
+          "target": "provider",
+          "label": "complete",
+          "mobileLabel": "complete"
+        },
+        {
+          "id": "provider-tool-use",
+          "source": "provider",
+          "target": "tool-use",
+          "label": "tool_use"
+        },
+        {
+          "id": "tool-use-registry",
+          "source": "tool-use",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "registry-result",
+          "source": "registry",
+          "target": "tool-result",
+          "label": "system_date()",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "label": "append",
+          "mobileLabel": "append",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "label": "final",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "message-shape",
+      "label": "Message shape",
+      "title": "Anthropic tool_use / tool_result message shape",
+      "summary": "The key Day 2 protocol change: tool_result is no longer Day 1's role='tool'; it is a content block inside the next role='user' message.",
+      "defaultActiveNodeId": "user-tool-result",
+      "nodes": [
+        {
+          "id": "user-prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "what date is it?",
+          "detail": "The user still writes natural language. The CLI does not pre-decide system_date; the real model asks for the tool after seeing the tools schema.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "user-message",
+          "kind": "data",
+          "label": "messages[0]",
+          "eyebrow": "role='user'",
+          "body": "content=prompt",
+          "detail": "The first messages entry is still a normal user message. AnthropicProvider passes it through to the Messages API.",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "assistant-tool-use",
+          "kind": "response",
+          "label": "assistant message",
+          "eyebrow": "type='tool_use'",
+          "body": "name='system_date'",
+          "detail": "The model returns an assistant content block with type='tool_use', id, name, and input. The harness must append this whole assistant message back into messages.",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "run-tool",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "harness",
+          "body": "system_date({})",
+          "detail": "The harness reads name/input from the assistant tool_use and routes it to ToolRegistry.run(call). The model still has not executed any Python function.",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "user-tool-result",
+          "kind": "data",
+          "label": "user message",
+          "eyebrow": "type='tool_result'",
+          "body": "tool_use_id + content",
+          "detail": "This is the Day 2 protocol hinge: tool_result lives inside the next role='user' content block and points back to the previous tool_use id. It is not Day 1's role='tool'.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "final-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "final",
+          "body": "text='Today is ...'",
+          "detail": "On the second Messages API call, the model reads the tool_result content block and turns the observation into final text.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout-shape",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "tool_call / final",
+          "detail": "The later Terminal Replay shows the terminal-facing tool_call, observation, and final output. This diagram only explains the protocol shape inside messages.",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "prompt-user",
+          "source": "user-prompt",
+          "target": "user-message",
+          "label": "wrap"
+        },
+        {
+          "id": "user-assistant",
+          "source": "user-message",
+          "target": "assistant-tool-use",
+          "label": "returns",
+          "mobileLabel": "returns"
+        },
+        {
+          "id": "assistant-run",
+          "source": "assistant-tool-use",
+          "target": "run-tool",
+          "label": "tool_use"
+        },
+        {
+          "id": "run-user-result",
+          "source": "run-tool",
+          "target": "user-tool-result",
+          "label": "tool_result",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "user-result-final",
+          "source": "user-tool-result",
+          "target": "final-response",
+          "label": "complete",
+          "mobileLabel": "complete",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "final-stdout",
+          "source": "final-response",
+          "target": "stdout-shape",
+          "label": "render",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        }
+      ]
+    },
+    {
+      "id": "provider-boundary",
+      "label": "Provider boundary",
+      "title": "AnthropicProvider as the protocol adapter",
+      "summary": "External Anthropic/DeepSeek content blocks stop inside AnthropicProvider; the Agent Loop continues to work with internal ModelResponse / ToolCall / ToolResult.",
+      "defaultActiveNodeId": "model-response",
+      "nodes": [
+        {
+          "id": "messages-input",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "input",
+          "body": "conversation context",
+          "detail": "run_agent hands accumulated messages to the provider. The provider can change, but the Agent Loop input boundary stays stable.",
+          "position": { "x": 0, "y": 40 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "tools-list",
+          "kind": "tool",
+          "label": "ToolRegistry.list",
+          "eyebrow": "tools",
+          "body": "Tool(parameters)",
+          "detail": "ToolRegistry.list() exposes available tools and parameters. Day 2's new parameters field becomes Anthropic input_schema.",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider-adapter",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "adapter",
+          "body": "_to_anthropic_tools",
+          "detail": "AnthropicProvider translates Tool(parameters) into Anthropic tools/input_schema and sends messages through messages.create.",
+          "position": { "x": 310, "y": 170 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "api",
+          "kind": "model",
+          "label": "Messages API",
+          "eyebrow": "external",
+          "body": "DeepSeek-compatible",
+          "detail": "The request can go to DeepSeek's Anthropic-compatible endpoint or the official Claude API. The harness only relies on the Anthropic Messages API shape.",
+          "position": { "x": 620, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "content-blocks",
+          "kind": "response",
+          "label": "content blocks",
+          "eyebrow": "response",
+          "body": "text / tool_use",
+          "detail": "The external API returns text blocks and tool_use blocks; DeepSeek may also return thinking blocks. The provider keeps assistant_content intact for the next request.",
+          "position": { "x": 930, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "model-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "internal",
+          "body": "text + tool_calls",
+          "detail": "This is the provider boundary's output: external content blocks are translated into the internal ModelResponse. run_agent does not need to know the vendor response object.",
+          "position": { "x": 620, "y": 430 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "run-agent",
+          "kind": "runtime",
+          "label": "run_agent",
+          "eyebrow": "agent loop",
+          "body": "provider-agnostic",
+          "detail": "run_agent only depends on the ModelProvider Protocol and the internal ModelResponse. Day 2 swaps in a real model without rewriting the Agent Loop shape.",
+          "position": { "x": 310, "y": 430 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "messages-provider",
+          "source": "messages-input",
+          "target": "provider-adapter",
+          "label": "messages",
+          "sourceHandle": "source-right",
+          "targetHandle": "target-left",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "tools-provider",
+          "source": "tools-list",
+          "target": "provider-adapter",
+          "label": "schema",
+          "mobileLabel": "schema",
+          "sourceHandle": "source-right",
+          "targetHandle": "target-left",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "provider-api",
+          "source": "provider-adapter",
+          "target": "api",
+          "label": "create",
+          "mobileLabel": "create"
+        },
+        {
+          "id": "api-blocks",
+          "source": "api",
+          "target": "content-blocks",
+          "label": "content",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "blocks-response",
+          "source": "content-blocks",
+          "target": "model-response",
+          "label": "translate",
+          "mobileLabel": "map",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top",
+          "mobileSourceHandle": "source-left",
+          "mobileTargetHandle": "target-right"
+        },
+        {
+          "id": "response-agent",
+          "source": "model-response",
+          "target": "run-agent",
+          "label": "internal",
+          "mobileLabel": "internal",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "agent-tools",
+          "source": "run-agent",
+          "target": "tools-list",
+          "label": "tool_calls",
+          "mobileLabel": "calls",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom",
+          "mobileSourceHandle": "source-right",
+          "mobileTargetHandle": "target-bottom"
+        }
+      ]
+    }
+  ]
+}

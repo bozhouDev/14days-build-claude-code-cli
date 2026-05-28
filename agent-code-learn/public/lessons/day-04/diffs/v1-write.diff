@@ -1,0 +1,220 @@
+--- /dev/null
++++ agent_code/diff_ui.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++import difflib
++
++import typer
++
++
++def render_diff(old: str, new: str, path: str) -> str:
++    """用 difflib 生成 unified diff，给增删行加 rich markup 着色。"""
++    old_lines = old.splitlines(keepends=True)
++    new_lines = new.splitlines(keepends=True)
++    diff_lines = difflib.unified_diff(
++        old_lines, new_lines,
++        fromfile=f"a/{path}", tofile=f"b/{path}",
++    )
++    colored: list[str] = []
++    for line in diff_lines:
++        line = line.rstrip()
++        if line.startswith("---") or line.startswith("+++"):
++            colored.append(f"[bold]{line}[/bold]")
++        elif line.startswith("-"):
++            colored.append(f"[red]{line}[/red]")
++        elif line.startswith("+"):
++            colored.append(f"[green]{line}[/green]")
++        elif line.startswith("@@"):
++            colored.append(f"[cyan]{line}[/cyan]")
++        else:
++            colored.append(line)
++    return "\n".join(colored)
++
++
++def confirm_edit(path: str) -> bool:
++    """让用户确认是否应用这次编辑，默认不应用。"""
++    return typer.confirm(f"Apply this edit to {path}?", default=False)
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ ... web_search 之后、class ToolRegistry 之前新增 file_write ... @@
++def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
++    """整文件覆盖写入。前置校验由 agent.py 拦截块完成。"""
++    path_str = args.get("file_path", "")
++    content = args.get("content", "")
++    if not path_str:
++        return "error: missing required argument 'file_path'"
++    try:
++        path = resolve_in_cwd(ctx.cwd, path_str)
++    except ValueError as exc:
++        return f"error: {exc}"
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(content, encoding="utf-8")
++    # 写盘后刷新 read_state，让下一次编辑基于最新内容
++    ctx.read_state.record(path, content)
++    return f"Wrote {len(content)} chars to {path_str}"
++
+
+@@ default_tools(): 在 web_search 注册之后、return registry 之前追加 @@
++    registry.register(
++        Tool(
++            name="file_write",
++            description="Write or overwrite a file. Path is relative to cwd.",
++            run=file_write,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "file_path": {"type": "string", "description": "Relative path inside cwd."},
++                    "content": {"type": "string", "description": "Full file content to write."},
++                },
++                "required": ["file_path", "content"],
++            },
++        )
++    )
+     return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ -1,9 +1,17 @@
+ from __future__ import annotations
+
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any
++from rich.console import Console
+
+-from .model import ModelProvider, ModelResponse
++from .model import ModelProvider, ModelResponse, ToolResult
+ from .tools import ToolContext, ToolRegistry
+-from .fs_safety import SkipPolicy, load_gitignore
++from .fs_safety import SkipPolicy, load_gitignore, resolve_in_cwd
++from .diff_ui import confirm_edit, render_diff
++
++console = Console()
+
+@@ run_agent: 在 ctx 构造之后新增 emit helper，并把 4 处 trace.append 改成 emit @@
+     resolved_cwd = cwd or Path.cwd()
+     ctx = ToolContext(
+         cwd=resolved_cwd,
+         skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
+     )
++    def emit(line: str) -> None:
++        # 流式输出 trace：append 给测试用，print 给读者看
++        trace.append(line)
++        console.print(line)
+     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+     trace: list[str] = []
+
+     for step in range(max_steps):
+         response = provider.complete(messages, tools=tools.list())
+         messages.append(_assistant_message(response))
+
+         if not response.tool_calls:
+             final = response.text or ""
+-            trace.append(f"final: {final}")
++            emit(f"final: {final}")
+             return AgentResult(final=final, trace=trace, messages=messages)
+
+         tool_result_blocks: list[dict[str, Any]] = []
+         for call in response.tool_calls:
+-            trace.append(f"tool_call: {call.name} {call.arguments}")
+-            result = tools.run(call, ctx)
+-            trace.append(f"observation: {result.content}")
++            emit(f"tool_call: {call.name} {call.arguments}")
++
++            # file_write / file_edit 的 harness 拦截：先做前置校验，再渲染 diff，最后让用户确认
++            if call.name in ("file_write", "file_edit"):
++                path_str = call.arguments.get("file_path", "")
++
++                # 1) 路径解析：越界 cwd 直接当 error
++                try:
++                    path = resolve_in_cwd(ctx.cwd, path_str)
++                except (ValueError, OSError) as exc:
++                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
++                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
++
++                # 2) 前置校验（v1 只对 file_write 做"文件存在则要求读过"）
++                validation_error: str | None = None
++                if call.name == "file_write" and path.exists():
++                    if path not in ctx.read_state.entries:
++                        validation_error = (
++                            f"error: file has not been read yet. "
++                            f"Read {path_str} first before editing."
++                        )
++                # file_edit 的校验在 v2 接上
++
++                # 3) 算 new_content（v1 file_edit 还没接，先跳过 diff）
++                new_content: str | None = None
++                if call.name == "file_write":
++                    new_content = call.arguments.get("content", "")
++
++                # 4) 校验失败：不渲染 diff、不问用户，直接 error observation
++                if validation_error is not None:
++                    result = ToolResult(call.id, validation_error, is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
++                # 5) 校验通过：渲染 diff + 用户确认
++                if new_content is not None:
++                    diff_text = render_diff(old_content, new_content, path_str)
++                    console.print(f"\n[bold]Diff for {path_str}:[/bold]")
++                    console.print(diff_text)
++                    if not confirm_edit(path_str):
++                        result = ToolResult(call.id, "error: edit rejected by user", is_error=True)
++                        emit(f"observation: {result.content}")
++                        tool_result_blocks.append(
++                            {
++                                "type": "tool_result",
++                                "tool_use_id": result.tool_call_id,
++                                "content": result.content,
++                                "is_error": True,
++                            }
++                        )
++                        continue
++
++            result = tools.run(call, ctx)
++            emit(f"observation: {result.content}")
+             tool_result_blocks.append(
+                 {
+                     "type": "tool_result",
+                     "tool_use_id": result.tool_call_id,
+                     "content": result.content,
+                     "is_error": result.is_error,
+                 }
+             )
+         messages.append({"role": "user", "content": tool_result_blocks})
+
+     final = f"reached max_steps={max_steps}"
+-    trace.append(f"final: {final}")
++    emit(f"final: {final}")
+     return AgentResult(final=final, trace=trace, messages=messages)
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ run_once: trace 已经在 run_agent 内部流式打印，run_once 不再重复打印 @@
+     provider = create_provider(provider_name, model, base_url)  # TODO: 引入 slash 命令注册系统
+-    result = run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd)
+-    for line in result.trace:
+-        console.print(line)
++    run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd)

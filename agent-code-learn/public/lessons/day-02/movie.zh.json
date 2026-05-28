@@ -1,0 +1,98 @@
+{
+  "title": "Day 2 · 真实模型 + tool_use / tool_result",
+  "task": "今天几号？请用 system_date 工具回答",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "今天几号？请用 system_date 工具回答" },
+      "ledger": { "delta": "messages += user('今天几号？请用 system_date 工具回答')" },
+      "caption": "CLI 解析 prompt，包成 user message 放进 messages。和 Day 1 一样，第一帧只是『把任务交给模型』。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: system_date()" },
+      "caption": "AnthropicProvider 把 messages 和 ToolRegistry.list() 翻译成 input_schema 一起发到 Messages API。模型知道自己没有时钟，返回一个 tool_use content block，stop_reason=tool_use。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ABC", "name": "system_date", "arguments": {} }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "tool registry lookup", "state": "open", "target": "system_date" },
+      "caption": "harness 在 ToolRegistry 里找 system_date。Day 2 仍然只看是否注册——权限层要到 Day 5 才会进来。模型只是『提议』调用，真正按下放行键的是 harness。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ABC", "name": "system_date", "arguments": {} }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "system_date() → '2026-05-20 14:32:00 CST'" },
+      "caption": "harness 调用 datetime.now().astimezone()，拿到本机时间字符串。Day 2 的 WORLD 还是个本地函数，Day 3 起会变成项目文件，Day 5 起会变成 shell。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user(tool_result)" },
+      "caption": "这里是 Day 2 和 Day 1 最大的协议差异：先把 assistant 的 tool_use 整条 message append 回 messages，再把 tool_result 作为『下一轮 user message』的 content block 放进来——不是 Day 1 的 role=tool，而是 Anthropic 公开协议形状。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: 今天是 2026 年 5 月 20 日。" },
+      "caption": "AnthropicProvider 第二次调 Messages API。模型这次读到 tool_result，知道了今天日期，返回纯文本，stop_reason=end_turn。while step < max_steps 在这一帧退出。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "今天是 2026 年 5 月 20 日。",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: 今天是 2026 年 5 月 20 日。'" },
+      "caption": "CLI 把 trace 三段打到终端：tool_call、observation、final。整条对话都还在 messages 里，可以保存、可以回放，这一份 messages 就是 Day 6 session 文件的雏形。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "今天是 2026 年 5 月 20 日。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

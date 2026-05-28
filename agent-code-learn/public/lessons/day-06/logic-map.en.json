@@ -1,0 +1,248 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 6 · Session + Memory",
+  "subtitle": "This map focuses on Day 6's three memory boundaries: session JSONL continuation, layered system prompt injection, and memdir long-term memory across sessions.",
+  "diagrams": [
+    {
+      "id": "session-ledger",
+      "label": "Session ledger",
+      "title": "How Session JSONL lets the Agent continue",
+      "summary": "The CLI uses --resume / -c to create or load a Session; run_agent restores messages from Session.history and appends each new turn back to disk.",
+      "defaultActiveNodeId": "session",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "--resume / -c / fresh",
+          "detail": "The CLI parses prompt, cwd, and session flags. No flag creates a new session; -c loads the latest; --resume loads a specific JSONL by id.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "session",
+          "kind": "data",
+          "label": "Session",
+          "eyebrow": "ledger",
+          "body": "create / load_latest / load_id",
+          "detail": "Session wraps session_id, file_path, history, and append_messages. The Agent Loop does not care about the directory layout.",
+          "position": { "x": 280, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "jsonl",
+          "kind": "data",
+          "label": "JSONL ledger",
+          "eyebrow": ".agent/sessions",
+          "body": "{role, content, timestamp}",
+          "detail": "One message per JSON row. Append-only storage keeps the implementation simple: a crash can lose the current turn, but never rewrites the whole history.",
+          "position": { "x": 560, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "restore + append prompt",
+          "detail": "When resuming, Session.history becomes the messages list first. The current user prompt is then appended to memory and persisted to JSONL.",
+          "position": { "x": 840, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider",
+          "eyebrow": "model",
+          "body": "complete(messages)",
+          "detail": "The model still reads messages and returns tool_use or final. Session restore is harness work outside the model.",
+          "position": { "x": 840, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "append",
+          "kind": "runtime",
+          "label": "append_messages",
+          "eyebrow": "persist",
+          "body": "assistant + tool_result + final",
+          "detail": "At the end of a turn, the harness writes assistant/tool_result/final messages back to JSONL. The next -c sees the same ledger.",
+          "position": { "x": 280, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-session", "source": "cli", "target": "session", "label": "select session" },
+        { "id": "session-jsonl", "source": "session", "target": "jsonl", "label": "read/write" },
+        { "id": "jsonl-messages", "source": "jsonl", "target": "messages", "label": "history" },
+        { "id": "messages-provider", "source": "messages", "target": "provider", "label": "complete" },
+        { "id": "provider-append", "source": "provider", "target": "append", "label": "new messages", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "append-jsonl", "source": "append", "target": "jsonl", "label": "append rows", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    },
+    {
+      "id": "system-prompt-layers",
+      "label": "System prompt layers",
+      "title": "AGENT.md and MEMORY.md do not enter messages",
+      "summary": "Day 6 puts project rules and the memory index into the system prompt. The messages list stores conversation history; compact only touches messages.",
+      "defaultActiveNodeId": "builder",
+      "nodes": [
+        {
+          "id": "core",
+          "kind": "data",
+          "label": "Core prompt",
+          "eyebrow": "base",
+          "body": "agent behavior guide",
+          "detail": "The core system prompt describes the Agent's baseline behavior: read/write files, run commands, search, and ask the user.",
+          "position": { "x": 0, "y": 30 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "agent-md",
+          "kind": "data",
+          "label": "AGENT.md",
+          "eyebrow": "project rules",
+          "body": "<project-rules>",
+          "detail": "Project rules are handwritten by the developer. At startup, cwd/AGENT.md is wrapped in a <project-rules> block.",
+          "position": { "x": 0, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 160 }
+        },
+        {
+          "id": "memory-index",
+          "kind": "data",
+          "label": "MEMORY.md index",
+          "eyebrow": "long-term hooks",
+          "body": "<project-memory>",
+          "detail": "The long-term memory index comes from .agent/memory/MEMORY.md. It stores short hooks and links; full bodies stay behind memory_recall.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 320 }
+        },
+        {
+          "id": "builder",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "harness",
+          "body": "core → AGENT.md → MEMORY.md",
+          "detail": "This function runs once at CLI cold start. Each layer is optional; missing files are skipped. The joined text is passed through system=.",
+          "position": { "x": 380, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 160 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider.complete",
+          "eyebrow": "system=",
+          "body": "messages + system",
+          "detail": "AnthropicProvider sends the system prompt as a top-level request field, sibling to messages. It is not messages[0].",
+          "position": { "x": 760, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 500 }
+        },
+        {
+          "id": "compact",
+          "kind": "runtime",
+          "label": "compact(messages)",
+          "eyebrow": "not system",
+          "body": "pinned + summary + working",
+          "detail": "compact only compresses messages. AGENT.md and MEMORY.md travel through system=, so they are not compressed away.",
+          "position": { "x": 760, "y": 360 },
+          "mobilePosition": { "x": 220, "y": 500 }
+        }
+      ],
+      "edges": [
+        { "id": "core-builder", "source": "core", "target": "builder", "label": "part 1" },
+        { "id": "agent-builder", "source": "agent-md", "target": "builder", "label": "optional" },
+        { "id": "memory-builder", "source": "memory-index", "target": "builder", "label": "optional" },
+        { "id": "builder-provider", "source": "builder", "target": "provider", "label": "system=" },
+        { "id": "provider-compact", "source": "provider", "target": "compact", "label": "messages only", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "long-term-memory",
+      "label": "Long-term memory",
+      "title": "How memdir remembers facts across sessions",
+      "summary": "The model can only propose memory_write / memory_recall tool_use calls. The harness tool runtime writes topic files, updates the index, and scans memories.",
+      "defaultActiveNodeId": "write-tool",
+      "nodes": [
+        {
+          "id": "model",
+          "kind": "model",
+          "label": "Model",
+          "eyebrow": "proposal",
+          "body": "tool_use: memory_write",
+          "detail": "The model notices a fact worth saving and proposes a memory_write call. It does not write files directly.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "runtime",
+          "label": "Permission gate",
+          "eyebrow": "allow / deny",
+          "body": "memory_recall readonly; memory_write low-risk",
+          "detail": "memory_recall is readonly. memory_write is a low-risk write: default/acceptEdits allow it, while plan mode still denies it.",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "write-tool",
+          "kind": "tool",
+          "label": "memory_write",
+          "eyebrow": "tool runtime",
+          "body": "write topic + index",
+          "detail": "write_memory writes both .agent/memory/<type>/<slug>.md and one MEMORY.md index row, so the model cannot forget the second step.",
+          "position": { "x": 620, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "topic",
+          "kind": "data",
+          "label": "topic file",
+          "eyebrow": ".agent/memory/user",
+          "body": "frontmatter + body",
+          "detail": "The topic file stores the full memory body. Fully Chinese titles fall back to a stable mem-<hash>.md filename via sha1.",
+          "position": { "x": 920, "y": 20 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "index",
+          "kind": "data",
+          "label": "MEMORY.md",
+          "eyebrow": "index",
+          "body": "title link + hook",
+          "detail": "The index stores only a short hook. It enters the system prompt at startup; the model can call memory_recall when it needs the full body.",
+          "position": { "x": 920, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "new-session",
+          "kind": "runtime",
+          "label": "Fresh session",
+          "eyebrow": "no -c",
+          "body": "still sees index",
+          "detail": "A fresh session has no old messages, but build_system_prompt reads MEMORY.md, so the model still sees the long-term memory index.",
+          "position": { "x": 300, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        },
+        {
+          "id": "recall",
+          "kind": "tool",
+          "label": "memory_recall",
+          "eyebrow": "keyword grep",
+          "body": "scan topic files",
+          "detail": "recall_memory scans topic files across the four type directories; it does not depend on the index. If a topic file was written but the index failed, recall can still find it.",
+          "position": { "x": 620, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 540 }
+        }
+      ],
+      "edges": [
+        { "id": "model-permission", "source": "model", "target": "permission", "label": "tool_use" },
+        { "id": "permission-write", "source": "permission", "target": "write-tool", "label": "allow" },
+        { "id": "write-topic", "source": "write-tool", "target": "topic", "label": "full body" },
+        { "id": "write-index", "source": "write-tool", "target": "index", "label": "hook" },
+        { "id": "index-session", "source": "index", "target": "new-session", "label": "system prompt", "sourceHandle": "source-left", "targetHandle": "target-top" },
+        { "id": "session-recall", "source": "new-session", "target": "recall", "label": "need details" },
+        { "id": "recall-topic", "source": "recall", "target": "topic", "label": "scan", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    }
+  ]
+}

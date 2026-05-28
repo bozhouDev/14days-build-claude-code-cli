@@ -1,0 +1,261 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 1 · Hello Agent",
+  "subtitle": "这张图只放今天最核心的 Agent 逻辑：model proposes，harness executes，observation 回到 messages。",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "最小 Agent Loop",
+      "summary": "从 prompt 进入 messages，到 MockProvider 提出 tool_call，再由 ToolRegistry 执行 echo，最后把 ToolResult 写回上下文并生成 final text。",
+      "defaultActiveNodeId": "registry",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "解析 prompt 和 cwd",
+          "detail": "CLI Runtime 只负责接住用户输入、解析工作目录边界，然后把 prompt 交给 run_agent。它不直接回答用户。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "append user message",
+          "detail": "messages 是每轮都要交回模型的上下文。Day 1 先放入 role='user' 的 prompt，工具执行后再追加 observation。",
+          "position": { "x": 250, "y": 80 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "MockProvider",
+          "eyebrow": "model",
+          "body": "读取 messages",
+          "detail": "MockProvider 是教学版假模型。第一轮看到 user message，返回 tool_call；第二轮看到 tool message，返回 final text。",
+          "position": { "x": 500, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "proposal",
+          "body": "tool_call: echo",
+          "detail": "模型只提出 tool_call: echo(text='hi')。这一步还没有改变世界，只是把意图交给 harness。",
+          "position": { "x": 840, "y": 80 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run echo(args)",
+          "detail": "模型只提出 `tool_call`，真正执行 `echo` 的是 harness。ToolRegistry 把工具名映射到 Python 函数，是 Day 1 最重要的边界。",
+          "position": { "x": 840, "y": 280 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "content='hi'",
+          "detail": "ToolResult 是工具执行后的观察结果。它会带着 tool_call_id 回到 messages，让模型知道这次 echo 的结果是什么。",
+          "position": { "x": 500, "y": 280 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "final text",
+          "detail": "第二次 complete(messages) 后，MockProvider 返回最终文本。CLI 把 final text 打到终端，Agent Loop 结束。",
+          "position": { "x": 0, "y": 280 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "cli-messages",
+          "source": "cli",
+          "target": "messages",
+          "label": "prompt"
+        },
+        {
+          "id": "messages-provider",
+          "source": "messages",
+          "target": "provider",
+          "label": "complete(messages)"
+        },
+        {
+          "id": "provider-response",
+          "source": "provider",
+          "target": "response",
+          "label": "tool_call"
+        },
+        {
+          "id": "response-registry",
+          "source": "response",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "registry-result",
+          "source": "registry",
+          "target": "tool-result",
+          "label": "echo(args)",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "label": "append observation",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "label": "final",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "message-shape",
+      "label": "Message shape",
+      "title": "Day 1 的 messages 形状",
+      "summary": "Day 1 为了跑通 mock loop，先用简化的 role='tool' 表示 observation。Day 2 接真实 Claude 时会换成 Anthropic 的 tool_use / tool_result。",
+      "defaultActiveNodeId": "tool-message",
+      "nodes": [
+        {
+          "id": "prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "用 echo 工具说 hi",
+          "detail": "用户输入仍然是自然语言。CLI 不解析工具参数，只把原始 prompt 放进 messages。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "user-message",
+          "kind": "data",
+          "label": "messages[0]",
+          "eyebrow": "role='user'",
+          "body": "content=prompt",
+          "detail": "run_agent 初始化 messages = [{ role: 'user', content: prompt }]。这是模型看到的第一份上下文。",
+          "position": { "x": 250, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "tool-call",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "stop_reason",
+          "body": "tool_calls=[echo]",
+          "detail": "MockProvider 返回 ModelResponse(tool_calls=[ToolCall(name='echo')])，这表示模型想让 harness 执行工具。",
+          "position": { "x": 500, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "run-tool",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "harness",
+          "body": "echo({'text':'hi'})",
+          "detail": "ToolRegistry.run(call) 根据 call.name 找到 echo 函数，并把 arguments 交给它执行。",
+          "position": { "x": 840, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "tool-message",
+          "kind": "data",
+          "label": "messages += tool",
+          "eyebrow": "role='tool'",
+          "body": "tool_call_id + content",
+          "detail": "这里是 Day 1 的教学简化：用 role='tool' 保存 ToolResult。Day 2 会改成 Anthropic Messages API 的 tool_use / tool_result content blocks。",
+          "position": { "x": 840, "y": 250 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "final-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "final",
+          "body": "text='echo 工具返回：hi'",
+          "detail": "MockProvider 第二次看到最新消息是 tool observation，于是返回最终文本，stop_reason 回到 end_turn。",
+          "position": { "x": 500, "y": 250 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "stdout-shape",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "print final",
+          "detail": "CLI 渲染 trace：tool_call、observation、final。后面的 Terminal Replay 会展示这个可运行输出。",
+          "position": { "x": 250, "y": 250 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "prompt-user",
+          "source": "prompt",
+          "target": "user-message",
+          "label": "wrap"
+        },
+        {
+          "id": "user-tool-call",
+          "source": "user-message",
+          "target": "tool-call",
+          "label": "complete"
+        },
+        {
+          "id": "tool-call-run",
+          "source": "tool-call",
+          "target": "run-tool",
+          "label": "ToolCall"
+        },
+        {
+          "id": "run-tool-message",
+          "source": "run-tool",
+          "target": "tool-message",
+          "label": "ToolResult",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "tool-message-final",
+          "source": "tool-message",
+          "target": "final-response",
+          "label": "second complete",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "final-stdout",
+          "source": "final-response",
+          "target": "stdout-shape",
+          "label": "render",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        }
+      ]
+    }
+  ]
+}

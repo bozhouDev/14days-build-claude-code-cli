@@ -1,0 +1,105 @@
+{
+  "nodes": [
+    { "id": "user", "label": "User", "type": "process" },
+    { "id": "anthropic", "label": "AnthropicProvider", "type": "model" },
+    { "id": "messages", "label": "Messages", "type": "data" },
+    { "id": "tool", "label": "Tool Runtime", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "user",
+      "caption": "1. User asks 'Where is this project's entry point?'. The CLI wraps it as a user message; cwd goes into ToolContext.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "anthropic",
+      "caption": "2. AnthropicProvider sends messages + all 9 tool schemas to the Messages API. The model decides to inspect the top-level layout first and returns tool_use: list_files, stop_reason=tool_use.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_01LIST", "name": "list_files", "arguments": { "path": "." } }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "messages",
+      "caption": "3. Harness appends the whole assistant tool_use message into messages, then dispatches list_files.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" }
+      ]
+    },
+    {
+      "step": 4,
+      "focus": "tool",
+      "caption": "4. ToolRegistry routes to list_files. fs_safety's should_skip filters out .venv/, __pycache__/, .git/, returning a clean top-level listing.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "anthropic",
+      "caption": "5. Harness batches this round's tool_result into one user message (v2's reshape). Second model request: the model spots pyproject.toml at the top, decides to read it, returns tool_use: read_file.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_02READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 6,
+      "focus": "tool",
+      "caption": "6. ToolRegistry routes to read_file. fs_safety chains resolve_in_cwd → ensure_text_file → ensure_within_size, ReadFileState.record stores (mtime_ns, char_count), and truncate_output trims to 8000 chars.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" }
+      ]
+    },
+    {
+      "step": 7,
+      "focus": "messages",
+      "caption": "7. Round two's tool_result also batches into one user message. messages now records both rounds in full: the user question, the assistant's two tool_use blocks, and the harness's two tool_result blocks.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_02READ): [project.scripts]\\nagent-code = \"agent_code.cli:main\"\\n...]" }
+      ]
+    },
+    {
+      "step": 8,
+      "focus": "anthropic",
+      "caption": "8. Third Anthropic call. The model reads agent_code.cli:main from [project.scripts] and returns plain text, stop_reason=end_turn. The while step < max_steps loop exits.",
+      "messages": [
+        { "role": "user", "content": "Where is this project's entry point?" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_02READ): [project.scripts]\\nagent-code = \"agent_code.cli:main\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "The entry point is the main() function in agent_code/cli.py.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

@@ -1,0 +1,706 @@
+---
+title: "Day 7 — Slash Commands + Hooks + Cron Jobs"
+description: "Day 6 gave the Agent three memory layers. Today opens three harness extension surfaces: a slash registry, lifecycle hooks, and cron wakeups for the REPL."
+---
+
+Day 6 gave the Agent three memory layers: session history, `AGENT.md` project rules, and long-term memory across sessions. The single-Agent CLI is nearly complete, but `cli.py` still has one old problem: runtime control commands such as `/help` and `/exit` are hard-coded inside the main loop.
+
+Today we open three extension surfaces in the <Concept name="Harness">harness</Concept>: move slash commands into a registry, add custom scripts around tool execution with hooks, and let the REPL schedule a slash or prompt back into the Agent Loop through a cron job.
+
+About 520 new lines, 4 new files, and edits mainly in `agent.py`, `cli.py`, `tools.py`, and `permissions.py`, plus one more check of the `pyproject.toml` command entry point.
+
+---
+
+### Day 7 Logic Map — Three CLI Extension Boundaries
+
+Start with this Agent Logic Map. It does not replay every terminal line; it separates the three boundaries that are easy to blur today: slash is the CLI control surface, hooks are tool lifecycle gates, and cron is the REPL's timed pending queue.
+
+```txt
+slash controls locally; hooks wrap tools; cron only enqueues, then the main thread runs in order.
+```
+
+<AgentLogicMap mapPath="/lessons/day-07/logic-map.json" />
+
+---
+
+Today we keep editing the Day 6 `agent-code` project. The Day 6/Day 7 `packages/day-*` snapshots have not been added yet, so this page's diffs use the code blocks in `docs/day-07-extensibility.md` as the source of truth.
+
+## Setup — Today's Starting Point
+
+From the Day 6 project root, run:
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+输入 /help 查看命令，输入 /exit 退出。
+> /help
+可用命令：/help, /exit
+```
+
+At this point only the early hard-coded `/help` exists. There is no `/context`, `/permissions`, or `/plan`. More importantly, there is no way to run a project script after every `file_edit`, and no way to ask the REPL to check something every few minutes.
+
+Today adds four files:
+
+```txt
+agent_code/slash.py           slash registry + dispatch
+agent_code/hooks.py           hooks.json loading + PreToolUse / PostToolUse execution
+agent_code/scheduler.py       CronJob management + background scheduler thread
+agent_code/cron_tools.py      cron_create / cron_list / cron_cancel tools
+```
+
+The main path has four passes: v1 extracts slash commands, v2 adds lifecycle hooks, v3 installs `agent-code` globally, and v4 adds cron wakeups.
+
+---
+
+## v1 — Slash Registry
+
+Since Day 1, slash handling in `cli.py` has been roughly a `handle_slash()` function: `/help` prints help, `/exit` exits. That works for a tiny project, but each new command adds another `if`, and handlers cannot see runtime state such as the current session, provider, or permission mode.
+
+v1 does three things: create `slash.py` with a registry and dispatch function, register six built-in commands, and replace `cli.py`'s `handle_slash` path with `dispatch_slash`.
+
+### 1.1 Create `agent_code/slash.py`
+
+Start with three data structures: the runtime snapshot a handler can read, the result a handler returns to the CLI, and the command metadata stored in the registry.
+
+```python
+@dataclass
+class SlashContext:
+    """slash handler 接收的运行时上下文。"""
+    cwd: Path
+    permission_mode: str
+    model: str
+    provider: str
+    session_id: str | None
+
+
+class SlashResult:
+    """slash command 执行结果。should_query=True 时会把 prompt 送回 Agent Loop。"""
+
+    def __init__(
+        self,
+        handled: bool = True,
+        should_query: bool = False,
+        prompt: str = "",
+        message: str = "",
+    ) -> None:
+        self.handled = handled
+        self.should_query = should_query
+        self.prompt = prompt
+        self.message = message
+```
+
+`SlashContext` gives handlers a state snapshot, not references to global mutable state. `SlashResult.should_query` separates local commands from model-facing commands: `/help` only prints, while a future `/review` could expand into a prompt and return to the Agent Loop.
+
+### 1.2 Register Built-Ins
+
+The registry is just a dictionary plus `dispatch_slash()`. The parsing rule stays simple: slash prefix, first token as command name, all remaining tokens as args.
+
+```python
+_registry: dict[str, SlashCommand] = {}
+
+
+def register(name: str, description: str, handler: SlashHandler) -> None:
+    _registry[name] = SlashCommand(name=name, description=description, handler=handler)
+
+
+def dispatch_slash(line: str, ctx: SlashContext) -> SlashResult:
+    if not line.startswith("/"):
+        return SlashResult(handled=False)
+    try:
+        parts = shlex.split(line[1:].strip())
+    except ValueError as exc:
+        return SlashResult(handled=True, message=f"Invalid command syntax: {exc}")
+    if not parts:
+        return SlashResult(handled=False)
+    cmd = _registry.get(parts[0])
+    if cmd is None:
+        return SlashResult(handled=True, message=f"Unknown command: /{parts[0]}")
+    return cmd.handler(parts[1:], ctx)
+```
+
+The bottom of the file registers `/help`, `/model`, `/context`, `/compact`, `/permissions`, and `/plan`. In this version, `/permissions` and `/plan` only display state; they do not hot-swap `permission_mode` inside the REPL. The full Plan Mode approval loop arrives in Day 8.
+
+### 1.3 Update `cli.py` With One Input Path
+
+`cli.py` gets a shared `run_user_input()` function. One-shot mode, REPL input, and later cron pending prompts all call this function:
+
+```python
+def run_user_input(line: str) -> None:
+    nonlocal session
+    slash_result = dispatch_slash(
+        line,
+        SlashContext(
+            cwd=resolved_cwd,
+            permission_mode=permission_mode,
+            model=model,
+            provider=provider,
+            session_id=session.session_id if session else None,
+        ),
+    )
+    if slash_result.handled:
+        if slash_result.message:
+            console.print(slash_result.message)
+        if slash_result.should_query:
+            if session is None:
+                session = Session.create(resolved_cwd)
+            run_once(slash_result.prompt, resolved_cwd, provider, model, base_url, max_steps,
+                     permission_mode, session=session, system_prompt=system_prompt)
+        return
+
+    if session is None:
+        session = Session.create(resolved_cwd)
+    run_once(line, resolved_cwd, provider, model, base_url, max_steps,
+             permission_mode, session=session, system_prompt=system_prompt)
+```
+
+### 1.4 Run It
+
+`/help` is a local command. It does not call the model and does not create a session:
+
+```bash
+$ uv run agent-code "/help"
+可用命令：
+  /compact  显示 compact 状态
+  /context  显示当前 session、cwd、权限模式
+  /help     显示所有可用 slash command
+  /model    显示当前模型/provider
+  /permissions  显示权限模式 (default/acceptEdits/plan)
+  /plan     显示 plan 模式提示
+```
+
+`/context` can read the runtime snapshot:
+
+```bash
+$ uv run agent-code "/context"
+cwd: /your/project
+session: (none)
+permission: default
+model: anthropic/deepseek-v4-flash
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v1-slash-registry.diff"
+  title="v1 stage: Slash registry"
+  description="Create slash.py; register /help, /context, /permissions, /plan, and related commands; route cli.py through run_user_input."
+/>
+
+---
+
+## v2 — Hooks: Tool Lifecycle Gates
+
+v1 fixes the CLI control surface. v2 adds extension points before and after tool execution: for example, write a log after every `file_edit`, run a formatter, or perform one more local check before a specific `bash` command.
+
+The main path adds `hooks.json`: it defines an event, a tool matcher, and a local command to run. The harness checks this config around tool execution.
+
+### 2.1 Create `agent_code/hooks.py`
+
+The hook system has three parts: load config, match tool names, and execute commands.
+
+```python
+def load_hooks(cwd: Path) -> dict[str, list[dict[str, Any]]]:
+    """加载 hooks.json。文件不存在返回空 dict——不是错误，只是没配置。"""
+    file_path = cwd / HOOKS_FILE
+    if not file_path.exists():
+        return {}
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("hooks", data)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[hook warning] failed to load {file_path}: {exc}")
+        return {}
+
+
+def _matches(tool_name: str, matcher: str) -> bool:
+    if matcher == "*":
+        return True
+    if "|" in matcher:
+        return tool_name in matcher.split("|")
+    return matcher == tool_name
+```
+
+`run_hooks()` runs commands with `subprocess.run()` and passes JSON on stdin: `event`, `tool_name`, `tool_input`, `tool_result`, and `cwd`. The teaching version only supports command hooks and exact matching; no regex, HTTP hooks, or agent hooks yet.
+
+### 2.2 Wire `agent.py`
+
+First, disable Rich markup in `emit()`, because hook observations can contain literal text such as `[hook]`:
+
+```python
+def emit(line: str) -> None:
+    trace.append(line)
+    console.print(line, markup=False)
+```
+
+Then place `PreToolUse` after `decide_permission()` and before actual tool execution:
+
+```python
+if decision.behavior != "deny":
+    pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+    pre_blocked = [h for h in pre_hooks if not h["success"]]
+    if pre_blocked:
+        blocked_msgs = "\n".join(
+            f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked
+        )
+        observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
+        emit(f"observation: {observation}")
+        tool_result_blocks.append({
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": observation,
+            "is_error": True,
+        })
+        continue
+```
+
+The order matters: a write tool already denied by plan mode does not still run a local hook, so hooks cannot create side effects after denial. In default or acceptEdits mode, a hook can still block before confirmation UI or actual execution.
+
+`PostToolUse` runs after `tools.run()`. It prints status only; it does not block and does not feed stdout/stderr back to the model:
+
+```python
+result = tools.run(call, ctx)
+emit(f"observation: {result.content}")
+
+if not result.is_error:
+    post_hooks = run_hooks(
+        "PostToolUse", call.name, call.arguments, ctx.cwd,
+        tool_result=result.content,
+    )
+    for h in post_hooks:
+        status = "ok" if h["success"] else f"warning: {h['output']}"
+        console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
+```
+
+### 2.3 Fix a leftover bug: empty `file_path` must not become cwd
+
+Before running the verification steps, patch one small boundary left over from Day 4. A real model can occasionally emit `file_write {}` as a malformed <Concept name="Tool Call">tool call</Concept>, even when the <Concept name="Schema">Schema</Concept> in `tools.py` marks `file_path` as required. Schema is an instruction for the model, not the harness safety boundary; the Agent Loop still has to treat tool arguments as untrusted input.
+
+Without the fix, `path_str = call.arguments.get("file_path", "")` returns an empty string, `resolve_in_cwd(ctx.cwd, "")` resolves to cwd itself, and the next `path.read_text()` tries to read the current directory as a file, raising `IsADirectoryError` and crashing the CLI.
+
+The fix only lives in the `file_write` / `file_edit` preview block: add an empty-path guard before `resolve_in_cwd()`, and a directory guard after it.
+
+```python
+path_str = call.arguments.get("file_path", "")
+if not path_str:
+    result = ToolResult(call.id, "error: missing required argument 'file_path'", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+
+try:
+    path = resolve_in_cwd(ctx.cwd, path_str)
+except (ValueError, OSError) as exc:
+    result = ToolResult(call.id, f"error: {exc}", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+
+if path.is_dir():
+    result = ToolResult(call.id, f"error: path is a directory: {path_str}", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+```
+
+Now malformed arguments become an <Concept name="Observation">observation</Concept> the model can recover from, instead of crashing the CLI.
+
+### 2.4 Run It
+
+Create a PostToolUse hook that writes `hook.log` after a successful `file_edit`:
+
+```bash
+$ cat > hooks.json << 'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "file_edit", "run": "python3 -c \"import json,pathlib,sys; d=json.load(sys.stdin); pathlib.Path('hook.log').write_text('post '+d['tool_name'])\""}
+    ]
+  }
+}
+EOF
+
+$ printf 'print("hello")\n' > hook_demo.py
+$ uv run agent-code --permission-mode acceptEdits "先读 hook_demo.py，再把 hello 改成 hello hook"
+Agent Code
+cwd: /your/project
+session: a1b2c3d4e5f6
+
+tool_call: read_file {...}
+observation: ...
+tool_call: file_edit {...}
+observation: Edited hook_demo.py: replaced 5 chars with 10 chars
+hook: PostToolUse file_edit ok
+
+final: 已更新 hook_demo.py。
+```
+
+Check the file the hook wrote:
+
+```bash
+$ cat hook.log
+post file_edit
+```
+
+PreToolUse can block a specific command:
+
+```bash
+$ cat > hooks.json << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "run": "python3 -c \"import json,sys; d=json.load(sys.stdin); cmd=d.get('tool_input',{}).get('command',''); sys.exit(1 if 'BLOCK_ME' in cmd else 0)\""}
+    ]
+  }
+}
+EOF
+
+$ uv run agent-code --permission-mode acceptEdits "用 bash 跑 echo BLOCK_ME"
+...
+tool_call: bash {'command': 'echo BLOCK_ME'}
+observation: tool blocked by PreToolUse hook:
+  [hook] python3 -c ...: ...
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v1-to-v2.diff"
+  title="v2 stage: Lifecycle hooks"
+  description="Create hooks.py; insert PreToolUse before tool execution and PostToolUse after successful tools.run."
+/>
+
+---
+
+## v3 — Global Install
+
+This pass does not add new Python code. It checks that `pyproject.toml` still has the Day 1 command entry point, then installs the current project as a global uv tool.
+
+### 3.1 Check `[project.scripts]`
+
+Open `pyproject.toml` and confirm:
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+`agent_code.cli:main` points to `main()` in `cli.py`; `main()` calls the Typer app. uv wraps that into a shell command.
+
+### 3.2 Install and Verify
+
+```bash
+$ uv tool install -e .
+Installed 1 executable: agent-code
+
+$ agent-code --help
+Usage: agent-code [OPTIONS] [PROMPT] COMMAND [ARGS]...
+...
+Options:
+  --cwd
+  --provider
+  --model
+  --base-url
+  --max-steps
+  --permission-mode
+  --resume
+  --continue
+  --help
+```
+
+Different Typer versions may format help text differently. The check is not exact layout; it is that the shell can find the global command and the options needed by Day 5, Day 6, and Day 7 are still present.
+
+### 3.3 Test From Any Directory
+
+```bash
+$ cd /tmp
+$ agent-code --cwd /your/project "/context"
+cwd: /your/project
+session: (none)
+permission: default
+model: anthropic/deepseek-v4-flash
+```
+
+`--cwd` controls the working directory. File operations, session JSONL, `AGENT.md`, memdir, and `hooks.json` all resolve from `cwd`, not from your shell's current directory.
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v2-to-v3.diff"
+  title="v3 stage: Global command entry"
+  description="Confirm the [project.scripts] agent-code entry and install the package with uv tool install -e . so it can run from any directory."
+/>
+
+---
+
+## v4 — Cron `/loop` Wakeups
+
+After v3, `agent-code` can run from anywhere. But the REPL still only reacts when you type. v4 adds a scheduler: register a slash or prompt plus an interval, let a background thread enqueue it when due, and have the REPL main thread run it in order.
+
+### 4.1 Create `agent_code/scheduler.py`
+
+`CronScheduler` owns the job list, `.agent/cron.json` persistence, the background thread, and the pending queue.
+
+```python
+class CronScheduler:
+    """REPL 内的 cron 调度器。维护 job 列表 + 后台 daemon thread + pending queue。"""
+
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
+        self._jobs: list[CronJob] = _load_jobs(cwd)
+        self._pending: Queue[str] = Queue()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def add_job(self, slash: str, every_seconds: int, label: str = "") -> CronJob:
+        jid = uuid.uuid4().hex[:12]
+        job = CronJob(job_id=jid, slash=slash, every_seconds=every_seconds, label=label)
+        with self._lock:
+            self._jobs.append(job)
+            _save_jobs(self.cwd, self._jobs)
+        return job
+
+    def drain_pending(self) -> list[str]:
+        items: list[str] = []
+        while not self._pending.empty():
+            items.append(self._pending.get_nowait())
+        return items
+```
+
+The key design choice: the background thread only enqueues; it never calls `run_agent` directly. Otherwise one thread could be in the middle of `file_edit` while another starts a `bash` tool against the same cwd.
+
+### 4.2 Create `agent_code/cron_tools.py`
+
+`cron_create`, `cron_list`, and `cron_cancel` are first-class model tools. In REPL mode, they reuse the scheduler created by `cli.py`; in one-shot mode, they temporarily open the same `.agent/cron.json` file for add/list/cancel, but do not start a background thread.
+
+```python
+_scheduler: Any = None
+
+
+def set_scheduler(scheduler: Any) -> None:
+    global _scheduler
+    _scheduler = scheduler
+
+
+def cron_create(args: dict[str, Any], ctx: ToolContext) -> str:
+    scheduler = _get_scheduler(ctx)
+    slash = args.get("slash", "")
+    every_seconds = int(args.get("every_seconds", 0))
+    label = args.get("label", "")
+    if not slash:
+        return "error: missing required argument 'slash'"
+    if every_seconds <= 0:
+        return "error: every_seconds must be positive"
+    job = scheduler.add_job(slash, every_seconds, label)
+    return f"Cron job created: {job.id} — every {every_seconds}s: {slash}"
+```
+
+`slash` can be a slash command such as `/context`, or a natural-language prompt. When due, the scheduler places that raw string into the pending queue.
+
+### 4.3 Register Tools and Permissions
+
+Register the three tools in `default_tools()`. For permissions, `cron_list` is readonly, while `cron_create` and `cron_cancel` write `.agent/cron.json`, so they are low-risk writes:
+
+```python
+_READONLY_TOOLS = frozenset({
+    "read_file", "list_files", "glob", "grep", "project_tree",
+    "git_status", "git_diff",
+    "system_date", "echo",
+    "memory_recall",
+    "cron_list",
+})
+
+_LOW_RISK_WRITES = frozenset({
+    "memory_write",
+    "cron_create",
+    "cron_cancel",
+})
+```
+
+Do not put `cron_create` or `cron_cancel` into the readonly set. They write a small, fixed file, but they still mutate `.agent/cron.json`; the plan-mode deny branch should still block them.
+
+### 4.4 Start the Scheduler in REPL Mode
+
+The REPL branch creates and starts the scheduler, then uses an input thread plus a main-thread loop that drains the pending queue:
+
+```python
+scheduler = CronScheduler(resolved_cwd)
+set_scheduler(scheduler)
+scheduler.start()
+
+try:
+    while True:
+        for pp in scheduler.drain_pending():
+            console.print(f"[dim]cron: running scheduled job → {pp}[/dim]")
+            run_user_input(pp)
+
+        try:
+            line = input_queue.get(timeout=0.5)
+        except Empty:
+            continue
+
+        if line is None:
+            break
+        if not line:
+            continue
+        if line == "/exit":
+            console.print("Bye.")
+            break
+        run_user_input(line)
+finally:
+    stop_repl.set()
+    scheduler.stop()
+```
+
+The main thread wakes every 0.5 seconds, drains cron pending jobs first, then handles user input. The Agent Loop still runs sequentially on the main thread.
+
+### 4.5 Register `/loop`
+
+`/loop add/list/cancel` is a local slash command. It manages the scheduler directly without going through the model. It shares the same `CronScheduler` instance and `.agent/cron.json` persistence with the `cron_create/list/cancel` model tools.
+
+```python
+def _cmd_loop(args: list[str], ctx: SlashContext) -> SlashResult:
+    """管理 cron 定时任务：/loop add/list/cancel。"""
+    if not args:
+        return SlashResult(
+            handled=True,
+            message="用法: /loop add <slash或prompt> --every <60s|5m|2h> --label <标签>\n      /loop list\n      /loop cancel <id>",
+        )
+    subcommand = args[0]
+    rest = args[1:]
+    if subcommand == "add":
+        return _cmd_loop_add(rest, ctx)
+    if subcommand == "list":
+        return _cmd_loop_list(rest, ctx)
+    if subcommand == "cancel":
+        return _cmd_loop_cancel(rest, ctx)
+    return SlashResult(handled=True, message=f"Unknown /loop subcommand: {subcommand}")
+
+
+register("loop", "管理 cron 定时任务: add/list/cancel", _cmd_loop)
+```
+
+### 4.6 Run It
+
+Add a scheduled job inside the REPL:
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+> /loop add /context --every 120 --label 上下文检查
+Cron job created: f7e8d9c0a1b2 — every 120s: /context
+
+> /loop list
+  [f7e8d9c0a1b2] every 120s: /context — 上下文检查  (last: never)
+>
+```
+
+Two minutes later, you should see:
+
+```txt
+cron: running scheduled job → /context
+```
+
+This check is best done in a real interactive REPL. A `printf` pipeline can work too, but prompts may appear as `>: >:`. The deterministic signal is seeing `cron: running scheduled job → /context` and the `/context` output.
+
+The model can also create a cron job through a tool:
+
+```bash
+> 帮我设一个定时任务，每 3 分钟跑一次 /context，标签叫'定期检查'
+Agent Code
+cwd: /your/project
+session: c1d2e3f4a5b6
+
+tool_call: cron_create {'slash': '/context', 'every_seconds': 180, 'label': '定期检查'}
+observation: Cron job created: a7b8c9d0e1f2 — every 180s: /context
+final: 已创建定时任务 a7b8c9d0e1f2，每 3 分钟自动运行 /context。
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v3-to-final.diff"
+  title="v4 stage: Cron /loop wakeups"
+  description="Create scheduler.py and cron_tools.py; register cron_* tools and permissions; start the scheduler in REPL mode and drain pending jobs; add /loop to slash.py."
+/>
+
+---
+
+### Terminal Replay Demo
+
+Below is the `/loop add /context` terminal animation. Watch the scheduled job enter the pending queue first; the actual work still happens through `run_user_input("/context")` and slash dispatch.
+
+<TerminalReplay tracePath="/lessons/day-07/traces/loop-context.json" />
+
+---
+
+## What You Have Now
+
+- **Slash registry**: `/help`, `/model`, `/context`, `/compact`, `/permissions`, and `/plan` are registered and dispatched in `slash.py`, no longer hard-coded in `cli.py`.
+- **Lifecycle hooks**: `hooks.json` lives under cwd. `PreToolUse` can block before execution; `PostToolUse` runs after success and only warns.
+- **Global install**: `uv tool install -e .` makes `agent-code` available from any directory, with `--cwd` controlling the working directory.
+- **Cron wakeups**: `CronScheduler` manages jobs, a daemon thread, a pending queue, and `.agent/cron.json` persistence.
+- **Human `/loop` panel**: `/loop add/list/cancel` is a local slash path, while `cron_create/list/cancel` are model tools. Both share the same scheduler.
+
+---
+
+## FAQ
+
+**Why don't `/permissions` and `/plan` actually switch modes yet?**
+
+In v1, `/permissions` and `/plan` only print information. They do not mutate the `permission_mode` variable owned by `cli.py`. To switch modes today, exit the REPL and restart with `--permission-mode plan`. Making slash commands mutate runtime state requires a callback or a returned `new_permission_mode`; that is left as a challenge.
+
+**Why did I configure `hooks.json` but see no hook?**
+
+The usual causes are: `hooks.json` is not under cwd; the matcher is wrong, for example `"FileEdit"` instead of `"file_edit"`; or the hook command itself does not exit 0. Run the hook command directly first and confirm it can read JSON from stdin.
+
+**Why didn't my cron job run on time?**
+
+First confirm you are in REPL mode. One-shot mode, such as `agent-code "prompt"`, does not start the scheduler. Then use `/loop list` to check that the job exists and that `last_run_at` updates. A newly created job waits for `every_seconds` before its first run.
+
+---
+
+## Challenges
+
+1. **Make `/permissions` and `/plan` mutate runtime mode**: add a callback to `SlashContext`, or let handlers return `new_permission_mode`, then have `cli.py` update its loop variable.
+
+2. **Inject hook output into model context**: update PostToolUse handling in `agent.py`. If a hook returns stdout, append it as an extra context block after `tool_result` so the model can see what the hook did.
+
+3. **Support five-field cron expressions**: add a `cron` field to `CronJob` so `/loop add` can accept `--cron "*/5 * * * *"`. The main path uses `every_seconds` to focus on the "enqueue, don't re-enter Agent Loop" boundary.
+
+4. **Limit the number of cron jobs**: cap `CronScheduler.add_job()` at 20 jobs and return an error after that, so a model cannot accidentally fill `.agent/cron.json` with many recurring tasks.
+
+---
+
+## Thinking Questions
+
+1. **Why is a slash command not the same thing as a tool?** Hint: can a slash handler call the model? Can it write files? Can it read session state? What problem does `SlashResult.should_query` solve?
+
+2. **Why does the order of `PreToolUse` and `decide_permission` matter?** Hint: if a hook allow could bypass plan-mode deny, where is the safety boundary?
+
+3. **Why doesn't `CronScheduler` call `run_agent` from the background thread?** Hint: what happens if a tool is editing files while another thread suddenly starts a `bash` command?
+
+4. **After global install, which files does `--cwd` affect?** Hint: list Day 6's session/memdir/`AGENT.md` plus Day 7's `hooks.json`/`cron.json`; what is their lookup root?
+
+---
+
+## Next Day
+
+Today added three harness extension surfaces: slash runtime control, lifecycle hooks, and cron wakeups. The first seven days now form a complete single-Agent CLI: it can read code, edit files, run commands, enforce permissions, remember context, and be extended.
+
+Next comes the second half: **Day 8 — TodoWrite + Plan Mode Approval Loop**. Day 5 introduced plan mode as a readonly hard boundary; Day 8 adds `exit_plan_mode` interception, plan rendering, and user approval so the Agent writes a todo plan before changing code.

@@ -1,0 +1,100 @@
+{
+  "title": "Day 6 · Session JSONL + 三层记忆",
+  "task": "用 echo 工具说 hello",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "用 echo 工具说 hello" },
+      "ledger": { "delta": "Session.create(cwd) -> .agent/sessions/<cwd>/<id>.jsonl" },
+      "caption": "CLI 没看到 --resume / -c，于是创建一个新 Session。prompt 进入 messages 的同时，也会作为第一行 JSONL 落盘。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: echo(text='hello')" },
+      "caption": "AnthropicProvider 带着 messages、tools 和 system prompt 请求模型。system prompt 这一路已经可以拼入 AGENT.md 与 MEMORY.md 索引，但不会进入 messages。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ECHO", "name": "echo", "arguments": { "text": "hello" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "Session.history + append-only JSONL + build_system_prompt", "state": "open", "target": "session ledger" },
+      "caption": "Day 6 的 gate 是上下文边界：恢复时先把 Session.history 读回 messages；执行中只追加 JSONL，不重写旧记录；启动时 build_system_prompt(cwd) 把 core、AGENT.md、MEMORY.md 分层注入。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ECHO", "name": "echo", "arguments": { "text": "hello" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "echo(text='hello') -> hello" },
+      "ledger": { "delta": "append assistant(tool_use) + user(tool_result)" },
+      "caption": "echo 是只读工具，权限引擎直接 allow。工具结果回到 harness 后，assistant 的 tool_use 和 user 的 tool_result 会一起追加到 JSONL。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result])" },
+      "caption": "messages 现在同时存在内存版和磁盘版：内存版继续喂给模型，磁盘版让下次 --resume 或 -c 能恢复同一段上下文。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" },
+        { "role": "assistant", "content": "[tool_use: echo(id=toolu_01ECHO, text=hello)]" },
+        { "role": "user", "content": "[tool_result(toolu_01ECHO): hello]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: 已经用 echo 工具说出了 \"hello\"。" },
+      "caption": "第二次请求模型时，它读到 tool_result 并返回 final。Agent Loop 在返回前再把 assistant(final) 追加到 session JSONL。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" },
+        { "role": "assistant", "content": "[tool_use: echo(id=toolu_01ECHO, text=hello)]" },
+        { "role": "user", "content": "[tool_result(toolu_01ECHO): hello]" }
+      ],
+      "modelResponse": {
+        "text": "已经用 echo 工具说出了 \"hello\"。",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout + session: a1b2c3d4e5f6" },
+      "caption": "终端输出 session id。下一次执行 uv run agent-code -c 时，CLI 读最近的 JSONL，把历史消息放回 messages，再接着这段对话往下跑。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hello" },
+        { "role": "assistant", "content": "[tool_use: echo(id=toolu_01ECHO, text=hello)]" },
+        { "role": "user", "content": "[tool_result(toolu_01ECHO): hello]" },
+        { "role": "assistant", "content": "已经用 echo 工具说出了 \"hello\"。" }
+      ],
+      "modelResponse": {
+        "text": "已经用 echo 工具说出了 \"hello\"。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

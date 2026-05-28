@@ -1,0 +1,95 @@
+{
+  "title": "Day 1 · Hello Agent",
+  "task": "Use the echo tool to say hi",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "Use the echo tool to say hi" },
+      "ledger": { "delta": "messages += user('Use the echo tool to say hi')" },
+      "caption": "CLI parses the input, wraps it as a user message, and drops it into messages. This is the first thing the model sees.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: echo(text='hi')" },
+      "caption": "MockProvider sees the user message, recognizes the tool intent, and returns tool_calls=[echo]. The model only proposes — it never executes.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "tool registry lookup", "state": "open", "target": "echo" },
+      "caption": "harness looks up echo in the ToolRegistry. Day 1 has no permission layer yet — any registered tool passes. This gate gets stricter every following day.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "echo({'text': 'hi'}) → 'hi'" },
+      "caption": "harness invokes the Python function and gets 'hi' back. WORLD is just a local function today; from Day 3 it becomes files, from Day 5 it becomes the shell.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += tool_result(call_echo_1, 'hi')" },
+      "caption": "harness writes the observation back to messages, role='tool', tool_call_id matching the model's proposal. This is the world → model return path.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: echo tool returned: hi" },
+      "caption": "MockProvider receives messages a second time, sees the latest tool result, and returns plain text with stop_reason=end_turn. The Agent Loop exits.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo tool returned: hi",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'echo tool returned: hi'" },
+      "caption": "CLI prints the model's final text to the terminal. The whole trace (user → tool_use → tool_result → final) lives in messages — saveable, replayable.",
+      "messages": [
+        { "role": "user", "content": "Use the echo tool to say hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo tool returned: hi",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

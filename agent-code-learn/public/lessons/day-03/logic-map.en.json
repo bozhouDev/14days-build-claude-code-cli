@@ -1,0 +1,465 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 3 · File + Web tools",
+  "subtitle": "A compact map of Day 3's core changes: ToolContext, fs_safety, local discovery tools, and the web-tool boundary.",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "From prompt to file Observation",
+      "summary": "The model proposes tool_use; ToolRegistry executes through ToolContext, which carries cwd, SkipPolicy, and ReadFileState, then tool_result blocks return to messages.",
+      "defaultActiveNodeId": "ctx",
+      "nodes": [
+        {
+          "id": "prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "where is the entrypoint?",
+          "detail": "The user still writes natural language. CLI parses the prompt and --cwd, but it does not decide which file to read.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "Anthropic content blocks",
+          "detail": "messages stores the user question, assistant tool_use, and harness-returned user tool_result blocks.",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "provider",
+          "body": "complete(messages, tools)",
+          "detail": "The provider remains a protocol adapter: it sends tool schemas to the model and translates tool_use content blocks into internal ToolCall objects.",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "model-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "tool_use",
+          "body": "list_files / read_file",
+          "detail": "The model returns requests, such as list_files followed by read_file pyproject.toml. It does not access the filesystem directly.",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run(call, ctx)",
+          "detail": "ToolRegistry routes by ToolCall.name and passes the same ToolContext into the Python tool function.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "ToolContext",
+          "eyebrow": "runtime",
+          "body": "cwd + SkipPolicy + ReadFileState",
+          "detail": "This is Day 3's key abstraction: tools do not read global state; they receive cwd, skip rules, and read_state through ToolContext.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "local-tools",
+          "kind": "tool",
+          "label": "local file tools",
+          "eyebrow": "tools",
+          "body": "list / read / grep",
+          "detail": "Local tools perform the real directory and file reads, filename search, and content search. Each one obeys cwd and skip policy.",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "tool_result blocks",
+          "eyebrow": "observation",
+          "body": "bounded Observation",
+          "detail": "Day 3 packs every tool_result for the same assistant turn into one immediately following user message, matching Anthropic's expected shape.",
+          "position": { "x": 300, "y": 540 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "tool_call / final",
+          "detail": "The terminal only renders trace: tool_call, observation, and final. Full messages and read_state stay inside the harness.",
+          "position": { "x": 0, "y": 540 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "prompt-messages", "source": "prompt", "target": "messages", "label": "wrap" },
+        { "id": "messages-provider", "source": "messages", "target": "provider", "label": "complete" },
+        { "id": "provider-response", "source": "provider", "target": "model-response", "label": "tool_use" },
+        {
+          "id": "response-registry",
+          "source": "model-response",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        { "id": "registry-ctx", "source": "registry", "target": "ctx", "label": "ctx", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "ctx-tools", "source": "ctx", "target": "local-tools", "label": "runtime", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        {
+          "id": "tools-result",
+          "source": "local-tools",
+          "target": "tool-result",
+          "label": "observe",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "sourceHandle": "source-top",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "fs-safety",
+      "label": "fs_safety gate",
+      "title": "The fs_safety gate inside read_file",
+      "summary": "read_file does not read the disk immediately. It first locks the path to cwd, checks text and size, records ReadFileState, and truncates the output.",
+      "defaultActiveNodeId": "resolve",
+      "nodes": [
+        {
+          "id": "read-file",
+          "kind": "tool",
+          "label": "read_file",
+          "eyebrow": "tool",
+          "body": "path from model",
+          "detail": "The model only supplies a relative path, such as pyproject.toml. That argument cannot go straight to Path.read_text.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "resolve",
+          "kind": "data",
+          "label": "resolve_in_cwd",
+          "eyebrow": "gate 1",
+          "body": "lock path inside cwd",
+          "detail": "resolve_in_cwd resolves the model's path, then proves it is still under cwd with relative_to(cwd).",
+          "position": { "x": 270, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "text",
+          "kind": "data",
+          "label": "ensure_text_file",
+          "eyebrow": "gate 2",
+          "body": "reject binary",
+          "detail": "Known text suffixes pass immediately; other files are checked for NUL bytes in the first 1 KiB.",
+          "position": { "x": 540, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "size",
+          "kind": "data",
+          "label": "ensure_within_size",
+          "eyebrow": "gate 3",
+          "body": "256 KiB cap",
+          "detail": "Files over 256 KiB are rejected for whole-file reads, nudging the model toward grep or a later offset/limit version.",
+          "position": { "x": 810, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "read-text",
+          "kind": "tool",
+          "label": "Path.read_text",
+          "eyebrow": "world",
+          "body": "read disk",
+          "detail": "The harness reads from disk only after all three gates pass.",
+          "position": { "x": 810, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "record",
+          "kind": "data",
+          "label": "ReadFileState",
+          "eyebrow": "state",
+          "body": "record(mtime, chars)",
+          "detail": "Day 3 only records this data. Day 4 read-before-edit will use it to detect whether the file changed after the model read it.",
+          "position": { "x": 540, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "truncate",
+          "kind": "data",
+          "label": "truncate_output",
+          "eyebrow": "context",
+          "body": "max 8000 chars",
+          "detail": "Tool observations are truncated before they enter model context, so one read cannot flood the conversation.",
+          "position": { "x": 270, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "text or error",
+          "detail": "Success and failure both become ToolResult. Missing files, escaping paths, binary files, and huge files do not crash the Agent Loop.",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "read-resolve", "source": "read-file", "target": "resolve", "label": "path" },
+        { "id": "resolve-text", "source": "resolve", "target": "text", "label": "safe path" },
+        { "id": "text-size", "source": "text", "target": "size", "label": "text" },
+        { "id": "size-read", "source": "size", "target": "read-text", "label": "ok", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "read-record", "source": "read-text", "target": "record", "label": "record", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "record-truncate", "source": "record", "target": "truncate", "label": "content", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "truncate-result", "source": "truncate", "target": "result", "label": "return" }
+      ]
+    },
+    {
+      "id": "local-discovery",
+      "label": "Local tools",
+      "title": "Local discovery tools share cwd and skip rules",
+      "summary": "list_files, glob, grep, and project_tree answer different discovery questions, but they all share cwd, SkipPolicy, and .gitignore filtering through ToolContext.",
+      "defaultActiveNodeId": "skip",
+      "nodes": [
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "ToolContext",
+          "eyebrow": "runtime",
+          "body": "shared tool runtime",
+          "detail": "ToolContext is the shared entry point for tools. Later permission, session, and memory state can hang off this same object.",
+          "position": { "x": 440, "y": 20 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "cwd",
+          "kind": "data",
+          "label": "cwd",
+          "eyebrow": "boundary",
+          "body": "--cwd resolved",
+          "detail": "cwd is the boundary for local file tools. Every relative path must prove it stays inside cwd.",
+          "position": { "x": 140, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "skip",
+          "kind": "data",
+          "label": "SkipPolicy",
+          "eyebrow": "filter",
+          "body": ".gitignore + skip_dirs",
+          "detail": "SkipPolicy filters .git/, .venv/, node_modules/, __pycache__/, and the cwd root .gitignore before tool output reaches the model.",
+          "position": { "x": 440, "y": 170 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "tools",
+          "kind": "tool",
+          "label": "local file tools",
+          "eyebrow": "toolbox",
+          "body": "read project state",
+          "detail": "These tools let the model see code, but the model is still not accessing the filesystem directly. Execution stays in the harness.",
+          "position": { "x": 740, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "list",
+          "kind": "tool",
+          "label": "list_files",
+          "eyebrow": "one level",
+          "body": "directory entries",
+          "detail": "list_files reads one directory level, which is useful for a first pass over the project root.",
+          "position": { "x": 0, "y": 360 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "glob",
+          "kind": "tool",
+          "label": "glob",
+          "eyebrow": "names",
+          "body": "**/*.py",
+          "detail": "glob finds files by name pattern and returns the most recently modified matches first.",
+          "position": { "x": 300, "y": 360 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "grep",
+          "kind": "tool",
+          "label": "grep",
+          "eyebrow": "contents",
+          "body": "rg first, Python fallback",
+          "detail": "grep prefers ripgrep and falls back to pure Python, while keeping output in path:line:content form.",
+          "position": { "x": 600, "y": 360 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tree",
+          "kind": "tool",
+          "label": "project_tree",
+          "eyebrow": "overview",
+          "body": "bounded tree",
+          "detail": "project_tree gives a compact project overview with depth, node-count, and output-length caps.",
+          "position": { "x": 900, "y": 360 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "observation",
+          "kind": "response",
+          "label": "Observation",
+          "eyebrow": "result",
+          "body": "clean bounded output",
+          "detail": "Every local discovery tool eventually returns a bounded observation inside the next user tool_result content blocks.",
+          "position": { "x": 440, "y": 560 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "ctx-cwd", "source": "ctx", "target": "cwd", "label": "cwd" },
+        { "id": "ctx-skip", "source": "ctx", "target": "skip", "label": "policy", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ctx-tools", "source": "ctx", "target": "tools", "label": "ctx" },
+        { "id": "cwd-tools", "source": "cwd", "target": "tools" },
+        { "id": "skip-tools", "source": "skip", "target": "tools", "label": "filter" },
+        { "id": "tools-list", "source": "tools", "target": "list", "label": "list", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-glob", "source": "tools", "target": "glob", "label": "glob", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-grep", "source": "tools", "target": "grep", "label": "grep", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-tree", "source": "tools", "target": "tree", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "list-observation", "source": "list", "target": "observation" },
+        { "id": "glob-observation", "source": "glob", "target": "observation" },
+        { "id": "grep-observation", "source": "grep", "target": "observation" },
+        { "id": "tree-observation", "source": "tree", "target": "observation" }
+      ]
+    },
+    {
+      "id": "web-boundary",
+      "label": "Web boundary",
+      "title": "Web tools still execute in the harness",
+      "summary": "web_fetch and web_search let the Agent see the outside world, but URL validation, HTTP requests, HTML conversion, and truncation all happen inside the tool boundary.",
+      "defaultActiveNodeId": "boundary",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "web_fetch / web_search",
+          "detail": "The model can only ask for a URL fetch or a query search. The harness tool performs the network access.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "route web call",
+          "detail": "ToolRegistry routes web_fetch / web_search to the matching function and passes ToolContext.",
+          "position": { "x": 270, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "boundary",
+          "kind": "data",
+          "label": "web boundary",
+          "eyebrow": "gate",
+          "body": "validate + timeout + cap",
+          "detail": "The web boundary centralizes URL scheme, credentials, hostname, timeout, content-type, response-size, and output-length checks.",
+          "position": { "x": 540, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "fetch",
+          "kind": "tool",
+          "label": "web_fetch",
+          "eyebrow": "url",
+          "body": "_validate_url",
+          "detail": "web_fetch allows only http(s), rejects credential-bearing URLs, and checks URL length and hostname shape.",
+          "position": { "x": 270, "y": 270 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "search",
+          "kind": "tool",
+          "label": "web_search",
+          "eyebrow": "query",
+          "body": "DuckDuckGo HTML",
+          "detail": "web_search uses DuckDuckGo HTML as the teaching fallback and unwraps redirect URLs into real result URLs.",
+          "position": { "x": 270, "y": 470 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "external",
+          "kind": "model",
+          "label": "external HTTP",
+          "eyebrow": "world",
+          "body": "httpx.Client",
+          "detail": "httpx.Client performs the real request with User-Agent, follow_redirects, and timeout; HTTP errors become observations.",
+          "position": { "x": 540, "y": 270 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "normalize",
+          "kind": "data",
+          "label": "normalize",
+          "eyebrow": "shape",
+          "body": "html2text / result URLs",
+          "detail": "HTML pages become markdown; search results become title + URL lines, giving the model clean text.",
+          "position": { "x": 810, "y": 270 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "truncate",
+          "kind": "data",
+          "label": "truncate_output",
+          "eyebrow": "context",
+          "body": "bounded web Observation",
+          "detail": "Pages and search results can be long, so the final observation is truncated before it enters messages.",
+          "position": { "x": 540, "y": 470 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "markdown or links",
+          "detail": "Successful content, network errors, and unsupported content-type failures all return as ToolResult.",
+          "position": { "x": 810, "y": 470 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "use-registry", "source": "tool-use", "target": "registry", "label": "dispatch" },
+        { "id": "registry-boundary", "source": "registry", "target": "boundary", "label": "ctx" },
+        { "id": "boundary-fetch", "source": "boundary", "target": "fetch", "label": "url", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "boundary-search", "source": "boundary", "target": "search", "label": "query", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "fetch-external", "source": "fetch", "target": "external", "label": "GET" },
+        { "id": "search-external", "source": "search", "target": "external", "label": "HTML", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "external-normalize", "source": "external", "target": "normalize", "label": "content" },
+        { "id": "normalize-truncate", "source": "normalize", "target": "truncate", "label": "text", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "truncate-result", "source": "truncate", "target": "result", "label": "return" }
+      ]
+    }
+  ]
+}

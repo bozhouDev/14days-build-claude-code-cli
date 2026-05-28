@@ -1,0 +1,34 @@
+--- pyproject.toml
++++ pyproject.toml
+@@ project scripts @@
++[project.scripts]
++agent-code = "agent_code.cli:main"
+
+--- shell
++++ shell
+@@ global install @@
++$ uv tool install -e .
++Installed 1 executable: agent-code
++
++$ agent-code --help
++Usage: agent-code [OPTIONS] [PROMPT] COMMAND [ARGS]...
++Options:
++  --cwd
++  --provider
++  --model
++  --base-url
++  --max-steps
++  --permission-mode
++  --resume
++  --continue
++  --help
+
+--- shell
++++ shell
+@@ cwd check @@
++$ cd /tmp
++$ agent-code --cwd /your/project "/context"
++cwd: /your/project
++session: (none)
++permission: default
++model: anthropic/deepseek-v4-flash

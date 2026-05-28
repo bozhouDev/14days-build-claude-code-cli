@@ -1,0 +1,40 @@
+{
+  "name": "agent-code-learn",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "NODE_OPTIONS=--max-old-space-size=12288 next dev",
+    "dev:webpack": "NODE_OPTIONS=--max-old-space-size=12288 next dev --webpack",
+    "build": "NODE_OPTIONS=--max-old-space-size=12288 next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@gsap/react": "^2.1.2",
+    "@xyflow/react": "^12.10.2",
+    "fumadocs-core": "latest",
+    "fumadocs-ui": "latest",
+    "gsap": "^3.15.0",
+    "lucide-react": "^0.378.0",
+    "next": "^16.2.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "shiki": "^1.6.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^20.12.12",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.19",
+    "fumadocs-mdx": "latest",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^4.0.0",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "react": "$react",
+    "react-dom": "$react-dom"
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "nodes": [
+    { "id": "user", "label": "User", "type": "process" },
+    { "id": "anthropic", "label": "AnthropicProvider", "type": "model" },
+    { "id": "messages", "label": "Messages", "type": "data" },
+    { "id": "tool", "label": "Tool Runtime", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "user",
+      "caption": "1. 用户输入 prompt：'今天几号？请用 system_date 工具回答'。CLI 把它包成 user message 放进 messages。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "anthropic",
+      "caption": "2. AnthropicProvider 把 messages 和工具 schema（含 system_date）一起发到 Messages API。模型自己没有时钟，返回一个 tool_use content block，stop_reason = tool_use。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_01ABC", "name": "system_date", "arguments": {} }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "messages",
+      "caption": "3. Harness 把 assistant 的 tool_use 整条 message append 回 messages。Day 2 和 Day 1 的关键差别：消息里不再是字符串，而是 content blocks。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" }
+      ]
+    },
+    {
+      "step": 4,
+      "focus": "tool",
+      "caption": "4. ToolRegistry 找到 system_date，执行 datetime.now().astimezone()，拿到当前系统时间字符串作为 observation。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "messages",
+      "caption": "5. Harness 把工具结果打包成一个 user message：role=user, content=[tool_result(tool_use_id=toolu_01ABC, content='2026-05-20 14:32:00 CST')]。这就是 Anthropic 的协议形状。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "anthropic",
+      "caption": "6. 第二次调 Anthropic，传入更新后的 messages。这次模型读到 tool_result，返回纯文本回答，stop_reason = end_turn。while step < max_steps 在这一帧退出。",
+      "messages": [
+        { "role": "user", "content": "今天几号？请用 system_date 工具回答" },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "今天是 2026 年 5 月 20 日。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

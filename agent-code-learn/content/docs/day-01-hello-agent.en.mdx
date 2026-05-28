@@ -1,0 +1,324 @@
+---
+title: "Day 1 — Hello Agent"
+description: "Today we write a ~150 line Python CLI called `agent-code`. By the end you'll see the model ask for a tool → execute → get a result → answer — the dividing line between an Agent and a chatbot."
+---
+
+Today we write a ~150 line Python CLI called `agent-code`.
+
+By the end you'll see the model **ask for a tool → execute → get a result → answer**. That's the dividing line between an Agent and a chatbot.
+
+This is a teaching project. We use the Claude Code source snapshot as an architecture reference and rewrite a minimal, teachable version in Python. We intentionally call our binary `agent-code` so it doesn't get confused with the official CLI.
+
+---
+
+### Quick look — the core loop
+
+Before writing any code, start with this Agent Logic Map. It does not replay every execution frame; it keeps only the two lines that matter for today's final shape: the minimum Agent Loop and the temporary Day 1 `messages` shape.
+
+```txt
+model proposes tool_call → harness executes tool → observation returns to messages
+```
+
+Notice the **harness** boundary in the middle: the model only proposes an action; `ToolRegistry` is what actually executes `echo`. In later days we keep adding real model protocol, file tools, and permission rules to that boundary.
+
+<AgentLogicMap mapPath="/lessons/day-01/logic-map.json" />
+
+---
+
+We'll start from the dumbest possible echo CLI and grow it into a tool-calling Agent over three small iterations. Every version actually runs with `uv run`, and after each one you see what new ability you got.
+
+## Setup — empty project
+
+Run these in your terminal to scaffold the project:
+
+```bash
+mkdir agent-code && cd agent-code
+uv init --package
+uv add typer rich
+uv add --dev pytest
+mkdir -p agent_code tests
+touch agent_code/__init__.py
+```
+
+Edit the key fields of `pyproject.toml` (leave everything else `uv init` generated):
+
+```toml
+[project]
+name = "agent-code"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "rich>=13.7.0",
+  "typer>=0.12.0",
+]
+
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+`[project.scripts]` is what lets `uv run agent-code` know that the entry is `main()` in `agent_code/cli.py`.
+
+> [!NOTE]
+> Reference snapshot lives in `packages/day-01-hello-agent/`. That's the answer key — **not** a directory you create every day. For the next 7 days you keep editing the same `agent-code` project.
+
+---
+
+## v1 — an echoing CLI (~15 lines)
+
+Simplest possible version: the CLI takes a string and echoes it.
+
+Create `agent_code/cli.py`:
+
+```python
+from __future__ import annotations
+
+import typer
+from rich.console import Console
+
+console = Console()
+app = typer.Typer(add_completion=False)
+
+
+@app.callback(invoke_without_command=True)
+def main_command(prompt: str = typer.Argument("hi")) -> None:
+    console.print(f"echo: {prompt}")
+
+
+def main() -> None:
+    app()
+```
+
+Run:
+
+```bash
+$ uv run agent-code "hi"
+echo: hi
+```
+
+This is basically a fancy `cat`. No model, no tools, no "doing anything". But it already lines up the skeleton: `uv run agent-code` works, the `pyproject.toml` entry is wired, `typer` parses the argument.
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v1-cli.diff" 
+  title="v1 — empty directory to minimal CLI entrypoint" 
+  description="Creates cli.py, wires up typer for arg parsing and rich for console output." 
+/>
+
+---
+
+## v2 — extract the "model" (~20 more lines)
+
+To turn this into an Agent, step one is to admit: **the thing answering the user shouldn't be the CLI — it should be a model.**
+
+Even if today the model is fake, we draw the boundary now. Tomorrow when we swap in real Claude, the CLI doesn't change.
+
+Create `agent_code/model.py`:
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class ModelResponse:
+    # one model response. v2 only has final text; v3 will add tool calls.
+    text: str
+
+
+class MockProvider:
+    def complete(self, prompt: str) -> ModelResponse:
+        # a fake model. fixed reply, just enough to draw the CLI <-> Provider boundary.
+        return ModelResponse(text=f"I'm MockProvider, you said: {prompt}")
+```
+
+At this point the boundary between <Concept name="Harness">CLI Harness</Concept> and <Concept name="Provider">Provider</Concept> is drawn.
+
+Two small edits in `cli.py`. Add this import at the top:
+
+```python
+from .model import MockProvider
+```
+
+Then replace the v1 line inside `main_command`:
+
+```python
+console.print(f"echo: {prompt}")
+```
+
+with:
+
+```python
+provider = MockProvider()
+response = provider.complete(prompt)
+console.print(f"final: {response.text}")
+```
+
+Run:
+
+```bash
+$ uv run agent-code "hi"
+final: I'm MockProvider, you said: hi
+```
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v1-to-v2.diff" 
+  title="v2 — split the model boundary" 
+  description="Hands the answering responsibility to MockProvider. ModelResponse becomes the contract so the CLI stops choosing what to print." 
+/>
+
+Now the CLI doesn't answer anymore — it delegates to `MockProvider`. But this "model" still only speaks. Tell it "echo hi using the echo tool" and it just parrots the words back. To actually *do* things, its output can't be only `text`.
+
+---
+
+## v3 — let the model ask for tools (the Agent Loop ships)
+
+For the model to do anything, it has to be able to say: "I want to call tool X with arguments Y." Then the program runs it, hands the result back, and the model continues.
+
+That `model says what → program runs it → result handed back to model` cycle is the <Concept name="Harness">Agent Loop</Concept>.
+
+We add it in three steps: extend the protocol, write the tool registry, wire the loop.
+
+### 3.1 Extend `model.py` so the model can write a "tool call slip"
+
+`MockProvider` now has two new needs:
+
+- `ModelResponse` needs to carry one or more <Concept name="Tool Call">Tool Calls</Concept>, not just `text`.
+- `complete()` no longer takes a single `prompt` — it takes a <Concept name="Messages">messages list</Concept>, because after a tool runs the model needs the full conversation to turn the result into a final answer.
+
+Rewrite `agent_code/model.py` entirely.
+
+### 3.2 The tool registry
+
+Now the model can say "I want to use `echo`". The program needs somewhere that maps tool names to actual Python functions.
+
+Create `agent_code/tools.py` to declare the tool abstraction and the registry container.
+
+When we add `read_file`, `bash` etc. later, it's just one more `register` line in `default_tools()`.
+
+### 3.3 Wire model + tools into the Agent Loop
+
+All the parts are here. Create `agent_code/agent.py` to manage the conversation turn-by-turn.
+
+Today the loop runs just once (one `tool_call` → <Concept name="Observation">observation</Concept> → one final answer). The `{"role": "tool"}` shape is a Day 1 simplification for the mock loop. Tomorrow when we hit real Claude, we'll switch to Anthropic's official `tool_use` / `tool_result` content blocks.
+
+Finally wire `cli.py` to `run_agent`. Two edits. Top-of-file imports become:
+
+```python
+from .agent import run_agent
+from .model import MockProvider
+from .tools import default_tools
+```
+
+The three lines from v2 inside `main_command` become:
+
+```python
+result = run_agent(prompt, MockProvider(), default_tools())
+for line in result.trace:
+    console.print(line)
+```
+
+Run:
+
+```bash
+$ uv run agent-code "echo hi using the echo tool"
+tool_call: echo {'text': 'hi'}
+observation: hi
+final: echo tool returned: hi
+```
+
+The full v2 → v3 diff:
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v2-to-v3.diff" 
+  title="v3 — complete the mock Agent loop" 
+  description="Rewrites model.py, adds tools.py with ToolRegistry, and adds agent.py for the loop. The harness runs a tool on the model's behalf and feeds the observation back." 
+/>
+
+**This is the minimum Agent Loop**:
+
+```txt
+model -> tool_call -> tool -> observation -> model -> final
+```
+
+v1's CLI could only echo. v2's "model" could only speak. v3 is the first time the model actually does something.
+
+---
+
+## Finishing touches — REPL, slash commands, --cwd
+
+v3 only supports one-shot mode: `agent-code "..."` runs once and exits. The official Claude Code also lets you just type `claude` to drop into a REPL with `/help`, `/exit` slash commands. We add the same layer. We also add a `--cwd` working directory flag, which Day 3's file tools will need.
+
+Replace `agent_code/cli.py` with the final version:
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v3-to-final.diff" 
+  title="v4 — CWD boundary and interactive shell (REPL)" 
+  description="Wraps cli.py for the last time: adds --cwd parsing, stdin loop (REPL), and a handle_slash interceptor for built-in commands." 
+/>
+
+Remember this boundary: **slash commands are handled by the CLI itself, never sent to the model as prompts.** Day 7 makes them extensible.
+
+---
+
+### Terminal replay
+
+Here's what running v3 looks like end-to-end:
+
+<TerminalReplay tracePath="/lessons/day-01/traces/echo-hi.json" />
+
+---
+
+## What you have today
+
+- **CLI runtime**: `uv run agent-code` supports both one-shot and REPL modes, knows about `--cwd`, intercepts `/help` and `/exit`.
+- **ModelResponse contract**: locked in v3. Tomorrow we swap in real Claude — same contract, the CLI doesn't change.
+- **Tool calling**: the model can output "I want to use tool X" rather than just text.
+- **Observation**: tool results flow back into messages, driving the next turn.
+- **Agent Loop**: `model -> tool -> observation -> model` — the smallest core of a code Agent.
+
+---
+
+## FAQ
+
+**`agent-code` command not found**
+
+Make sure `pyproject.toml` has:
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+Then use `uv run agent-code`, not `agent-code` directly.
+
+**My dict output uses single quotes**
+
+Python `dict` may print with single quotes. As long as you see `tool_call`, `observation`, `final` in order, it's correct.
+
+---
+
+## Challenges
+
+- [ ] **Challenge 1**: add an `uppercase` tool that uppercases its input.
+- [ ] **Challenge 2**: improve `ToolRegistry.run()` error for unknown tools (include the list of available tools).
+- [ ] **Challenge 3**: make `/help` print all currently registered tools.
+
+---
+
+## Thinking questions
+
+A few open-ended questions. Try to answer each in one sentence before reading on. If an interviewer ever drills into the Agent layer, this is what gets tested.
+
+1. **In one sentence, what is the Agent Loop?** Where does it fundamentally differ from a regular chatbot?
+
+2. **What role does `ToolRegistry` play in the harness?** Without it, if you just dispatched directly in the Agent Loop with `if call.name == "echo": ...`, what would go wrong?
+
+3. **In v2 we split the "model" into `MockProvider`, even though the CLI doesn't strictly need that boundary today — is this overkill?** (Hint: peek at Day 2 when we plug in the real model and count how many lines of `cli.py` actually change.)
+
+4. **The v3 output `tool_call → observation → final` is the minimum Agent Loop.** If you had to explain to a coworker in three sentences what `model` / `harness` / `tool` each do along this chain, what would you say?
+
+---
+
+## Tomorrow
+
+Today we ran the minimum Agent Loop on a `MockProvider`. Tomorrow we swap `MockProvider` for a real Claude provider, and grow the single-step `for` into `while step < max_steps`. Because `ModelResponse` is already locked, tomorrow doesn't rewrite the Agent Loop — only the provider.

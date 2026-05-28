@@ -1,0 +1,465 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 3 · File + Web tools",
+  "subtitle": "这张图只放 Day 3 的核心变化：ToolContext、fs_safety、本地发现工具、Web 工具边界。",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "从 prompt 到文件 Observation 的主循环",
+      "summary": "模型只提出 tool_use；ToolRegistry 通过 ToolContext 把 cwd、SkipPolicy、ReadFileState 交给工具，工具执行后把 tool_result blocks 写回 messages。",
+      "defaultActiveNodeId": "ctx",
+      "nodes": [
+        {
+          "id": "prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "入口文件在哪里？",
+          "detail": "用户仍然只输入自然语言。CLI 解析 prompt 和 --cwd，但不会自己猜要读哪个文件。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "Anthropic content blocks",
+          "detail": "messages 保存用户问题、assistant tool_use，以及 harness 回填的 user tool_result blocks。",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "provider",
+          "body": "complete(messages, tools)",
+          "detail": "provider 仍然只做协议适配，把 tools schema 发给模型，再把 tool_use content block 翻译成内部 ToolCall。",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "model-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "tool_use",
+          "body": "list_files / read_file",
+          "detail": "模型返回的是请求：例如先 list_files，再 read_file pyproject.toml。模型没有直接访问文件系统。",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run(call, ctx)",
+          "detail": "ToolRegistry 根据 ToolCall.name 路由到具体 Python 函数，并把同一个 ToolContext 传进去。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "ToolContext",
+          "eyebrow": "runtime",
+          "body": "cwd + SkipPolicy + ReadFileState",
+          "detail": "这是 Day 3 的关键抽象：工具不摸全局状态，而是通过 ToolContext 拿 cwd、skip 规则和 read_state。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "local-tools",
+          "kind": "tool",
+          "label": "local file tools",
+          "eyebrow": "tools",
+          "body": "list / read / grep",
+          "detail": "本地工具负责真正读目录、读文件、按名字找、按内容搜。每个工具都先服从 ToolContext 里的 cwd 和 skip policy。",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "tool_result blocks",
+          "eyebrow": "observation",
+          "body": "bounded Observation",
+          "detail": "Day 3 会把同一轮 assistant 里所有 tool_use 的结果打包进紧接着的一条 user message，避免 Anthropic API 拒绝。",
+          "position": { "x": 300, "y": 540 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "tool_call / final",
+          "detail": "终端只展示 trace：tool_call、observation、final。完整 messages 和 read_state 留在 harness 内存里。",
+          "position": { "x": 0, "y": 540 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "prompt-messages", "source": "prompt", "target": "messages", "label": "wrap" },
+        { "id": "messages-provider", "source": "messages", "target": "provider", "label": "complete" },
+        { "id": "provider-response", "source": "provider", "target": "model-response", "label": "tool_use" },
+        {
+          "id": "response-registry",
+          "source": "model-response",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        { "id": "registry-ctx", "source": "registry", "target": "ctx", "label": "ctx", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "ctx-tools", "source": "ctx", "target": "local-tools", "label": "runtime", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        {
+          "id": "tools-result",
+          "source": "local-tools",
+          "target": "tool-result",
+          "label": "observe",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "sourceHandle": "source-top",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "fs-safety",
+      "label": "fs_safety gate",
+      "title": "read_file 的 fs_safety 安全门",
+      "summary": "read_file 不直接读盘，而是先经过 cwd 锁定、文本判断、大小上限、ReadFileState 记录和输出截断。",
+      "defaultActiveNodeId": "resolve",
+      "nodes": [
+        {
+          "id": "read-file",
+          "kind": "tool",
+          "label": "read_file",
+          "eyebrow": "tool",
+          "body": "path from model",
+          "detail": "模型只提供相对路径，例如 pyproject.toml。这个参数不能直接交给 Path.read_text。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "resolve",
+          "kind": "data",
+          "label": "resolve_in_cwd",
+          "eyebrow": "gate 1",
+          "body": "lock path inside cwd",
+          "detail": "resolve_in_cwd 把模型给的路径解析成绝对路径，再用 relative_to(cwd) 证明它没有逃出 cwd。",
+          "position": { "x": 270, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "text",
+          "kind": "data",
+          "label": "ensure_text_file",
+          "eyebrow": "gate 2",
+          "body": "reject binary",
+          "detail": "白名单后缀直接放行；其他文件 peek 前 1 KiB，看到 NUL 字节就作为二进制拒绝。",
+          "position": { "x": 540, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "size",
+          "kind": "data",
+          "label": "ensure_within_size",
+          "eyebrow": "gate 3",
+          "body": "256 KiB cap",
+          "detail": "单文件超过 256 KiB 就拒绝整文件读取，引导模型改用 grep 或后续 offset/limit 版本。",
+          "position": { "x": 810, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "read-text",
+          "kind": "tool",
+          "label": "Path.read_text",
+          "eyebrow": "world",
+          "body": "read disk",
+          "detail": "只有三道 gate 都通过，harness 才真正读取磁盘内容。",
+          "position": { "x": 810, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "record",
+          "kind": "data",
+          "label": "ReadFileState",
+          "eyebrow": "state",
+          "body": "record(mtime, chars)",
+          "detail": "Day 3 只记录，不读取。Day 4 的 read-before-edit 会用这份状态判断文件是否在读取后又被改过。",
+          "position": { "x": 540, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "truncate",
+          "kind": "data",
+          "label": "truncate_output",
+          "eyebrow": "context",
+          "body": "max 8000 chars",
+          "detail": "工具 observation 进入模型上下文前会被截断，防止单次工具结果把上下文撑爆。",
+          "position": { "x": 270, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "text or error",
+          "detail": "成功和失败都会变成 ToolResult。未知文件、越界、二进制、大文件都不会让 Agent Loop 崩掉。",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "read-resolve", "source": "read-file", "target": "resolve", "label": "path" },
+        { "id": "resolve-text", "source": "resolve", "target": "text", "label": "safe path" },
+        { "id": "text-size", "source": "text", "target": "size", "label": "text" },
+        { "id": "size-read", "source": "size", "target": "read-text", "label": "ok", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "read-record", "source": "read-text", "target": "record", "label": "record", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "record-truncate", "source": "record", "target": "truncate", "label": "content", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "truncate-result", "source": "truncate", "target": "result", "label": "return" }
+      ]
+    },
+    {
+      "id": "local-discovery",
+      "label": "Local tools",
+      "title": "本地发现工具如何共享 cwd 和 skip 规则",
+      "summary": "list_files、glob、grep、project_tree 各自回答不同问题，但都通过 ToolContext 共享 cwd、SkipPolicy 和 .gitignore 过滤。",
+      "defaultActiveNodeId": "skip",
+      "nodes": [
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "ToolContext",
+          "eyebrow": "runtime",
+          "body": "shared tool runtime",
+          "detail": "ToolContext 是所有工具的统一入口，后续 permission、session、memory 都可以继续往这里挂。",
+          "position": { "x": 440, "y": 20 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "cwd",
+          "kind": "data",
+          "label": "cwd",
+          "eyebrow": "boundary",
+          "body": "--cwd resolved",
+          "detail": "cwd 是本地文件工具的边界圆。所有相对路径都必须先证明自己在 cwd 内。",
+          "position": { "x": 140, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "skip",
+          "kind": "data",
+          "label": "SkipPolicy",
+          "eyebrow": "filter",
+          "body": ".gitignore + skip_dirs",
+          "detail": "SkipPolicy 把 .git/、.venv/、node_modules/、__pycache__/ 和 cwd 根 .gitignore 统一挡在工具输出外。",
+          "position": { "x": 440, "y": 170 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "tools",
+          "kind": "tool",
+          "label": "local file tools",
+          "eyebrow": "toolbox",
+          "body": "read project state",
+          "detail": "这些工具让模型看见代码，但仍然不是模型直接访问文件系统。真正执行都在 harness 内。",
+          "position": { "x": 740, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "list",
+          "kind": "tool",
+          "label": "list_files",
+          "eyebrow": "one level",
+          "body": "directory entries",
+          "detail": "list_files 看一层目录，适合先摸项目顶层结构。",
+          "position": { "x": 0, "y": 360 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "glob",
+          "kind": "tool",
+          "label": "glob",
+          "eyebrow": "names",
+          "body": "**/*.py",
+          "detail": "glob 按文件名模式找文件，并按 mtime 倒序返回最近改动的结果。",
+          "position": { "x": 300, "y": 360 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "grep",
+          "kind": "tool",
+          "label": "grep",
+          "eyebrow": "contents",
+          "body": "rg first, Python fallback",
+          "detail": "grep 优先调用 ripgrep，失败或缺失时退回纯 Python，输出都统一成 path:line:content。",
+          "position": { "x": 600, "y": 360 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tree",
+          "kind": "tool",
+          "label": "project_tree",
+          "eyebrow": "overview",
+          "body": "bounded tree",
+          "detail": "project_tree 一次给项目结构全景，但有深度、节点数和输出长度限制。",
+          "position": { "x": 900, "y": 360 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "observation",
+          "kind": "response",
+          "label": "Observation",
+          "eyebrow": "result",
+          "body": "clean bounded output",
+          "detail": "所有本地发现工具最终都产出受控 observation，进入下一轮 user tool_result content blocks。",
+          "position": { "x": 440, "y": 560 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "ctx-cwd", "source": "ctx", "target": "cwd", "label": "cwd" },
+        { "id": "ctx-skip", "source": "ctx", "target": "skip", "label": "policy", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ctx-tools", "source": "ctx", "target": "tools", "label": "ctx" },
+        { "id": "cwd-tools", "source": "cwd", "target": "tools" },
+        { "id": "skip-tools", "source": "skip", "target": "tools", "label": "filter" },
+        { "id": "tools-list", "source": "tools", "target": "list", "label": "list", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-glob", "source": "tools", "target": "glob", "label": "glob", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-grep", "source": "tools", "target": "grep", "label": "grep", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "tools-tree", "source": "tools", "target": "tree", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "list-observation", "source": "list", "target": "observation" },
+        { "id": "glob-observation", "source": "glob", "target": "observation" },
+        { "id": "grep-observation", "source": "grep", "target": "observation" },
+        { "id": "tree-observation", "source": "tree", "target": "observation" }
+      ]
+    },
+    {
+      "id": "web-boundary",
+      "label": "Web boundary",
+      "title": "Web 工具仍然由 harness 执行",
+      "summary": "web_fetch 和 web_search 让 Agent 看外部世界，但 URL 校验、HTTP 请求、HTML 转换、结果截断都在工具边界内完成。",
+      "defaultActiveNodeId": "boundary",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "web_fetch / web_search",
+          "detail": "模型只能提出请求：要抓哪个 URL，或搜什么 query。真正联网的是 harness 工具。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "route web call",
+          "detail": "ToolRegistry 把 web_fetch / web_search 路由到对应函数，并传入 ToolContext。",
+          "position": { "x": 270, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "boundary",
+          "kind": "data",
+          "label": "web boundary",
+          "eyebrow": "gate",
+          "body": "validate + timeout + cap",
+          "detail": "Web 边界集中处理 URL scheme、credentials、hostname、超时、content-type、response size 和输出长度。",
+          "position": { "x": 540, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "fetch",
+          "kind": "tool",
+          "label": "web_fetch",
+          "eyebrow": "url",
+          "body": "_validate_url",
+          "detail": "web_fetch 只允许 http(s)，拒绝带账号密码的 URL，并限制 URL 长度和 hostname 形状。",
+          "position": { "x": 270, "y": 270 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "search",
+          "kind": "tool",
+          "label": "web_search",
+          "eyebrow": "query",
+          "body": "DuckDuckGo HTML",
+          "detail": "web_search 用 DuckDuckGo HTML 端点做教学版搜索，并把跳转 URL unwrap 成真实结果地址。",
+          "position": { "x": 270, "y": 470 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "external",
+          "kind": "model",
+          "label": "external HTTP",
+          "eyebrow": "world",
+          "body": "httpx.Client",
+          "detail": "httpx.Client 执行实际请求，设置 User-Agent、follow_redirects 和 timeout；HTTP 错误被转成 observation。",
+          "position": { "x": 540, "y": 270 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "normalize",
+          "kind": "data",
+          "label": "normalize",
+          "eyebrow": "shape",
+          "body": "html2text / result URLs",
+          "detail": "HTML 页面转成 markdown；搜索结果转成 title + url 列表，让模型看到的是干净文本。",
+          "position": { "x": 810, "y": 270 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "truncate",
+          "kind": "data",
+          "label": "truncate_output",
+          "eyebrow": "context",
+          "body": "bounded web Observation",
+          "detail": "网页和搜索结果都可能很长，最终必须统一截断后再进入 messages。",
+          "position": { "x": 540, "y": 470 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "markdown or links",
+          "detail": "Web 工具的成功结果、网络错误、unsupported content-type 都作为 ToolResult 返回给模型。",
+          "position": { "x": 810, "y": 470 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "use-registry", "source": "tool-use", "target": "registry", "label": "dispatch" },
+        { "id": "registry-boundary", "source": "registry", "target": "boundary", "label": "ctx" },
+        { "id": "boundary-fetch", "source": "boundary", "target": "fetch", "label": "url", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "boundary-search", "source": "boundary", "target": "search", "label": "query", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "fetch-external", "source": "fetch", "target": "external", "label": "GET" },
+        { "id": "search-external", "source": "search", "target": "external", "label": "HTML", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "external-normalize", "source": "external", "target": "normalize", "label": "content" },
+        { "id": "normalize-truncate", "source": "normalize", "target": "truncate", "label": "text", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "truncate-result", "source": "truncate", "target": "result", "label": "return" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "title": "Day 3 · fs_safety boundary + ReadFileState hook",
+  "task": "Use the read_file tool to read pyproject.toml and tell me the project name",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "Use read_file on pyproject.toml; tell me the project name" },
+      "ledger": { "delta": "messages += user('Use read_file on pyproject.toml...')" },
+      "caption": "CLI parses the prompt and stuffs cwd into ToolContext. From today on, cwd isn't just a header line — it's the boundary circle for every file tool the model can call.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: read_file(path='pyproject.toml')" },
+      "caption": "AnthropicProvider translates ToolRegistry.list() into input_schema and sends it to the Messages API. The model reads the tool list, decides to call read_file, and passes only a relative path.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "fs_safety: resolve_in_cwd + ensure_text_file + ensure_within_size", "state": "open", "target": "pyproject.toml" },
+      "caption": "Day 3's gate adds three checks over Day 1/2: resolve_in_cwd locks the relative path back into the cwd subtree (escape → ValueError); ensure_text_file uses a suffix allowlist or NUL-byte peek to reject binaries; ensure_within_size caps a single file at 256 KiB. Only after all three pass does the read happen.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "read_file(path='pyproject.toml') → [project] name=\"agent-code\"..." },
+      "caption": "Path.read_text reads pyproject.toml into memory, then truncate_output trims to 8000 chars. ReadFileState.record(path, content) stores (mtime_ns, char_count) — Day 4's read-before-edit will diff this record against the disk mtime to detect file drift between read and edit.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result])" },
+      "caption": "Day 3 also reshapes messages: append the assistant's tool_use message first, then bundle every tool_result from this round into one user message's content blocks — one batch per round, no longer one message per tool_use like Day 2.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: The project name is agent-code." },
+      "caption": "AnthropicProvider calls the model a second time. The model reads the [project] block inside the tool_result, returns plain text with stop_reason=end_turn. The for step in range(max_steps) loop exits here.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "The project name is agent-code.",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: The project name is agent-code.'" },
+      "caption": "CLI prints the three trace lines: tool_call, observation, final. The whole conversation and the ReadFileState are still in memory — Day 4's file_edit starts from this same ctx.read_state.",
+      "messages": [
+        { "role": "user", "content": "Use read_file on pyproject.toml; tell me the project name" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "The project name is agent-code.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

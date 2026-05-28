@@ -1,0 +1,12 @@
+{
+  "title": "Agent CLI",
+  "pages": [
+    "day-01-hello-agent",
+    "day-02-real-model-tool-calling",
+    "day-03-file-and-web-tools",
+    "day-04-safe-edit",
+    "day-05-bash-permissions",
+    "day-06-session-memory",
+    "day-07-slash-hooks"
+  ]
+}

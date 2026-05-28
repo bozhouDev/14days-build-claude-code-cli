@@ -1,0 +1,504 @@
+---
+title: "Day 6：Session + Memory（三层记忆）"
+description: "Day 5 让 Agent 能跑命令、有权限控制。今天补上三层记忆：Session JSONL、AGENT.md 项目规则、memdir 长期记忆，让 Agent 退出后还能接着说。"
+---
+
+Day 5 让 Agent 能跑命令，也有了权限引擎。但每次 `agent-code` 退出后，对话历史就丢了：下一次启动时，模型完全不记得上一轮说过什么、改过哪些文件。
+
+今天给 <Concept name="Harness">harness</Concept> 加三层记忆：会话历史自动落盘到 JSONL，cwd 下的 `AGENT.md` 自动进入 system prompt，模型还能用 `memory_write` / `memory_recall` 把长期事实写进 `.agent/memory/`。跑完之后，`--resume <id>` / `-c` 能续上旧会话，新 session 也能从 MEMORY.md 索引里找回项目和用户事实。
+
+代码约 400 行新增，改 4 个老文件，新增 7 个文件。没有新依赖，`uuid`、`json`、`datetime` 都是标准库。
+
+---
+
+### Day 6 核心链路图：三层记忆边界
+
+先看这张 Agent Logic Map。它不复述每一帧执行细节，只抓今天最容易混在一起的三条线：`Session.history` 如何把 JSONL 读回 <Concept name="Messages">messages</Concept>，`build_system_prompt(cwd)` 如何把 core prompt、`AGENT.md`、MEMORY.md 分层注入，以及 `memory_write` / `memory_recall` 如何跨 session 读写 memdir。
+
+```txt
+session JSONL 负责续聊；system prompt 负责规则和索引；memdir 负责长期事实。
+```
+
+<AgentLogicMap mapPath="/lessons/day-06/logic-map.json" />
+
+---
+
+今天从 Day 5 的 `agent-code` 项目继续改。仓库里 Day 5/Day 6 的 `packages/day-*` 参考快照暂未补齐，本页面的 diff 以 `docs/day-06-session-memory.md` 里的代码块为事实依据。
+
+## 起手：今天的起点
+
+Day 5 末尾已经有 `bash`、权限引擎、`ask_user_question`、后台 bash。今天围绕这套 Agent Loop 加四件事：
+
+- 新文件 `session.py`：创建、加载、追加 JSONL 会话。
+- 新文件 `project_memory.py`：读取 cwd 下的 `AGENT.md`，包装成 `<project-rules>`。
+- 新文件 `compact_basic.py`：超过 40 条消息时做确定性 compact。
+- 新子包 `memdir/`：长期记忆目录、索引、写入和召回。
+
+会同步改 `model.py`、`agent.py`、`cli.py`、`permissions.py`、`tools.py`。主线分四步：v1 session，v2 `AGENT.md`，v3 compact，v4 memdir。
+
+---
+
+## v1：Session JSONL + `--resume` / `-c`
+
+先解决最痛的问题：每次退出后对话历史就没了。v1 新建 `Session` 类，负责 session id、JSONL 文件路径、历史读取、追加写入。Agent Loop 不需要知道文件怎么组织，只拿 `session.history` 和 `session.append_messages()`。
+
+### 1.1 新建 `agent_code/session.py`
+
+`Session` 的核心接口只有三个工厂方法和两个读写入口：
+
+```python
+class Session:
+    """一次会话。管理 session id、JSONL 落盘、读取历史消息。"""
+
+    @classmethod
+    def create(cls, cwd: Path) -> "Session":
+        sid = uuid.uuid4().hex[:12]
+        file_path = _sessions_dir(cwd) / f"{sid}.jsonl"
+        file_path.touch()
+        return cls(cwd=cwd, session_id=sid, file_path=file_path, resumed=False)
+
+    @classmethod
+    def load_latest(cls, cwd: Path) -> "Session | None":
+        sessions_dir = _sessions_dir(cwd)
+        jsonl_files = list(sessions_dir.glob("*.jsonl"))
+        if not jsonl_files:
+            return None
+        latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
+        return cls(cwd=cwd, session_id=latest.stem, file_path=latest, resumed=True)
+
+    def append_messages(self, msgs: list[dict[str, Any]]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with open(self.file_path, "a", encoding="utf-8") as f:
+            for msg in msgs:
+                record = {"role": msg["role"], "content": msg["content"], "timestamp": now}
+                f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+```
+
+JSONL 是 append-only：一条消息一行 JSON，崩溃时最多丢当前回合，不需要重写整个文件。
+
+### 1.2 接入 `agent.py` 和 `cli.py`
+
+`run_agent()` 多接一个 `session` 参数。有历史就先恢复，没有就从当前 prompt 冷启动；每次把新增 user prompt、assistant final、tool_result 回合追加到 JSONL：
+
+```python
+if session and session.history:
+    messages = list(session.history)
+    messages.append({"role": "user", "content": prompt})
+else:
+    messages = [{"role": "user", "content": prompt}]
+
+if session:
+    session.append_messages([messages[-1]])
+```
+
+CLI 侧加两个入口：`--resume <id>` 指定恢复，`--continue` / `-c` 恢复 cwd 最近一次会话。一次性命令和 REPL 都共享同一套 `Session`。
+
+### 1.3 跑一下
+
+```bash
+$ uv run agent-code "用 echo 工具说 hello"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+session: a1b2c3d4e5f6
+
+tool_call: echo {'text': 'hello'}
+observation: hello
+final: 已经用 echo 工具说出了 "hello"。
+```
+
+继续最近会话：
+
+```bash
+$ uv run agent-code -c "我们上次说了什么"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+session: a1b2c3d4e5f6 (resumed)
+
+final: 我们上次用 echo 工具说了 "hello"。
+```
+
+`session_id` 是随机的，你看到的值会不同。确定性判断点是：`-c` 输出同一个 id，且带 `(resumed)` 后缀。
+
+<DiffCard
+  diffPath="/lessons/day-06/diffs/v1-session-jsonl.diff"
+  title="v1 阶段：Session JSONL + 恢复入口"
+  description="新建 session.py；agent.py 从 session.history 恢复 messages 并追加 JSONL；cli.py 加 --resume / --continue / -c。"
+/>
+
+---
+
+## v2：`AGENT.md` 项目规则注入
+
+Session 只能记住一次对话，项目规则还需要你每次重复。v2 让 CLI cold start 时读取 cwd 下的 `AGENT.md`，包装成 `<project-rules>` 后通过 Anthropic Messages API 的 `system` 字段传给模型。
+
+### 2.1 新建 `project_memory.py`
+
+这个模块只做一件事：读 cwd 下的 `AGENT.md`。文件不存在不是错误，返回 `None` 即可：
+
+```python
+def load_agent_md(cwd: Path) -> str | None:
+    """读取 cwd 下的 AGENT.md，包装成 <project-rules> 块。
+    文件不存在返回 None——不是错误，只是没配置。"""
+    agent_md = cwd / "AGENT.md"
+    if not agent_md.exists():
+        return None
+    content = agent_md.read_text(encoding="utf-8", errors="replace").strip()
+    if not content:
+        return None
+    if len(content.encode("utf-8")) > _MAX_AGENT_MD_BYTES:
+        truncated = content.encode("utf-8")[:_MAX_AGENT_MD_BYTES].decode("utf-8", errors="replace")
+        content = truncated + "\n\n[... AGENT.md truncated at 50 KB ...]"
+    return f"<project-rules>\n{content}\n</project-rules>"
+```
+
+只读 cwd 一层，不向父目录 walk。对初学者来说，`cat AGENT.md` 就能看到模型看到的规则，调试成本最低。
+
+### 2.2 `model.py` 暴露 `system` 参数
+
+Anthropic Messages API 里，system prompt 和 <Concept name="Messages">messages</Concept> 是平级输入。接口也要把这条边界暴露出来：
+
+```python
+class ModelProvider(Protocol):
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        system: str | None = None,
+    ) -> ModelResponse:
+        ...
+```
+
+`AnthropicProvider.complete()` 只在 `system` 有值时把它塞进 `kwargs["system"]`；`MockProvider` 签名对齐，但不读取 system。
+
+### 2.3 `build_system_prompt(cwd)`
+
+`agent.py` 公开一个组装函数，CLI cold start 调一次，REPL 多轮共享同一份 system prompt：
+
+```python
+_SYSTEM_CORE = (
+    "You are an AI coding agent running inside a CLI harness. "
+    "You have access to tools for reading/writing files, running shell commands, "
+    "searching the web, and asking the user questions. "
+    "Use tools when needed; respond directly when you can."
+)
+
+
+def build_system_prompt(cwd: Path) -> str:
+    parts: list[str] = [_SYSTEM_CORE]
+    agent_md = load_agent_md(cwd)
+    if agent_md:
+        parts.append(agent_md)
+    return "\n\n".join(parts)
+```
+
+### 2.4 跑一下
+
+```bash
+$ cat > AGENT.md << 'EOF'
+# 项目规则（demo）
+- 所有代码必须用 Python 3.10+，写完整 type hints。
+- 测试框架用 pytest，测试文件放在 tests/ 目录下。
+- 不要用 print 打日志，用 logging 模块。
+EOF
+
+$ uv run python -c "
+from pathlib import Path
+from agent_code.agent import build_system_prompt
+print(build_system_prompt(Path.cwd()))
+"
+```
+
+预期输出会包含：
+
+```txt
+You are an AI coding agent running inside a CLI harness. ...
+
+<project-rules>
+# 项目规则（demo）
+- 所有代码必须用 Python 3.10+，写完整 type hints。
+- 测试框架用 pytest，测试文件放在 tests/ 目录下。
+- 不要用 print 打日志，用 logging 模块。
+</project-rules>
+```
+
+这个检查不依赖模型行为。只要 `build_system_prompt` 输出对，system prompt 注入链路就通了一半；再用 `uv run agent-code "这个项目有什么规则"` 可以看模型复述规则。
+
+<DiffCard
+  diffPath="/lessons/day-06/diffs/v1-to-v2.diff"
+  title="v2 阶段：AGENT.md → system prompt"
+  description="新建 project_memory.py；model.py complete() 加 system 参数；agent.py 暴露 build_system_prompt；cli.py cold start 读一次规则。"
+/>
+
+更完整的代码 Agent 通常不是只读当前目录一个文件。它会把几类规则拼起来：用户级规则（比如 `~/.claude/CLAUDE.md`，记录你的长期偏好）、项目级规则（从 cwd 往父目录递归找 `CLAUDE.md` / `.claude/CLAUDE.md`）、项目私有覆盖（比如 `CLAUDE.local.md`），有的还会支持 `.claude/rules/*.md` 这种目录化规则。这样做适合真实工程，但第一版教学代码如果一上来做递归、优先级和多文件合并，读者很难判断模型到底看到了哪一份规则。
+
+所以 v2 先收窄：只读 cwd 下的 `AGENT.md`，不读用户级规则，也不向父目录递归。这个版本的目标不是复刻完整规则系统，而是跑通最关键的 <Concept name="Harness">harness</Concept> 边界：CLI 在 cold start 读一次规则，拼进 `system_prompt`，再由 provider 透传给模型。也正因为只读一层，`load_agent_md()` 暂时不用处理规则优先级和冲突。
+
+---
+
+## v3：最简 Compact
+
+Session JSONL 会越存越长，内存里的 `messages` 也可能越来越大。v3 做一个确定性压缩：保留最早 2 条 pinned、最近 8 条 working，把中间消息压成一条 `<compacted-history>` user message。
+
+注意：被压的是 `messages` 数组，不是 system prompt。`AGENT.md` 和 MEMORY.md 通过 `provider.complete(system=...)` 单独传，不会被 compact 触及。
+
+### 3.1 新建 `compact_basic.py`
+
+```python
+def compact(messages: list[dict[str, Any]], keep: int = 8) -> list[dict[str, Any]]:
+    """确定性压缩消息历史。不调 LLM。"""
+    pin_count = 2
+    if len(messages) <= keep + pin_count:
+        return messages
+
+    pinned = messages[:pin_count]
+    working = messages[-keep:]
+    middle = messages[pin_count:-keep]
+    compressed = _build_compressed_block(middle)
+    return pinned + [compressed] + working
+```
+
+`_build_compressed_block()` 只做统计：消息数量、工具调用次数、用过哪些工具、读过哪些文件、改过哪些文件、跑过哪些命令。它不会假装理解业务语义，LLM 摘要留到 Day 11。
+
+### 3.2 Agent Loop 自动触发
+
+在每次 `provider.complete()` 前检查消息数量：
+
+```python
+if len(messages) > 40:
+    messages = compact(messages, keep=8)
+    console.print(f"[dim]compacted: {len(messages)} messages remaining[/dim]")
+```
+
+40 不是模型上下文上限估算。现在很多模型上下文已经远大于 8K，单靠消息条数判断"快满了"并不靠谱：一条大的 `tool_result` 可能比 20 条普通聊天还大，反过来 100 条短消息也可能很小。Day 6 把阈值写死成 40，只是为了让读者在本地容易触发 compact，亲眼看到"旧消息被折叠成摘要、最近消息保留原样"这条链路。真正的自动 compact 应该看 token 用量、tool_result 大小、模型上下文窗口和预留 buffer；Day 11 再把它换成基于 token 预算的动态阈值。
+
+### 3.3 跑一下
+
+```bash
+$ uv run python -c "
+from agent_code.compact_basic import compact
+
+msgs = []
+for i in range(15):
+    msgs.append({'role': 'user', 'content': f'task step {i}'})
+    msgs.append({'role': 'assistant', 'content': [
+        {'type': 'text', 'text': f'doing step {i}'},
+        {'type': 'tool_use', 'id': f'c{i}', 'name': 'read_file', 'input': {'path': f'file{i}.py'}},
+    ]})
+    msgs.append({'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': f'c{i}', 'content': f'content of file{i}'}
+    ]})
+
+print(f'before: {len(msgs)} messages')
+result = compact(msgs, keep=8)
+print(f'after: {len(result)} messages')
+"
+```
+
+预期看到 `before: 45 messages`、`after: 11 messages`。11 条 = 2 pinned + 1 summary + 8 working。
+
+<DiffCard
+  diffPath="/lessons/day-06/diffs/v2-to-v3.diff"
+  title="v3 阶段：确定性 compact"
+  description="新增 compact_basic.py；agent.py 在模型调用前检查 messages 数量，超过 40 条就压成 pinned / compressed / working 三段。"
+/>
+
+---
+
+## v4：Memdir 长期记忆
+
+v1-v3 都还偏向当前 session。v4 加跨 session 记忆：模型可以把“用户是数据科学家，主要研究观测性”写入 `.agent/memory/`，新 session 不用 `-c` 也能通过 MEMORY.md 索引看到这条事实。
+
+### 4.1 `memdir/` 子包
+
+memdir 由四个文件组成：`paths.py` 管目录和截断常量，`types.py` 管 `MemoryEntry` 和 slug，`store.py` 管 `load_index` / `write_memory` / `recall_memory`，`__init__.py` re-export 公共 API。
+
+```python
+MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
+
+@dataclass
+class MemoryEntry:
+    mem_type: str
+    title: str
+    slug: str
+    body: str
+    file_path: str
+```
+
+`write_memory()` 一次工具调用同时做两件事：写 topic 文件，并追加 MEMORY.md 索引行。这样模型不会忘记第二步。
+
+### 4.2 权限与工具注册
+
+`memory_recall` 是纯读，放进 `_READONLY_TOOLS`；`memory_write` 是低风险写，单独放进 `_LOW_RISK_WRITES`，在 default / acceptEdits 自动 allow，但 plan 模式仍然 deny。
+
+```python
+_LOW_RISK_WRITES = frozenset({"memory_write"})
+
+if tool_name in _LOW_RISK_WRITES:
+    return PermissionDecision("allow")
+```
+
+工具函数只做薄包装：校验参数，调用 `write_memory()` / `recall_memory()`，把结果转成 <Concept name="Observation">observation</Concept>。
+
+### 4.3 MEMORY.md 注入 system prompt
+
+v4 把 v2 的 `build_system_prompt()` 替换成三层拼接：
+
+```python
+def build_system_prompt(cwd: Path) -> str:
+    """组装 system prompt：核心指南 + AGENT.md + MEMORY.md 索引。"""
+    from .memdir.store import load_index as load_memory_index
+
+    parts: list[str] = [_SYSTEM_CORE]
+    agent_md = load_agent_md(cwd)
+    if agent_md:
+        parts.append(agent_md)
+
+    memory_index = load_memory_index(cwd)
+    if memory_index:
+        parts.append(f"<project-memory>\n{memory_index}\n</project-memory>")
+
+    return "\n\n".join(parts)
+```
+
+### 4.4 跑一下
+
+先跑函数级确定性验证，不污染真实项目：
+
+```bash
+$ uv run python -c "
+import tempfile
+from pathlib import Path
+from agent_code.memdir.store import write_memory, recall_memory
+from agent_code.agent import build_system_prompt
+
+with tempfile.TemporaryDirectory() as tmp:
+    cwd = Path(tmp)
+    entry = write_memory(cwd, 'user', '用户角色', '用户是数据科学家，主要研究方向是观测性。')
+    print('written:', entry.file_path)
+    hits = recall_memory(cwd, '数据科学家')
+    print('recalled:', len(hits), 'entries')
+    print('first hit type:', hits[0].mem_type, 'title:', hits[0].title)
+    sp = build_system_prompt(cwd)
+    print('project-memory in system prompt:', '<project-memory>' in sp)
+"
+```
+
+预期输出：
+
+```txt
+written: .agent/memory/user/mem-247c9e11.md
+recalled: 1 entries
+first hit type: user title: 用户角色
+project-memory in system prompt: True
+```
+
+再看真实模型写入一条记忆：
+
+```bash
+$ uv run agent-code "我是数据科学家，主要研究观测性。记住这一点。"
+tool_call: memory_write {'type': 'user', 'title': '用户角色', 'body': '用户是数据科学家，主要研究方向是观测性。'}
+observation: Memory saved: [user] 用户角色 -> .agent/memory/user/mem-247c9e11.md
+final: 已记住。下次对话时我会记得你是数据科学家，研究方向是观测性。
+```
+
+新 session 里指定使用 `memory_recall`：
+
+```bash
+$ uv run agent-code "用 memory_recall 工具查一下你对我有什么记忆"
+tool_call: memory_recall {'query': '用户 数据科学家 观测性', 'top_k': 5}
+observation: ## [user] 用户角色
+  file: .agent/memory/user/mem-247c9e11.md
+  用户是数据科学家，主要研究方向是观测性。
+
+final: 根据我的记忆，你是一名数据科学家，主要研究观测性方向。
+```
+
+<DiffCard
+  diffPath="/lessons/day-06/diffs/v3-to-final.diff"
+  title="v4 阶段：memdir 长期记忆"
+  description="新增 memdir 子包；permissions.py 放行 memory_recall / memory_write；tools.py 注册两个记忆工具；build_system_prompt 注入 MEMORY.md 索引。"
+/>
+
+---
+
+### 终端 Replay 演示
+
+下面是 `agent-code` 创建 session、随后用 `-c` 恢复同一段对话的终端动画：
+
+<TerminalReplay tracePath="/lessons/day-06/traces/resume-session.json" />
+
+---
+
+## 今天有了什么
+
+- **Session JSONL**：每次对话自动落盘到 `.agent/sessions/<sanitized_cwd>/<id>.jsonl`，`-c` 恢复最近会话，`--resume <id>` 恢复指定会话。
+- **AGENT.md 项目规则注入**：cwd 下的 `AGENT.md` 包装成 `<project-rules>`，通过 `system=` 注入模型。
+- **确定性 Compact**：超过 40 条消息时把早期消息压成 `<compacted-history>`，保留 pinned 和最近 working context。
+- **Memdir 长期记忆**：`memory_write` 写 topic 文件并更新 MEMORY.md，`memory_recall` 用 keyword grep 召回。
+- **System prompt 组装**：core prompt → `AGENT.md` → MEMORY.md 索引，三层都可选。
+
+---
+
+## 常见问题
+
+**`-c` 报 "没有找到历史会话"**
+
+你的 cwd 下还没有 `.agent/sessions/` 目录。先跑一次不带 flag 的命令创建 session，退出后再用 `-c`。
+
+```bash
+$ uv run agent-code "hello"
+$ uv run agent-code -c "继续"
+```
+
+**compact 之后模型"忘了"之前的对话**
+
+这是预期行为。当前 compressed block 只包含统计信息，不包含对话语义。如果某个重要结论已经离开 working window，模型确实会忘。Day 11 会做 LLM 语义摘要；今天可以先用 `memory_write` 把关键事实写进 memdir。
+
+**`memory_recall` 搜中文的命中规则是什么**
+
+`query` 先按空格拆成关键词列表，每个关键词在 title + body 里命中就加一分。不是必须所有关键词都出现；中文没空格时整句会当成一个 keyword，所以搜 `"数据科学家"` 只算一个词。
+
+**`memory_write` 之后为什么文件名是 `mem-247c9e11.md` 不是拼音**
+
+`make_slug` 只保留 ASCII 字母数字。纯中文 title 会被过滤成空字符串，于是落到 `hashlib.sha1(title)` 兜底，生成 `mem-<前 8 位>`。这保持了标准库实现，也避开不同文件系统的 Unicode 归一化差异。
+
+**MEMORY.md 超过 200 行或 25KB 怎么办**
+
+`load_index` 读出时截断：超过 200 行保留头部和最新 200 行，超过 25KB 按字节边界截。写入时不截断，课后挑战会让你把“写入时截断”补上。
+
+---
+
+## 课后挑战
+
+1. **`/sessions` 命令列出历史会话**：给 `cli.py` 加一个 slash command，扫描 `.agent/sessions/` 下所有 jsonl 文件，打印 session_id、消息数、最后更新时间。
+
+2. **session 导出 markdown**：给 `session.py` 加一个 `export_markdown(output_path)` 方法，把 JSONL 历史转成人类友好的 markdown 格式。
+
+3. **中文分词 recall**：给 `recall_memory` 加一个可选的分词策略。不引入 jieba 时，可以用 unigram + bigram。
+
+4. **写入时截断 MEMORY.md**：在 `write_memory` 写完后，如果索引超过 200 行，保留头部并删除最老条目。
+
+5. **从 session 历史自动提取 memdir**：写一个小脚本扫描 session JSONL，从对话里提取用户事实，自动调 `memory_write` 存进 memdir。
+
+---
+
+## 思考题
+
+1. **为什么三层记忆（session JSONL / AGENT.md / memdir）职责要分开，不能全塞进一个文件？**（提示：三种记忆的写入者、生命周期和可靠性要求都不同。）
+
+2. **compact 的确定性统计和 LLM 语义摘要，什么场景下前者够用、什么场景下必须后者？**（提示：统计能告诉模型“改过哪些文件”，但能不能告诉它“bug 排查到哪一步”？）
+
+3. **MEMORY.md 索引注入 system prompt vs 让模型每次都主动调 `memory_recall`，这两个策略各有什么适用场景？**（提示：索引越大，system prompt 成本越高；工具调用越多，回合延迟越高。）
+
+4. **`memory_write` 同时写 topic 文件和索引行，如果中间崩溃会发生什么？**（提示：`recall_memory` 扫描 topic 文件，`load_index` 只看 MEMORY.md。）
+
+---
+
+## 下一天
+
+今天 Agent 有了三层记忆：session 历史记录、`AGENT.md` 项目规则、memdir 跨 session 长期记忆。单 Agent CLI 的核心能力到这里基本完整了：能读代码、改文件、跑命令、有权限控制，也能记住上下文。
+
+下一天进入 harness 的自定义层：**Slash Commands + Hooks + Cron**。你会让 `/` 命令控制 Agent 行为，注册 hook 在工具调用前后拦截，再用 cron 表达式设置定时任务。

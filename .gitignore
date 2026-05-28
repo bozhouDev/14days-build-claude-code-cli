@@ -1,0 +1,36 @@
+reference/claude-code-official/
+
+node_modules/
+dist/
+coverage/
+.env
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Next.js / fumadocs (agent-code-learn)
+.next/
+.source/
+out/
+.vercel/
+.turbo/
+.swc/
+next-env.d.ts
+*.tsbuildinfo
+
+# agent-code runtime artifacts
+.agent/
+.bg/
+
+# Local agent / tool side-channels (avoid leaking private skills, hooks, audits)
+.gstack/
+.gemini/
+.claude/
+.agents/
+.superpowers/
+.obsidian/
+
+# Local template scaffolds
+docs/_template/
+packages/_template-python/

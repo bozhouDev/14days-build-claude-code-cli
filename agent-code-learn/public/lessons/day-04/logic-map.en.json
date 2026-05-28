@@ -1,0 +1,292 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 4 · Safe Edit",
+  "subtitle": "This map focuses on Day 4's control flow: the harness gates writes, read-before-edit consumes Day 3 state, and confirmed edits snapshot old content first.",
+  "diagrams": [
+    {
+      "id": "write-gate",
+      "label": "Write gate",
+      "title": "The harness gate before any write",
+      "summary": "The model can only propose a file_write / file_edit tool_use; the agent.py intercept block owns path boundaries, read state, diff preview, and y/N confirmation.",
+      "defaultActiveNodeId": "intercept",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "file_write / file_edit",
+          "detail": "The model only states edit intent: which file_path, content, or old_string/new_string. It never writes directly to disk.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "intercept",
+          "kind": "tool",
+          "label": "agent.py intercept block",
+          "eyebrow": "harness",
+          "body": "pre-checks before tools.run",
+          "detail": "This is Day 4's key boundary: every write tool is intercepted, checked, diffed, and confirmed before it reaches ToolRegistry.run.",
+          "position": { "x": 300, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "path",
+          "kind": "data",
+          "label": "resolve_in_cwd",
+          "eyebrow": "gate 1",
+          "body": "lock path inside cwd",
+          "detail": "Write tools reuse the same cwd boundary as read tools. A path that escapes cwd becomes an error ToolResult.",
+          "position": { "x": 600, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "read-state",
+          "kind": "data",
+          "label": "read-before-edit",
+          "eyebrow": "gate 2",
+          "body": "ensure + mtime check",
+          "detail": "file_write on existing files and every file_edit must have been read first; if disk mtime changed after that read, check_mtime_conflict blocks the write.",
+          "position": { "x": 900, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "replace",
+          "kind": "data",
+          "label": "apply_single_replace",
+          "eyebrow": "file_edit",
+          "body": "dry-run replacement",
+          "detail": "file_edit dry-runs replacement in memory. Empty old_string, no match, multiple matches, or old==new all return an error before any diff is shown.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "diff",
+          "kind": "output",
+          "label": "render_diff",
+          "eyebrow": "human review",
+          "body": "unified diff preview",
+          "detail": "The diff is for the human, not the messages list. The model only sees the eventual ToolResult observation.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "typer.confirm",
+          "eyebrow": "y/N",
+          "body": "user accepts or rejects",
+          "detail": "The default is N. Pressing n returns error: edit rejected by user; pressing y allows real tool execution.",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "execute",
+          "body": "write bytes after approval",
+          "detail": "Only after all gates pass and the user confirms does the harness call the original file_write / file_edit function.",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "success or structured error",
+          "detail": "Path escape, unread file, mtime conflict, replacement failure, and user rejection all return as is_error=True observations.",
+          "position": { "x": 0, "y": 540 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-intercept", "source": "tool-use", "target": "intercept", "label": "intercept" },
+        { "id": "intercept-path", "source": "intercept", "target": "path", "label": "path" },
+        { "id": "path-read-state", "source": "path", "target": "read-state", "label": "safe path" },
+        { "id": "read-state-diff", "source": "read-state", "target": "diff", "label": "file_write content", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "read-state-replace", "source": "read-state", "target": "replace", "label": "file_edit", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "replace-diff", "source": "replace", "target": "diff", "label": "file_edit new_content", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "diff-confirm", "source": "diff", "target": "confirm", "label": "show diff", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-run", "source": "confirm", "target": "tools-run", "label": "y", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "run-result", "source": "tools-run", "target": "result", "label": "ToolResult", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-reject", "source": "confirm", "target": "result", "label": "n -> error", "sourceHandle": "source-bottom", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "read-before-edit",
+      "label": "Read before edit",
+      "title": "How ReadFileState becomes a write gate",
+      "summary": "Day 3 only recorded ReadFileState; Day 4 reads it before writes to prove the model saw the target file and the file has not changed externally.",
+      "defaultActiveNodeId": "state",
+      "nodes": [
+        {
+          "id": "read-file",
+          "kind": "tool",
+          "label": "read_file",
+          "eyebrow": "Day 3 hook",
+          "body": "read target file",
+          "detail": "The model usually calls read_file to inspect the target. Day 3 already ended that tool with ctx.read_state.record(path, content).",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "record",
+          "kind": "data",
+          "label": "record(path, content)",
+          "eyebrow": "state write",
+          "body": "mtime_ns + char_count",
+          "detail": "ReadFileState stores mtime_ns and character count only. The teaching version does not cache full content or use a content-equals fallback.",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "state",
+          "kind": "data",
+          "label": "ReadFileState.entries",
+          "eyebrow": "memory",
+          "body": "path -> (mtime, chars)",
+          "detail": "This in-memory state is the evidence for read-before-edit. ToolContext is recreated for each agent-code invocation, so the state is per session.",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "write-call",
+          "kind": "response",
+          "label": "write tool_use",
+          "eyebrow": "later",
+          "body": "existing file edit",
+          "detail": "When the model later asks to edit an existing file, the harness checks ReadFileState instead of trusting the model's memory.",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "ensure",
+          "kind": "data",
+          "label": "ensure_read_before_edit",
+          "eyebrow": "gate",
+          "body": "path in entries?",
+          "detail": "If the file has not been read, the harness returns an error ToolResult and skips both diff rendering and y/N confirmation.",
+          "position": { "x": 300, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "mtime",
+          "kind": "data",
+          "label": "check_mtime_conflict",
+          "eyebrow": "gate",
+          "body": "disk mtime unchanged?",
+          "detail": "If disk mtime changed after the read, the harness reports a conflict and nudges the model to read_file again. This avoids patching stale content.",
+          "position": { "x": 600, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "continue",
+          "kind": "runtime",
+          "label": "render_diff",
+          "eyebrow": "next",
+          "body": "only after state passes",
+          "detail": "Only after read-before-edit and mtime gates pass does the harness compute new_content and show the diff.",
+          "position": { "x": 900, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "read-record", "source": "read-file", "target": "record", "label": "record" },
+        { "id": "record-state", "source": "record", "target": "state", "label": "store" },
+        { "id": "write-ensure", "source": "write-call", "target": "ensure", "label": "before write" },
+        { "id": "state-ensure", "source": "state", "target": "ensure", "label": "lookup", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ensure-mtime", "source": "ensure", "target": "mtime", "label": "read" },
+        { "id": "mtime-continue", "source": "mtime", "target": "continue", "label": "unchanged" }
+      ]
+    },
+    {
+      "id": "backup-safety-net",
+      "label": "Backup safety net",
+      "title": "How old content enters .agent/history after confirmation",
+      "summary": "Backup happens inside the tool function, before write_text. It is not a model-visible tool, and backup failure does not block an edit the user already confirmed.",
+      "defaultActiveNodeId": "backup",
+      "nodes": [
+        {
+          "id": "approved",
+          "kind": "runtime",
+          "label": "typer.confirm = y",
+          "eyebrow": "human",
+          "body": "edit accepted",
+          "detail": "After the human reviews the diff and presses y, agent.py lets the request reach the real tool function.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "write-tools",
+          "kind": "tool",
+          "label": "file_write / file_edit",
+          "eyebrow": "tool",
+          "body": "prepare to write",
+          "detail": "file_write backs up only when the target already exists; file_edit backs up immediately after reading the old content.",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "backup",
+          "kind": "data",
+          "label": "file_history.backup",
+          "eyebrow": "harness",
+          "body": "snapshot old_content",
+          "detail": "backup is a harness-wide safety net. It is never registered in ToolRegistry, so the model cannot call it or know it exists.",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "history",
+          "kind": "output",
+          "label": ".agent/history/<rel>/<ts>",
+          "eyebrow": "disk",
+          "body": "timestamped snapshot",
+          "detail": "Snapshots are organized by relative file path and UTC millisecond timestamps, which makes later restore or retention-policy exercises straightforward.",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "write-text",
+          "kind": "tool",
+          "label": "Path.write_text",
+          "eyebrow": "world",
+          "body": "write new_content",
+          "detail": "Backup failures are swallowed so they do not block an edit the user already approved. The tool function still performs the actual write.",
+          "position": { "x": 600, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "refresh",
+          "kind": "data",
+          "label": "read_state.record",
+          "eyebrow": "refresh",
+          "body": "new mtime + chars",
+          "detail": "After a successful write, read_state is refreshed so later edits in the same run are based on the latest file version.",
+          "position": { "x": 300, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "Wrote / Edited",
+          "detail": "The model still sees only the normal tool result, such as Wrote 18 chars or Edited hello.txt. Backup details never enter the observation.",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "approved-tools", "source": "approved", "target": "write-tools", "label": "run" },
+        { "id": "tools-backup", "source": "write-tools", "target": "backup", "label": "old_content" },
+        { "id": "backup-history", "source": "backup", "target": "history", "label": "snapshot" },
+        { "id": "backup-write", "source": "backup", "target": "write-text", "label": "then write", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "write-refresh", "source": "write-text", "target": "refresh", "label": "record", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "refresh-result", "source": "refresh", "target": "result", "label": "return", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    }
+  ]
+}

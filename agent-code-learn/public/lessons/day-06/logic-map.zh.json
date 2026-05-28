@@ -1,0 +1,248 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 6 · Session + Memory",
+  "subtitle": "这张图只讲 Day 6 的三层记忆边界：session JSONL 续聊、system prompt 分层注入、memdir 跨 session 长期记忆。",
+  "diagrams": [
+    {
+      "id": "session-ledger",
+      "label": "Session ledger",
+      "title": "Session JSONL 如何让 Agent 续聊",
+      "summary": "CLI 根据 --resume / -c 决定创建新 Session 还是加载旧 JSONL；run_agent 从 Session.history 恢复 messages，并把每轮新增消息追加回磁盘。",
+      "defaultActiveNodeId": "session",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "--resume / -c / fresh",
+          "detail": "CLI 解析 prompt、cwd 和 session flag。没有 flag 就新建 session；-c 读取最近一次；--resume 按 id 读取指定 JSONL。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "session",
+          "kind": "data",
+          "label": "Session",
+          "eyebrow": "ledger",
+          "body": "create / load_latest / load_id",
+          "detail": "Session 封装 session_id、file_path、history 和 append_messages。Agent Loop 不关心目录怎么组织，只消费这两个读写入口。",
+          "position": { "x": 280, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "jsonl",
+          "kind": "data",
+          "label": "JSONL ledger",
+          "eyebrow": ".agent/sessions",
+          "body": "{role, content, timestamp}",
+          "detail": "一条消息一行 JSON。append-only 的好处是简单稳定：崩溃时最多丢当前回合，不需要重写整个历史文件。",
+          "position": { "x": 560, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "restore + append prompt",
+          "detail": "恢复会话时，Session.history 先变回 messages；随后当前 user prompt 被追加到内存上下文，也同步写入 JSONL。",
+          "position": { "x": 840, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider",
+          "eyebrow": "model",
+          "body": "complete(messages)",
+          "detail": "模型仍然只读取 messages 并返回 tool_use 或 final。会话恢复是 harness 在模型外部完成的。",
+          "position": { "x": 840, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "append",
+          "kind": "runtime",
+          "label": "append_messages",
+          "eyebrow": "persist",
+          "body": "assistant + tool_result + final",
+          "detail": "每轮结束后，harness 把 assistant/tool_result/final 写回 JSONL。下次 -c 看到的是同一份 ledger。",
+          "position": { "x": 280, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-session", "source": "cli", "target": "session", "label": "select session" },
+        { "id": "session-jsonl", "source": "session", "target": "jsonl", "label": "read/write" },
+        { "id": "jsonl-messages", "source": "jsonl", "target": "messages", "label": "history" },
+        { "id": "messages-provider", "source": "messages", "target": "provider", "label": "complete" },
+        { "id": "provider-append", "source": "provider", "target": "append", "label": "new messages", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "append-jsonl", "source": "append", "target": "jsonl", "label": "append rows", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    },
+    {
+      "id": "system-prompt-layers",
+      "label": "System prompt layers",
+      "title": "AGENT.md 和 MEMORY.md 不进 messages",
+      "summary": "Day 6 把项目规则和长期记忆索引放进 system prompt；messages 只保存对话历史，compact 也只压 messages。",
+      "defaultActiveNodeId": "builder",
+      "nodes": [
+        {
+          "id": "core",
+          "kind": "data",
+          "label": "Core prompt",
+          "eyebrow": "base",
+          "body": "agent behavior guide",
+          "detail": "核心 system prompt 描述 Agent 的基本行为：能读写文件、跑命令、搜索、询问用户。",
+          "position": { "x": 0, "y": 30 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "agent-md",
+          "kind": "data",
+          "label": "AGENT.md",
+          "eyebrow": "project rules",
+          "body": "<project-rules>",
+          "detail": "项目规则由开发者手写，启动时读取 cwd 下的 AGENT.md，并包进 <project-rules> 块。",
+          "position": { "x": 0, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 160 }
+        },
+        {
+          "id": "memory-index",
+          "kind": "data",
+          "label": "MEMORY.md index",
+          "eyebrow": "long-term hooks",
+          "body": "<project-memory>",
+          "detail": "长期记忆索引来自 .agent/memory/MEMORY.md，只放 hook 和链接；详细正文留给 memory_recall 拉取。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 320 }
+        },
+        {
+          "id": "builder",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "harness",
+          "body": "core → AGENT.md → MEMORY.md",
+          "detail": "这个函数在 CLI cold start 调一次。三层都可选，文件不存在就跳过；拼好的文本通过 system= 传给 Provider。",
+          "position": { "x": 380, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 160 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider.complete",
+          "eyebrow": "system=",
+          "body": "messages + system",
+          "detail": "AnthropicProvider 把 system prompt 放在请求顶层，和 messages 平级。它不是 messages 的第一条消息。",
+          "position": { "x": 760, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 500 }
+        },
+        {
+          "id": "compact",
+          "kind": "runtime",
+          "label": "compact(messages)",
+          "eyebrow": "not system",
+          "body": "pinned + summary + working",
+          "detail": "compact 只压 messages。AGENT.md 和 MEMORY.md 走 system= 旁路，因此不会被压缩丢掉。",
+          "position": { "x": 760, "y": 360 },
+          "mobilePosition": { "x": 220, "y": 500 }
+        }
+      ],
+      "edges": [
+        { "id": "core-builder", "source": "core", "target": "builder", "label": "part 1" },
+        { "id": "agent-builder", "source": "agent-md", "target": "builder", "label": "optional" },
+        { "id": "memory-builder", "source": "memory-index", "target": "builder", "label": "optional" },
+        { "id": "builder-provider", "source": "builder", "target": "provider", "label": "system=" },
+        { "id": "provider-compact", "source": "provider", "target": "compact", "label": "messages only", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "long-term-memory",
+      "label": "Long-term memory",
+      "title": "memdir 如何跨 session 记住事实",
+      "summary": "模型只能提出 memory_write / memory_recall 的 tool_use；真正写 topic 文件、更新索引、扫描召回的是 harness 工具实现。",
+      "defaultActiveNodeId": "write-tool",
+      "nodes": [
+        {
+          "id": "model",
+          "kind": "model",
+          "label": "Model",
+          "eyebrow": "proposal",
+          "body": "tool_use: memory_write",
+          "detail": "模型在对话里识别到值得长期保存的事实，只提出 memory_write 调用。它不直接写文件。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "runtime",
+          "label": "Permission gate",
+          "eyebrow": "allow / deny",
+          "body": "memory_recall readonly; memory_write low-risk",
+          "detail": "memory_recall 进只读白名单；memory_write 是低风险写，在 default/acceptEdits allow，plan 模式仍 deny。",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "write-tool",
+          "kind": "tool",
+          "label": "memory_write",
+          "eyebrow": "tool runtime",
+          "body": "write topic + index",
+          "detail": "write_memory 同时写 .agent/memory/<type>/<slug>.md 和 MEMORY.md 索引行，避免模型只做一半。",
+          "position": { "x": 620, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "topic",
+          "kind": "data",
+          "label": "topic file",
+          "eyebrow": ".agent/memory/user",
+          "body": "frontmatter + body",
+          "detail": "topic 文件保存完整记忆正文。纯中文 title 会通过 sha1 生成 mem-<hash>.md 这种稳定文件名。",
+          "position": { "x": 920, "y": 20 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "index",
+          "kind": "data",
+          "label": "MEMORY.md",
+          "eyebrow": "index",
+          "body": "title link + hook",
+          "detail": "索引只放短 hook，启动时注入 system prompt。模型看到 hook 后再决定是否调 memory_recall 看正文。",
+          "position": { "x": 920, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "new-session",
+          "kind": "runtime",
+          "label": "Fresh session",
+          "eyebrow": "no -c",
+          "body": "still sees index",
+          "detail": "新 session 没有旧 messages，但 build_system_prompt 会读 MEMORY.md，所以模型仍能看到长期记忆索引。",
+          "position": { "x": 300, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        },
+        {
+          "id": "recall",
+          "kind": "tool",
+          "label": "memory_recall",
+          "eyebrow": "keyword grep",
+          "body": "scan topic files",
+          "detail": "recall_memory 不看索引，而是扫描四个类型目录下的 topic 文件。即使 topic 写完但索引没更新，召回仍然能找到。",
+          "position": { "x": 620, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 540 }
+        }
+      ],
+      "edges": [
+        { "id": "model-permission", "source": "model", "target": "permission", "label": "tool_use" },
+        { "id": "permission-write", "source": "permission", "target": "write-tool", "label": "allow" },
+        { "id": "write-topic", "source": "write-tool", "target": "topic", "label": "full body" },
+        { "id": "write-index", "source": "write-tool", "target": "index", "label": "hook" },
+        { "id": "index-session", "source": "index", "target": "new-session", "label": "system prompt", "sourceHandle": "source-left", "targetHandle": "target-top" },
+        { "id": "session-recall", "source": "new-session", "target": "recall", "label": "need details" },
+        { "id": "recall-topic", "source": "recall", "target": "topic", "label": "scan", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    }
+  ]
+}

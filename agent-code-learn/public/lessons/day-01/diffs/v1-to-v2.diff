@@ -1,0 +1,29 @@
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ -2,2 +2,3 @@
+ 
++from .model import MockProvider
+ import typer
+@@ -10,3 +11,5 @@
+ def main_command(prompt: str = typer.Argument("hi")) -> None:
+-    console.print(f"回声: {prompt}")
++    provider = MockProvider()
++    response = provider.complete(prompt)
++    console.print(f"final: {response.text}")
+ 
+--- /dev/null
++++ agent_code/model.py
+@@ -0,0 +1,11 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass
++class ModelResponse:
++    text: str
++
++
++class MockProvider:
++    def complete(self, prompt: str) -> ModelResponse:
++        return ModelResponse(text=f"我是 MockProvider，你说了：{prompt}")

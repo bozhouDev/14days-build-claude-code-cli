@@ -1,0 +1,98 @@
+{
+  "title": "Day 2 · Real Model + tool_use / tool_result",
+  "task": "What's today's date? Use the system_date tool.",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "What's today's date? Use the system_date tool." },
+      "ledger": { "delta": "messages += user('What's today's date? Use the system_date tool.')" },
+      "caption": "CLI parses the prompt, wraps it as a user message, and drops it into messages. Same as Day 1, the first frame just hands the task off to the model.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: system_date()" },
+      "caption": "AnthropicProvider sends messages and the translated ToolRegistry.list() (as input_schema) to the Messages API. The model knows it has no clock and returns one tool_use content block, stop_reason=tool_use.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ABC", "name": "system_date", "arguments": {} }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "tool registry lookup", "state": "open", "target": "system_date" },
+      "caption": "harness looks up system_date in the ToolRegistry. Day 2 still only checks registration — the permission layer arrives on Day 5. The model only proposes; the harness is what actually presses the green button.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01ABC", "name": "system_date", "arguments": {} }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "system_date() → '2026-05-20 14:32:00 CST'" },
+      "caption": "harness calls datetime.now().astimezone() and gets the wall-clock string. WORLD is still just a local function on Day 2; from Day 3 it becomes project files, and from Day 5 it becomes the shell.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user(tool_result)" },
+      "caption": "This is the biggest protocol shift between Day 1 and Day 2: append the assistant's tool_use message back to messages first, then put the tool_result as a content block inside the next user message — not Day 1's role=tool, but the Anthropic public shape.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: Today is May 20, 2026." },
+      "caption": "AnthropicProvider calls Messages API a second time. This round the model reads the tool_result, now knows the date, and returns plain text with stop_reason=end_turn. The while step < max_steps loop exits here.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "Today is May 20, 2026.",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: Today is May 20, 2026.'" },
+      "caption": "CLI prints the three trace lines: tool_call, observation, final. The whole conversation is still in messages — saveable, replayable. This same messages array is the seed of the Day 6 session file.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "Today is May 20, 2026.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

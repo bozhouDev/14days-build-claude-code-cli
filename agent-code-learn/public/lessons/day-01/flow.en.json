@@ -1,0 +1,75 @@
+{
+  "nodes": [
+    { "id": "cli", "label": "CLI Runtime", "type": "process" },
+    { "id": "messages", "label": "Messages", "type": "data" },
+    { "id": "provider", "label": "MockProvider", "type": "model" },
+    { "id": "registry", "label": "ToolRegistry", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "cli",
+      "caption": "1. CLI boots, parses the prompt 'echo hi using the echo tool' and resolves the working directory.",
+      "messages": []
+    },
+    {
+      "step": 2,
+      "focus": "messages",
+      "caption": "2. run_agent wraps the prompt as a user message: messages = [{'role': 'user', 'content': 'echo hi using the echo tool'}].",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" }
+      ]
+    },
+    {
+      "step": 3,
+      "focus": "provider",
+      "caption": "3. MockProvider reads the messages, sees a user message, and returns ModelResponse(tool_calls=[echo]) — asking the harness to run a tool.",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "registry",
+      "caption": "4. ToolRegistry resolves `echo` to its Python function, runs it with {'text': 'hi'}, and gets back the string 'hi'.",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "messages",
+      "caption": "5. The harness packs the result into a ToolResult and appends it to messages: role='tool', content='hi'.",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "provider",
+      "caption": "6. MockProvider sees the new tool message, and now produces the final text response: 'echo tool returned: hi'.",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo tool returned: hi",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "cli",
+      "caption": "7. Agent Loop done. The CLI prints the full trace: tool_call, observation, final.",
+      "messages": [
+        { "role": "user", "content": "echo hi using the echo tool" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    }
+  ]
+}

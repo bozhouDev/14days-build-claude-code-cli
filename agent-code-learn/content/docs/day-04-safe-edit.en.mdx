@@ -1,0 +1,700 @@
+---
+title: "Day 4 — Safe Edit"
+description: "Day 3 gave the Agent eyes to read project code. Today it gets hands to change code — but no byte hits disk until the harness shows you a diff, asks y/n, and snapshots the old content. The model never sees these mechanisms; it only sees a 'file_write failed' or 'file_edit succeeded' observation."
+---
+
+Day 3 let the Agent see the project. The natural next ask is "refactor this", "add a note to the README". The catch: if the CLI doesn't gate writes, a single prompt can overwrite your `app.py` — no diff, no confirmation, no undo.
+
+So today we slot a layer of execution control between "the model decides what to do" and "bytes actually hit disk" — what AI Agent people call the <Concept name="Harness">harness</Concept>. `file_write` overwrites a whole file but shows you a diff and waits for y/n. `file_edit` does precise string replace but only after the file's been read this session, the file hasn't been touched since, and the `old_string` appears exactly once. And every successful write snapshots the previous content to `.agent/history/` — the model never knows that's happening.
+
+About 300 lines of code, two new files (`diff_ui.py`, `file_history.py`), four touched (`tools.py`, `agent.py`, `fs_safety.py`, `cli.py`). No new dependencies — `difflib` ships with Python.
+
+---
+
+### Day 4 main visual — diff gate + read-before-edit before any write
+
+Start with the `Write gate` map: before any byte lands on disk, the <Concept name="Harness">harness</Concept> now runs `resolve_in_cwd` → `ensure_read_before_edit` + `check_mtime_conflict` → `render_diff` → `typer.confirm`. `Read before edit` explains how Day 3's `ctx.read_state.record()` hook gets consumed; `Backup safety net` shows why confirmed edits snapshot old content into `.agent/history/` first.
+
+<AgentLogicMap mapPath="/lessons/day-04/logic-map.json" />
+
+---
+
+Today we keep editing Day 3's `agent-code` project. `packages/day-04-safe-edit/` is the reference snapshot, not a directory you create yourself.
+
+## Setup — today's starting point
+
+Day 3 already lets the Agent read files, list directories, glob, grep, and fetch URLs. But every tool signature quietly carries a hook: `read_file` calls `ctx.read_state.record(path, content)` on every successful read — that stores `(mtime_ns, char_count)` into `ReadFileState.entries`. No code in Day 3 ever reads it back. Today it finally matters.
+
+Four things go around that hook today:
+
+- A new `diff_ui.py`: `render_diff` colors a unified diff, `confirm_edit` prompts y/N.
+- A new `file_history.py`: every successful write snapshots the old content to `.agent/history/<rel>/<ts>`.
+- Two new tools `file_write` / `file_edit`, but every safety policy stays hidden from the model — it all lives in the `agent.py` intercept block and three new pure functions in `fs_safety.py`.
+- Switch trace to streaming so diff and confirm prompts interleave with `tool_call` / `observation` in real order.
+
+No new dependencies. `difflib` is stdlib; `rich` and `typer` shipped on Day 1.
+
+Heads-up: v1 leaves the `_tool_result_message` helper alone. It's been dead code since Day 3 and is still unused today — we just don't delete other people's code without reason.
+
+---
+
+## v1 — `file_write` whole-file overwrite + diff preview
+
+Start with the simplest case: the model wants to write a new file or overwrite an existing one, and the harness shows you the diff before any byte lands. Three pieces: a new `diff_ui.py`, a `file_write` in `tools.py`, and an intercept block in `agent.py`'s tool loop.
+
+### 1.1 Create `agent_code/diff_ui.py`
+
+`render_diff` runs `difflib.unified_diff` and adds rich color markup to add/remove lines. `confirm_edit` uses `typer.confirm` for a y/N prompt that defaults to N.
+
+```python
+from __future__ import annotations
+
+import difflib
+
+import typer
+
+
+def render_diff(old: str, new: str, path: str) -> str:
+    """Build a unified diff with rich markup for add/remove lines."""
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff_lines = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path}", tofile=f"b/{path}",
+    )
+    colored: list[str] = []
+    for line in diff_lines:
+        line = line.rstrip()
+        if line.startswith("---") or line.startswith("+++"):
+            colored.append(f"[bold]{line}[/bold]")
+        elif line.startswith("-"):
+            colored.append(f"[red]{line}[/red]")
+        elif line.startswith("+"):
+            colored.append(f"[green]{line}[/green]")
+        elif line.startswith("@@"):
+            colored.append(f"[cyan]{line}[/cyan]")
+        else:
+            colored.append(line)
+    return "\n".join(colored)
+
+
+def confirm_edit(path: str) -> bool:
+    """Ask the user whether to apply this edit. Default is no."""
+    return typer.confirm(f"Apply this edit to {path}?", default=False)
+```
+
+Note the boundary: the diff is for the **human**, not for the model. The model only knows it requested `file_write` — it has no idea the terminal is showing a diff and asking for confirmation.
+
+### 1.2 Edit `agent_code/tools.py` — add `file_write`
+
+Place it after `web_search` and before `class ToolRegistry`. The tool function itself stays pure: it only does "write + refresh read_state". Every safety check (read-before-edit, mtime conflict, user confirmation) lives in `agent.py`'s intercept block.
+
+```python
+def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Whole-file overwrite. Pre-checks happen in agent.py's intercept block."""
+    path_str = args.get("file_path", "")
+    content = args.get("content", "")
+    if not path_str:
+        return "error: missing required argument 'file_path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    # Refresh read_state so the next edit sees the latest content.
+    ctx.read_state.record(path, content)
+    return f"Wrote {len(content)} chars to {path_str}"
+```
+
+Then register it at the end of `default_tools()` just before `return registry`:
+
+```python
+    registry.register(
+        Tool(
+            name="file_write",
+            description="Write or overwrite a file. Path is relative to cwd.",
+            run=file_write,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative path inside cwd."},
+                    "content": {"type": "string", "description": "Full file content to write."},
+                },
+                "required": ["file_path", "content"],
+            },
+        )
+    )
+```
+
+Why does `file_write` only take `file_path` and `content`? Because it describes what the model wants to do, not the safety policy. If the file doesn't exist, write it; if it does, the intercept block in `agent.py` shows the diff and asks for confirmation.
+
+### 1.3 Edit `agent_code/agent.py` — streaming trace + intercept `file_write`
+
+Two core changes. First, streaming trace — Day 3's `run_agent` dumped the trace once at the end, so you couldn't tell which step produced the diff. Today every trace line prints immediately, letting diff and confirm prompts appear in real order. Second, the `file_write` intercept — before `tools.run`, run pre-checks, then render the diff, then `typer.confirm`.
+
+The top imports gain a <Concept name="Tool Result">`ToolResult`</Concept> (defined in `model.py` since Day 1; the intercept block constructs it by hand) and `resolve_in_cwd`, plus two fresh import lines:
+
+```python
+from rich.console import Console
+
+from .diff_ui import confirm_edit, render_diff
+```
+
+Module-level console:
+
+```python
+console = Console()
+```
+
+Inside `run_agent`, add an `emit` closure and replace all four `trace.append(...)` calls with `emit(...)`:
+
+```python
+    def emit(line: str) -> None:
+        # Stream the trace: append for tests, print for readers.
+        trace.append(line)
+        console.print(line)
+```
+
+Then inside the `for call in response.tool_calls` loop, after `emit(f"tool_call: ...")` and before `result = tools.run(call, ctx)`, slot in the file_write intercept block. Five steps, each of which can short-circuit to an `is_error=True` <Concept name="Tool Result">tool_result</Concept>:
+
+```python
+            # file_write / file_edit harness intercept: pre-checks, then diff, then user confirm.
+            if call.name in ("file_write", "file_edit"):
+                path_str = call.arguments.get("file_path", "")
+
+                # 1) Resolve path: cwd escape becomes an error.
+                try:
+                    path = resolve_in_cwd(ctx.cwd, path_str)
+                except (ValueError, OSError) as exc:
+                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
+                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+                # 2) Pre-checks (v1 only: file_write requires read-before-edit if file exists).
+                validation_error: str | None = None
+                if call.name == "file_write" and path.exists():
+                    if path not in ctx.read_state.entries:
+                        validation_error = (
+                            f"error: file has not been read yet. "
+                            f"Read {path_str} first before editing."
+                        )
+                # file_edit pre-checks land in v2.
+
+                # 3) Compute new_content (v1 has no file_edit; skip diff for that name).
+                new_content: str | None = None
+                if call.name == "file_write":
+                    new_content = call.arguments.get("content", "")
+
+                # 4) Validation failed: skip diff and confirm, emit error observation directly.
+                if validation_error is not None:
+                    result = ToolResult(call.id, validation_error, is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
+                # 5) Validation passed: render diff and ask the user.
+                if new_content is not None:
+                    diff_text = render_diff(old_content, new_content, path_str)
+                    console.print(f"\n[bold]Diff for {path_str}:[/bold]")
+                    console.print(diff_text)
+                    if not confirm_edit(path_str):
+                        result = ToolResult(call.id, "error: edit rejected by user", is_error=True)
+                        emit(f"observation: {result.content}")
+                        tool_result_blocks.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": result.tool_call_id,
+                                "content": result.content,
+                                "is_error": True,
+                            }
+                        )
+                        continue
+```
+
+Four exits: cwd escape, pre-check failure, user rejection — each builds an `is_error=True` observation and `continue`s past `tools.run`. Only "passed" falls through to `tools.run` at the loop bottom. Each error is streamed, and the model gets it as feedback on its next turn.
+
+Last touch: `agent_code/cli.py` no longer needs `for line in result.trace: console.print(line)` since `run_agent` streams the trace itself.
+
+### 1.4 Two acceptance runs
+
+Create a new file first — read-before-edit doesn't apply to new files:
+
+```bash
+$ uv run agent-code "Use file_write to create hello.txt with one line 'hello from agent'"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+tool_call: file_write {'file_path': 'hello.txt', 'content': 'hello from agent'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -0,0 +1 @@
++hello from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Wrote 16 chars to hello.txt
+final: Created hello.txt with the content 'hello from agent'.
+```
+
+Then overwrite an existing file. `ReadFileState` is fresh per `agent-code` invocation, so the model must `read_file` first:
+
+```bash
+$ uv run agent-code "Use read_file on hello.txt, then file_write to change content to 'goodbye from agent'"
+...
+tool_call: read_file {'path': 'hello.txt'}
+observation: hello from agent
+
+tool_call: file_write {'file_path': 'hello.txt', 'content': 'goodbye from agent'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-hello from agent
++goodbye from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Wrote 18 chars to hello.txt
+final: Done — hello.txt now reads 'goodbye from agent'.
+```
+
+The exact wording of `final` may vary; what matters is the `tool_call: file_write`, the `Diff for hello.txt`, the `Apply this edit` prompt, and the `observation: Wrote ...` line. Re-run with `n` instead of `y` and the observation will be `error: edit rejected by user` with the file unchanged.
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v1-write.diff"
+  title="v1 — diff_ui + file_write + streaming trace + intercept block"
+  description="New diff_ui.py (render_diff + confirm_edit); tools.py adds file_write + registration; agent.py imports ToolResult / resolve_in_cwd / Console / diff_ui, introduces the emit closure to stream four trace calls, and slots the file_write/file_edit intercept block into the tool loop; cli.py drops the duplicate trace print."
+/>
+
+v1's `file_write` covers whole files, but it has a fatal flaw: if the model wants to change one character in the third paragraph of a long README, it has to resend the entire file in `content` — thousands of tokens for one edit. Next pass: give it a scalpel.
+
+---
+
+## v2 — `file_edit` string replace + three safety checks
+
+`file_edit` takes three arguments: `file_path`, `old_string`, `new_string`. It matches verbatim and replaces a single occurrence. The model only cares about which piece to swap; the harness does three things before any write: has the file been read? has it been changed since? is `old_string` unique? All three are pure functions, all in `fs_safety.py`.
+
+### 2.1 Edit `agent_code/fs_safety.py` — add three pure functions
+
+After `load_gitignore`, append:
+
+```python
+def ensure_read_before_edit(state: ReadFileState, path: Path) -> str | None:
+    """Has the file been read this session? Return an error string if not."""
+    if path not in state.entries:
+        return (
+            f"error: file has not been read yet. "
+            f"Read {path.name} first before editing."
+        )
+    return None
+
+
+def check_mtime_conflict(state: ReadFileState, path: Path) -> str | None:
+    """Has the file been modified externally since the last read? mtime change = conflict.
+    No content-equals fallback in the teaching version — re-read to refresh."""
+    entry = state.entries.get(path)
+    if entry is None:
+        return None  # ensure_read_before_edit catches the never-read case first.
+    read_mtime_ns, _ = entry
+    try:
+        current_mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if current_mtime_ns > read_mtime_ns:
+        return (
+            f"error: file was modified after read. "
+            f"Read {path.name} again before editing."
+        )
+    return None
+
+
+def apply_single_replace(
+    content: str, old: str, new: str, replace_all: bool
+) -> tuple[str | None, str | None]:
+    """Find old in content and replace with new.
+    Returns (new_content, error): success -> error is None; failure -> new_content is None."""
+    if old == "":
+        # str.count("") returns len+1; str.replace("", x) inserts x between every char.
+        # Neither behavior is useful for the model. Reject up front.
+        return None, "error: old_string must not be empty."
+    if old == new:
+        return None, "error: old_string and new_string are exactly the same."
+
+    count = content.count(old)
+    if count == 0:
+        return None, "error: string to replace not found in file."
+    if count > 1 and not replace_all:
+        return None, (
+            f"error: found {count} matches for old_string. "
+            f"Use replace_all=True to replace all, or make old_string more specific."
+        )
+
+    if replace_all:
+        return content.replace(old, new), None
+    else:
+        return content.replace(old, new, 1), None
+```
+
+None of these functions touch global state. `apply_single_replace` returns `(result, None)` on success and `(None, error_message)` on failure. Pulling them out as pure functions lets us unit-test them, and it makes `agent.py`'s intercept block read like a clear chain of gates: confirm read, confirm unchanged, confirm unique replacement.
+
+### 2.2 Edit `agent_code/tools.py` — add `file_edit`
+
+Add `apply_single_replace` to the `from .fs_safety import (...)` block at the top. `ensure_read_before_edit` and `check_mtime_conflict` are not used here — they go into `agent.py`.
+
+The `file_edit` tool function stays pure: resolve path, read disk, replace, write, refresh read_state. read-before-edit, mtime conflict, and multi-match checks all live in the intercept block; the tool itself only re-runs `apply_single_replace` as a last-ditch race guard (in case the file was touched between the diff render and the write).
+
+```python
+def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
+    """String-replace edit. Pre-checks live in agent.py's intercept block."""
+    path_str = args.get("file_path", "")
+    old_string = args.get("old_string", "")
+    new_string = args.get("new_string", "")
+    replace_all = bool(args.get("replace_all", False))
+    if not path_str:
+        return "error: missing required argument 'file_path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError) as exc:
+        return f"error: {exc}"
+
+    # Race guard: agent.py already ran apply_single_replace to compute the diff.
+    # If the on-disk content drifted between confirm and now, this catches it.
+    new_content, err = apply_single_replace(content, old_string, new_string, replace_all)
+    if err:
+        return err
+
+    path.write_text(new_content, encoding="utf-8")
+    ctx.read_state.record(path, new_content)
+    return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
+```
+
+Then register `file_edit` after the `file_write` registration in `default_tools()` (schema includes a `replace_all` boolean, default false). Full schema in the DiffCard.
+
+### 2.3 Edit `agent_code/agent.py` — swap inline checks for fs_safety calls; wire file_edit in
+
+`from .fs_safety import` adds three new functions. Then replace v1's (2) pre-checks block (~8 lines) with the fs_safety version — `file_write` runs `ensure_read_before_edit + check_mtime_conflict`; `file_edit` always requires file existence + read-before-edit + mtime match:
+
+```python
+                # 2) Pre-checks: read-before-edit + mtime conflict.
+                validation_error: str | None = None
+                if call.name == "file_write":
+                    if path.exists():
+                        validation_error = (
+                            ensure_read_before_edit(ctx.read_state, path)
+                            or check_mtime_conflict(ctx.read_state, path)
+                        )
+                else:  # file_edit
+                    if not path.exists():
+                        validation_error = f"error: file does not exist: {path_str}"
+                    else:
+                        validation_error = (
+                            ensure_read_before_edit(ctx.read_state, path)
+                            or check_mtime_conflict(ctx.read_state, path)
+                        )
+```
+
+Replace (3) compute new_content with the version where `file_edit` runs `apply_single_replace` in memory. If it returns an error (multi-match, no match, `old==new`, empty `old`), funnel it into `validation_error` so step (4) handles it uniformly:
+
+```python
+                # 3) Compute new_content: file_write takes content as-is; file_edit dry-runs the replace.
+                new_content: str | None = None
+                if call.name == "file_write":
+                    new_content = call.arguments.get("content", "")
+                elif call.name == "file_edit" and validation_error is None:
+                    new_content, replace_err = apply_single_replace(
+                        old_content,
+                        call.arguments.get("old_string", ""),
+                        call.arguments.get("new_string", ""),
+                        bool(call.arguments.get("replace_all", False)),
+                    )
+                    if replace_err is not None:
+                        validation_error = replace_err
+```
+
+Steps (4) and (5) stay as-is. The only change in this pass: every validation funnels through `validation_error`, the diff renders only when validation passes, and confirm only fires for edits that can actually be written.
+
+### 2.4 Four acceptance runs
+
+(a) Successful edit — feel the scalpel:
+
+```bash
+$ uv run agent-code "Use read_file on hello.txt first, then file_edit to change goodbye to hola"
+tool_call: read_file {'path': 'hello.txt'}
+observation: goodbye from agent
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'goodbye', 'new_string': 'hola'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-goodbye from agent
++hola from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Edited hello.txt: replaced 7 chars with 4 chars
+final: Done — hello.txt now reads 'hola from agent' instead of 'goodbye from agent'.
+```
+
+Notice how `tool_call: file_edit` is immediately followed by `Diff for ...` and `Apply this edit?` — that's the streaming trace + intercept block cooperating.
+
+(b) Edit without reading — read-before-edit rejects. The model defaults to `read_file` first, so we have to forbid it in the prompt:
+
+```bash
+$ uv run agent-code "Do not call read_file. Directly use file_edit on hello.txt to change hola to hello."
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'hola', 'new_string': 'hello'}
+observation: error: file has not been read yet. Read hello.txt first before editing.
+tool_call: read_file {'path': 'hello.txt'}
+observation: hola from agent
+...
+```
+
+When validation fails, the diff is **not** rendered and confirm is **not** asked — that's the intercept block's step (4) at work. The model usually responds by calling `read_file` and retrying `file_edit`: structured error as feedback driving self-correction.
+
+(c) Multi-match — `old_string` appears 2+ times:
+
+```bash
+$ echo -e "line one: hello\nline two: hello" > dup.txt
+$ uv run agent-code --max-steps 2 "Use read_file on dup.txt, then file_edit to change hello to hi. old_string must be exactly 'hello' and replace_all must be false."
+tool_call: read_file {'path': 'dup.txt'}
+observation: line one: hello
+line two: hello
+
+tool_call: file_edit {'file_path': 'dup.txt', 'old_string': 'hello', 'new_string': 'hi', 'replace_all': False}
+observation: error: found 2 matches for old_string. Use replace_all=True to replace all, or make old_string more specific.
+final: reached max_steps=2
+```
+
+The model learns its lesson — either add `replace_all=True`, or make `old_string` more specific (e.g. `line one: hello`).
+
+(d) mtime conflict — deliberately change the file between read and edit:
+
+```bash
+$ uv run agent-code "Use read_file on dup.txt, then change hello to bonjour."
+```
+
+After the model calls `read_file` but before the Diff appears, quickly do `echo "external change" > dup.txt` in another terminal, then come back to agent-code and press `y`. You'll see:
+
+```
+observation: error: file was modified after read. Read dup.txt again before editing.
+```
+
+That's `check_mtime_conflict` firing. No content-equals fallback in the teaching version — mtime change means conflict, and a fresh `read_file` refreshes state.
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v1-to-v2.diff"
+  title="v2 — three fs_safety helpers + file_edit + unified validation_error funnel"
+  description="fs_safety.py adds ensure_read_before_edit / check_mtime_conflict / apply_single_replace; tools.py imports apply_single_replace and adds the file_edit tool + registration; agent.py swaps inline checks for fs_safety calls and dry-runs the replace for file_edit so the diff reflects exactly what will land."
+/>
+
+The model now has two write tools, but every successful write overwrites — old content is gone forever. v3 plants the safety net.
+
+---
+
+## v3 — file history backup
+
+`file_history.backup` snapshots the file's current content to `.agent/history/<rel>/<timestamp>` before every successful write. No new tool, no model awareness — this is a harness-wide safety net, invisible to the model.
+
+### 3.1 Create `agent_code/file_history.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def backup(cwd: Path, path: Path, old_content: str) -> Path | None:
+    """Before any write, snapshot the file's old content to .agent/history/<rel>/<ts>.
+    Backup is not a tool — the model can't see it. It's a harness-wide safety net.
+    A backup failure does not block the edit; returns None."""
+    try:
+        rel = path.resolve().relative_to(cwd.resolve())
+    except ValueError:
+        return None  # Path is outside cwd; don't back it up.
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
+    backup_dir = cwd / ".agent" / "history" / rel
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / ts
+
+    try:
+        backup_path.write_text(old_content, encoding="utf-8")
+    except OSError:
+        return None
+    return backup_path
+```
+
+`backup` returns `None` on any failure (path escape, disk full, permissions) and never raises — backup must not block an edit you've already confirmed with `y`. The filename is an ISO timestamp with millisecond precision so multiple edits in the same second don't clobber each other.
+
+### 3.2 Edit `agent_code/tools.py` — call `backup` before every write
+
+Top imports gain `from .file_history import backup`.
+
+`file_write`: insert a "back up if file exists" block right before `path.parent.mkdir`:
+
+```python
+    if path.exists():
+        # Back up the old content (a backup failure must not block the write).
+        try:
+            old = path.read_text(encoding="utf-8")
+            backup(ctx.cwd, path, old)
+        except Exception:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+```
+
+`file_edit`: between `content = path.read_text(...)` and `apply_single_replace(...)`, slot one line:
+
+```python
+    backup(ctx.cwd, path, content)  # back up the old content before the write
+```
+
+By the time `file_edit` reaches `backup`, the file is guaranteed to exist (the intercept block already short-circuits the no-such-file case), so we skip the `path.exists()` check here.
+
+### 3.3 Verify
+
+Confirm hello.txt exists, then edit it once:
+
+```bash
+$ uv run agent-code "Use read_file on hello.txt, then change hello to hola"
+...
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'hello', 'new_string': 'hola'}
+Diff for hello.txt:
+...
+Apply this edit to hello.txt? [y/N]: y
+observation: Edited hello.txt: replaced 5 chars with 4 chars
+```
+
+Now peek at `.agent/history/`:
+
+```bash
+$ ls .agent/history/hello.txt/
+20260526T120000.123Z
+
+$ cat .agent/history/hello.txt/20260526T120000.123Z
+hello from agent
+```
+
+The old content was preserved verbatim. File backup is **not** a tool: the model can't call it, can't read it, and prompts never reveal it. It's analogous to your editor's local history or git reflog — visible only to the developer, part of the harness infrastructure.
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v2-to-final.diff"
+  title="v3 — file_history.backup as a harness-wide safety net"
+  description="New file_history.py (backup with ISO millisecond timestamps); tools.py imports backup at the top; file_write checks path.exists() and backs up before path.parent.mkdir; file_edit backs up between the read and apply_single_replace — every backup failure is swallowed so it never blocks the write."
+/>
+
+---
+
+## Closeout — today's full file change list
+
+Six files changed, two new. Per-file change summary:
+
+| File | New | Changed |
+|---|---|---|
+| `agent_code/diff_ui.py` | New file: `render_diff` + `confirm_edit` | — |
+| `agent_code/file_history.py` | New file: `backup` | — |
+| `agent_code/fs_safety.py` | `ensure_read_before_edit` + `check_mtime_conflict` + `apply_single_replace` | — |
+| `agent_code/tools.py` | `file_write` + `file_edit` + two registrations + imports for `backup` and `apply_single_replace` | `file_write` / `file_edit` call `backup` before writing |
+| `agent_code/agent.py` | Imports for `ToolResult`, `resolve_in_cwd`, `apply_single_replace`, `check_mtime_conflict`, `ensure_read_before_edit`, `render_diff`, `confirm_edit`, `Console` + module-level `console` + `emit` closure | Insert ~50-line intercept block in the tool loop; replace four `trace.append` with `emit` |
+| `agent_code/cli.py` | — | `run_once` no longer prints the trace itself — `run_agent` already streamed it |
+
+`model.py` doesn't change today. The `ToolContext.read_state` field has been there since Day 3; today we finally read it.
+
+---
+
+### Terminal replay
+
+Below is `agent-code "read hello.txt first, then file_edit goodbye -> hola"` end-to-end, including read_file -> file_edit -> diff render -> y/N confirm -> observation -> final:
+
+<TerminalReplay tracePath="/lessons/day-04/traces/safe-edit-hello.json" />
+
+---
+
+## What you have today
+
+- **`file_write` + `file_edit`**: two write tools — one whole-file overwrite, one string replace. The model can change code, but every safety policy stays hidden in the <Concept name="Harness">harness</Concept> intercept block, never exposed as a tool argument.
+- **`ReadFileState` hook finally consumed**: Day 3 planted `(mtime_ns, char_count)` records, today they become two real gates — `ensure_read_before_edit` blocks "write without reading" and `check_mtime_conflict` blocks "external change since last read".
+- **diff preview + y/N confirm**: before any byte lands, the harness paints a unified diff and you personally accept the edit. Today uses a minimal y/N; Day 5's permission system upgrades it to a full `PermissionDecision`.
+- **File history backup**: every successful write snapshots the old content to `.agent/history/<rel>/<ts>`. The model can't see it — it's the harness's safety net, akin to your editor's local history.
+- **Streaming trace**: `run_agent` uses an `emit` closure to print `tool_call` / `observation` / `final` as they happen, so diff and confirm prompts can interleave in real order. Day 3's "dump trace at the end" couldn't show that interleaving.
+
+---
+
+## FAQ
+
+**`file_edit` says `string to replace not found in file`, but the `old_string` is clearly in the file**
+
+Most likely an indentation or whitespace mismatch. The model sometimes hallucinates leading spaces or treats tabs as 4 spaces. Have it re-read the target line and use a richer surrounding context as `old_string`; or fish the exact text out yourself with `grep` and feed it back.
+
+**`old_string` and `new_string` are identical and it still errors**
+
+`apply_single_replace`'s first line rejects `old == new`. That's usually the model performing an "empty edit" — it thinks the file needs to change but the strings it sends are the same. Ask it to retry with a genuinely different old/new pair.
+
+**What happens after I press `n`**
+
+The Agent Loop turns `error: edit rejected by user` into an `is_error=True` tool_result and hands it back to the model. The model typically falls back to an alternative — different phrasing, a different tool, or simply "I can't edit that." Same shape as read-before-edit and mtime-conflict errors: error is feedback that drives the next round of reasoning.
+
+**Why does "read then `touch` (no content change)" also report an mtime conflict**
+
+Day 3's `ReadFileState` only stores `(mtime_ns, char_count)`, not file contents. It compares mtime, not content. `touch` bumps mtime, so the harness flags a conflict. Re-running `read_file` refreshes the record. That's intentional simplification — establish the "mtime is a read/write lock" intuition first; content-equals fallback is a challenge.
+
+**Windows `st_mtime_ns` precision quirk**
+
+NTFS timestamps on Windows don't match the nanosecond precision of Linux/macOS. Python derives `st_mtime_ns` from `st_mtime` (a float of seconds) times `10**9`, so you can lose precision and trip the conflict check immediately after a read. Easiest workaround: add a small tolerance window (e.g. 1s) to `check_mtime_conflict`. Not baked in today — most learners run on macOS or Linux.
+
+---
+
+## Challenges
+
+- [ ] **Challenge 1**: add `restore(cwd, path, ts) -> None` to `file_history` that overwrites the current file with the snapshot at `.agent/history/<rel>/<ts>`. Then add a CLI slash command `/rewind <path> <ts>`.
+- [ ] **Challenge 2**: a prototype `--permission-mode acceptEdits`. Take a `permission_mode` argument in the intercept block; `acceptEdits` skips `confirm_edit` and runs `tools.run` directly; `default` keeps the current y/N.
+- [ ] **Challenge 3**: curly-quote normalization. Models sometimes substitute `"hello"` (curly) for `"hello"` (straight) and `old_string` stops matching. Pre-process content and old_string in `apply_single_replace` to fold curly quotes to straight quotes before matching.
+- [ ] **Challenge 4**: cap `.agent/history/`. Add `MAX_BACKUPS_PER_FILE = 50` and prune the oldest snapshots before adding a new one.
+- [ ] **Challenge 5**: add a `file_diff` tool that only renders a diff and never writes. Useful for the model to compare two files, or current content against a historical snapshot, before deciding to call `file_edit`.
+- [ ] **Challenge 6**: search-then-edit combo. Have the model `grep` to find every match, then `file_edit` each occurrence one by one. Compare against `replace_all` behavior, and reason about why the harness doesn't fuse search and replace into one tool.
+
+---
+
+## Thinking questions
+
+A few open-ended questions. Try to answer each in one sentence before reading on. These are the kinds of things an interviewer would probe on harness boundaries.
+
+1. **Why does `ensure_read_before_edit` return a structured error to the model instead of just refusing the <Concept name="Tool Call">tool_use</Concept>?** If you swallowed the call entirely, the model wouldn't know what happened — could it learn "read before write" from that?
+
+2. **Why are `render_diff` + `confirm_edit` `agent.py`'s job, not `file_edit` / `file_write`'s?** What's lost if you push them into the tool function bodies? Think about how Day 5's permission system would reuse this UI.
+
+3. **`check_mtime_conflict` has no content-equals fallback today.** If somebody `touch`es a file between read and edit (mtime moves but content is identical), the harness reports a conflict. What's the real-world impact? If you wanted a fallback, where would you cache file contents?
+
+4. **Why isn't `file_history.backup` exposed as a model tool?** If the model could call `restore` or `list_snapshots`, how would Agent behavior change?
+
+---
+
+## Tomorrow
+
+Today the Agent can change code safely. Every write goes through diff -> y/N -> backup — a complete read/write protection chain.
+
+Tomorrow we let it run commands: a `bash` tool plus a permission engine. The model can call `bash` to run arbitrary shell, but execution funnels through a full `PermissionRequest` -> `PermissionDecision` chain. Today's y/N confirmation gets abstracted into `PermissionDecision.ask`, augmented with timeouts, allowlists, output truncation, and a pinned cwd — a real "should the model run this command" permission system.

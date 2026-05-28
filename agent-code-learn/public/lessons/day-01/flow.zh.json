@@ -1,0 +1,75 @@
+{
+  "nodes": [
+    { "id": "cli", "label": "CLI Runtime", "type": "process" },
+    { "id": "messages", "label": "Messages Context", "type": "data" },
+    { "id": "provider", "label": "MockProvider", "type": "model" },
+    { "id": "registry", "label": "ToolRegistry", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "cli",
+      "caption": "1. CLI 启动，解析用户输入的 prompt：'用 echo 工具说 hi'，并获取当前 cwd 目录边界。",
+      "messages": []
+    },
+    {
+      "step": 2,
+      "focus": "messages",
+      "caption": "2. run_agent 初始化会话，把 prompt 包入消息列表：messages = [{'role': 'user', 'content': '用 echo 工具说 hi'}]。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ]
+    },
+    {
+      "step": 3,
+      "focus": "provider",
+      "caption": "3. MockProvider 接收消息列表，发现最后一包是 user 消息，识别出工具调用，返回 ModelResponse(tool_calls=[echo]) 请求执行工具。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "registry",
+      "caption": "4. ToolRegistry 根据 ModelResponse 里的 tool_call 名定位到 `echo` Python 函数，输入参数 {'text': 'hi'} 执行并得到结果 'hi'。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "messages",
+      "caption": "5. Agent Harness 执行工具完毕，将结果拼装为 ToolResult，追加 append 到 messages 上下文中：role='tool', content='hi'。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "provider",
+      "caption": "6. MockProvider 第二次接收 messages，检测到最新的消息是 tool 结果，从而依据 context 生成最终的模型回复 text='echo 工具返回：hi'。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo 工具返回：hi",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "cli",
+      "caption": "7. Agent Loop 结束。CLI 收到最终回复，将整条链路的 trace（tool_call、observation、final）输出在屏幕终端上。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    }
+  ]
+}

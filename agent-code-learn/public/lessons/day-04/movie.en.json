@@ -1,0 +1,111 @@
+{
+  "title": "Day 4 · Diff gate + read-before-edit before any write",
+  "task": "Use file_write to create hello.txt with one line 'hello from agent'",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "Use file_write to create hello.txt with 'hello from agent'" },
+      "ledger": { "delta": "messages += user('Use file_write to create hello.txt...')" },
+      "caption": "CLI parses the prompt and builds ToolContext. The read_state slot Day 3 planted finally matters today — it's about to be consulted before any byte hits disk.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: file_write(file_path='hello.txt', content='hello from agent')" },
+      "caption": "The model sees file_write freshly registered at the end of default_tools and calls it. Notice file_write only has file_path / content — every safety policy (read-before-edit, mtime conflict, diff preview, y/N confirm) stays hidden from the model.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01WRITE",
+            "name": "file_write",
+            "arguments": { "file_path": "hello.txt", "content": "hello from agent" }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "Day 4 signature: resolve_in_cwd -> ensure_read_before_edit + check_mtime_conflict -> render_diff -> typer.confirm y/N", "state": "ask", "target": "hello.txt" },
+      "caption": "agent.py intercepts file_write / file_edit. On the new-file path: cwd lock passes; file doesn't exist so read-before-edit + mtime checks short-circuit; render_diff colors the '+hello from agent' line; typer.confirm prints 'Apply this edit to hello.txt? [y/N]' and waits for you. This is Day 4's signature frame — the model proposes, the harness decides.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01WRITE",
+            "name": "file_write",
+            "arguments": { "file_path": "hello.txt", "content": "hello from agent" }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "file_write -> Wrote 16 chars to hello.txt" },
+      "ledger": { "delta": "path.exists()=False skips the backup branch; path.write_text(...); ctx.read_state.record(hello.txt)" },
+      "caption": "You press y, control returns to tools.run. file_write sees path.exists()=False, so the whole backup branch is skipped — there's no old content to snapshot for a brand-new file. Then path.write_text lands the bytes, and ctx.read_state.record(hello.txt, content) stores (mtime_ns, char_count) so any subsequent file_edit on this file sails through ensure_read_before_edit.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result])" },
+      "caption": "Same shape as Day 3: assistant's tool_use as one message, then all tool_result blocks in one user message. The new wrinkle today is the streaming emit — diff and confirm prompts get printed in the real order alongside tool_call / observation, instead of being dumped at the end.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: Created hello.txt with 'hello from agent'." },
+      "caption": "Second request. The model reads 'Wrote 16 chars to hello.txt' in the tool_result, concludes the write succeeded, and returns plain text with stop_reason=end_turn. The for-loop exits here.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ],
+      "modelResponse": {
+        "text": "Created hello.txt with the content 'hello from agent'.",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout <- 'final: Created hello.txt...'" },
+      "caption": "emit already streamed tool_call / diff / observation / final to the terminal in real order. ReadFileState now holds an entry for hello.txt — a follow-up file_edit on this file would clear ensure_read_before_edit without needing a fresh read_file.",
+      "messages": [
+        { "role": "user", "content": "Use file_write to create hello.txt with one line 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ],
+      "modelResponse": {
+        "text": "Created hello.txt with the content 'hello from agent'.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

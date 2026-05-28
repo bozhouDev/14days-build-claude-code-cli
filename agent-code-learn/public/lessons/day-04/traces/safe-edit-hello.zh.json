@@ -1,0 +1,19 @@
+{
+  "command": "uv run agent-code \"先 read_file hello.txt，再用 file_edit 把里面的 goodbye 改成 hola\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/xc/my/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n\r\n" },
+    { "time": 1200, "text": "\u001b[33mtool_call\u001b[0m: read_file {'path': 'hello.txt'}\r\n" },
+    { "time": 2000, "text": "\u001b[36mobservation\u001b[0m: goodbye from agent\r\n" },
+    { "time": 2800, "text": "\u001b[33mtool_call\u001b[0m: file_edit {'file_path': 'hello.txt', 'old_string': 'goodbye', 'new_string': 'hola'}\r\n" },
+    { "time": 3600, "text": "\r\n\u001b[1mDiff for hello.txt:\u001b[0m\r\n" },
+    { "time": 3900, "text": "\u001b[1m--- a/hello.txt\u001b[0m\r\n\u001b[1m+++ b/hello.txt\u001b[0m\r\n" },
+    { "time": 4200, "text": "\u001b[36m@@ -1 +1 @@\u001b[0m\r\n" },
+    { "time": 4400, "text": "\u001b[31m-goodbye from agent\u001b[0m\r\n" },
+    { "time": 4600, "text": "\u001b[32m+hola from agent\u001b[0m\r\n" },
+    { "time": 5400, "text": "Apply this edit to hello.txt? [y/N]: y\r\n" },
+    { "time": 6200, "text": "\u001b[36mobservation\u001b[0m: Edited hello.txt: replaced 7 chars with 4 chars\r\n" },
+    { "time": 7400, "text": "\u001b[32mfinal\u001b[0m: 修改成功！hello.txt 的内容已从 goodbye from agent 变更为 hola from agent。\r\n" }
+  ]
+}

@@ -1,0 +1,105 @@
+{
+  "nodes": [
+    { "id": "user", "label": "User", "type": "process" },
+    { "id": "anthropic", "label": "AnthropicProvider", "type": "model" },
+    { "id": "messages", "label": "Messages", "type": "data" },
+    { "id": "tool", "label": "Tool Runtime", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "user",
+      "caption": "1. 用户问『这个项目的入口文件在哪里？』。CLI 把它包成 user message，cwd 装进 ToolContext。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "anthropic",
+      "caption": "2. AnthropicProvider 把 messages 和 9 个工具 schema 一起发到 Messages API。模型决定先看一眼项目顶层目录，返回 tool_use: list_files，stop_reason=tool_use。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_01LIST", "name": "list_files", "arguments": { "path": "." } }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "messages",
+      "caption": "3. Harness 把 assistant 的 tool_use 整条 append 回 messages，然后调用 list_files。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" }
+      ]
+    },
+    {
+      "step": 4,
+      "focus": "tool",
+      "caption": "4. ToolRegistry 路由到 list_files。fs_safety 的 should_skip 把 .venv/、__pycache__/、.git/ 全过滤掉，返回干净的顶层目录清单。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "anthropic",
+      "caption": "5. Harness 把这一轮的 tool_result 打包进一条 user 消息（v2 改的形状）。第二次请求模型；模型看到顶层有 pyproject.toml，决定读它来找入口，返回 tool_use: read_file。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_02READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 6,
+      "focus": "tool",
+      "caption": "6. ToolRegistry 路由到 read_file。fs_safety 串起 resolve_in_cwd → ensure_text_file → ensure_within_size 三道关，再 ReadFileState.record 记下 (mtime_ns, char_count)，最后 truncate_output 截到 8000 chars。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" }
+      ]
+    },
+    {
+      "step": 7,
+      "focus": "messages",
+      "caption": "7. 第二轮的 tool_result 也打包进一条 user 消息。messages 现在记着完整两轮：user 提问、assistant 的两次 tool_use、harness 回填的两次 tool_result。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_02READ): [project.scripts]\\nagent-code = \"agent_code.cli:main\"\\n...]" }
+      ]
+    },
+    {
+      "step": 8,
+      "focus": "anthropic",
+      "caption": "8. 第三次调 Anthropic。模型从 [project.scripts] 里读到 agent_code.cli:main，返回 final 纯文本，stop_reason=end_turn。while step < max_steps 退出。",
+      "messages": [
+        { "role": "user", "content": "这个项目的入口文件在哪里？" },
+        { "role": "assistant", "content": "[tool_use: list_files(id=toolu_01LIST, path=.)]" },
+        { "role": "user", "content": "[tool_result(toolu_01LIST): agent_code/\\ntests/\\nREADME.md\\npyproject.toml\\nuv.lock]" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_02READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_02READ): [project.scripts]\\nagent-code = \"agent_code.cli:main\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "入口在 agent_code/cli.py 的 main()。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

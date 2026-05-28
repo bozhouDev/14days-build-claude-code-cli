@@ -1,0 +1,725 @@
+---
+title: "Day 5 — Bash + Permission Engine"
+description: "Day 4 made file edits safe. Today the Agent grows hands to run commands — but every command goes through a permission gate first: dangerous commands are blocked outright, normal ones print a preview and wait for y, file edits can be put in acceptEdits or plan mode. The model only sees a bash tool; every policy hides behind PermissionRequest → decide_permission."
+---
+
+Day 4 made file edits safe. Every write went through a <Concept name="Harness">harness</Concept> that printed a diff, asked y/N, and snapshotted the old content — a full read-write protection chain. But the Agent still can't run commands. The model wants to run `pytest` to see tests, or `git status` to check the repo — no tool for that yet. Day 3's `grep` was a pure-Python implementation, not a shell.
+
+Today the Agent gets two new capabilities. First, the `bash` <Concept name="Tool Call">tool</Concept>: the model can invoke any shell command, but every execution flows through a permission engine — dangerous commands get blocked, normal ones get a preview + y/N confirmation, and a `--permission-mode` flag swaps between three modes (`default` / `acceptEdits` / `plan`). Second, `ask_user_question` as a first-class tool: the model isn't limited to "doing" — it can also "ask you", popping a numbered menu and waiting for your choice.
+
+About 300 lines of code, four new files (`bash_runner.py` / `permissions.py` / `bg_manager.py` / `prompt_ui.py`), four touched (`tools.py` / `agent.py` / `cli.py` / `diff_ui.py`). No new dependencies — `subprocess`, `threading`, `re` all ship with Python.
+
+---
+
+### Day 5 Main Visual — Bash + Permission Engine
+
+Start with this Agent Logic Map. It is not a frame-by-frame replay; it isolates the four Day 5 lines that are easiest to mix up: how a `tool_use` becomes a `PermissionRequest`, how `bash` passes dangerous-command blocking and confirmation, how `--permission-mode` changes allow / ask / deny, and why `ask_user_question` plus background bash are still harness branches.
+
+<AgentLogicMap mapPath="/lessons/day-05/logic-map.json" />
+
+---
+
+Today we keep editing Day 4's `agent-code` project. `packages/day-04-safe-edit/` is the Day 4 reference snapshot (the Day 5 final state lives in `demo/agent_code/`).
+
+## Setup — today's starting point
+
+Day 4 gave the Agent two write tools — `file_write` for whole-file overwrite and `file_edit` for string replace. The harness rendered diffs, waited for y, and snapshotted old content. But the interceptor in `agent.py` was a single `if call.name in ("file_write", "file_edit"):` block — edit-only, and every new tool would need another branch.
+
+Today we wrap that interceptor with four pieces:
+
+- A new `bash_runner.py`: `subprocess.run` runs shell commands, cwd pinned to the project, env restricted to a minimal set, timeout + output truncation.
+- A new `permissions.py`: `PermissionRequest` describes one tool call, `PermissionDecision(allow | ask | deny)` is the harness's verdict, `decide_permission()` is the single entry point.
+- A new `prompt_ui.py`: pulls `render_diff` + `confirm_edit` out of Day 4's `diff_ui.py`, adds `confirm_command` + `confirm_tool_use` + `prompt_single_choice`. `diff_ui.py` becomes a re-export so old imports keep working.
+- A new `bg_manager.py`: `subprocess.Popen` + a daemon thread, returns a `background_id` immediately, output streams to `.bg/<id>.out/.err`.
+
+Four-step rollout: v1 gets bash running, v2 lifts confirmation into a permission engine, v3 adds `ask_user_question`, the final step wires up background execution.
+
+---
+
+## v1 — bash sync execution + command preview + y/N confirmation
+
+Start with the most direct case: the model wants to run a command, the harness prints the command for you, you hit y, it runs. Same shape as Day 4 v1's `file_write` — intercept before `tools.run`, preview, confirm. But bash has one key twist: there's no `resolve_in_cwd` to lean on (commands are shell strings, not file paths). Instead the safety boundary is `subprocess.run(cwd=ctx.cwd)`, pinning the process to the project directory.
+
+### 1.1 Create `agent_code/bash_runner.py`
+
+Bash execution gets its own module. The tool function stays thin; the actual run logic lives in the runner — so both the permission engine and the tool function can reuse it. Full 41 lines in the v1 DiffCard, the two key blocks:
+
+```python
+# Minimal env for bash — don't leak host secrets into the child process
+_MINIMAL_ENV = {
+    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    "HOME": os.environ.get("HOME", ""),
+    "USER": os.environ.get("USER", ""),
+    "SHELL": os.environ.get("SHELL", "/bin/bash"),
+}
+
+
+def run_sync(command: str, cwd: Path, timeout: int = 30) -> str:
+    """Run a shell command synchronously. cwd is pinned; the process is killed on timeout."""
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            env=_MINIMAL_ENV,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"error: command timed out after {timeout}s"
+    ...
+    truncated = truncate_output(output.strip(), max_chars=12000)
+    if proc.returncode != 0:
+        return f"exit code {proc.returncode}\n{truncated}"
+    return truncated if truncated else "(no output)"
+```
+
+`shell=True` lets the model write commands the way you'd type them in a terminal. That convenience has a cost — any shell-injection that bypasses the permission engine executes directly. The teaching-grade safety net lands in v2: dangerous-command regex blocking + user confirmation.
+
+### 1.2 Create `agent_code/prompt_ui.py`
+
+Day 4's `diff_ui.py` carried `render_diff` and `confirm_edit`. Today both functions move into `prompt_ui.py`, joined by three new interactions (`confirm_command` for v1, `confirm_tool_use` for v2, `prompt_single_choice` for v3). `diff_ui.py` becomes a re-export shim so existing `from .diff_ui import ...` lines keep working:
+
+```python
+from __future__ import annotations
+
+# Day 5: render_diff and confirm_edit moved to prompt_ui.py.
+# Keep this re-export so the old import path keeps working.
+from .prompt_ui import confirm_edit, render_diff
+
+__all__ = ["confirm_edit", "render_diff"]
+```
+
+`confirm_command` is short:
+
+```python
+def confirm_command(command: str) -> bool:
+    """Ask the user to confirm a bash command. Defaults to no."""
+    return typer.confirm(f"Run this command?", default=False)
+```
+
+### 1.3 Edit `agent_code/tools.py` — add bash, git_status, git_diff
+
+Three new tools. `bash` is the core — it calls `bash_runner.run_sync`. `git_status` and `git_diff` are read-only conveniences; their bodies are also subprocess, but in v2 the permission engine will put them in `_READONLY_TOOLS` so they don't trigger an ask popup every time.
+
+Top of file, add this import:
+
+```python
+from .bash_runner import run_sync as _bash_run_sync
+```
+
+After `file_edit`, before `class ToolRegistry`, insert the three tool functions. `bash` itself is thin:
+
+```python
+def bash(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Execute a shell command. Validation and confirmation live in agent.py's interceptor."""
+    command = args.get("command", "")
+    if not command:
+        return "error: missing required argument 'command'"
+    timeout = int(args.get("timeout", 30))
+    background = bool(args.get("background", False))
+
+    # v1 only handles sync; v4 wires up the background=True branch
+    if background:
+        return "error: background mode not implemented yet (coming in v4)"
+
+    return _bash_run_sync(command, ctx.cwd, timeout=timeout)
+```
+
+Full three tool functions + three `registry.register(...)` calls in the v1 DiffCard. Notice `bash`'s <Concept name="Schema">input_schema</Concept> only exposes `command` / `timeout` / `background` — the dangerous-command list, user confirmation, and mode switching all stay invisible to the model.
+
+### 1.4 Edit `agent_code/agent.py` — add a bash branch in the interceptor
+
+Day 4's interceptor only knew about `file_write` and `file_edit`. v1 adds an `elif` after that if-block: recognize `bash`, print the command preview, ask for confirmation. Add `from .prompt_ui import confirm_command` at the top, then insert before `result = tools.run(call, ctx)`:
+
+```python
+            # bash interceptor: print the command preview, then ask for confirmation
+            elif call.name == "bash":
+                command = call.arguments.get("command", "")
+                timeout = call.arguments.get("timeout", 30)
+                console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
+                console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
+                if not confirm_command(command):
+                    result = ToolResult(call.id, "error: command rejected by user", is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append(...)
+                    continue
+```
+
+Only `bash` is intercepted. `git_status` and `git_diff` fall straight through to `tools.run` with no confirmation prompt.
+
+### 1.5 Three verifications
+
+**(a) Read-only git tools — straight to results, no confirmation:**
+
+```bash
+$ uv run agent-code "Use git_status to inspect the repo, then git_diff to see what changed"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+tool_call: git_status {}
+observation: On branch main
+Changes not staged for commit:
+  modified: ...
+
+tool_call: git_diff {}
+observation: diff --git ...
+final: There are uncommitted changes in the repo; I've reviewed git status and git diff.
+```
+
+Don't expect your output to match byte-for-byte. If you're working in this repo while reading the tutorial, `git status` probably won't be clean. The two things to look for: `tool_call: git_status` / `tool_call: git_diff` show up, and **no** `Run this command?` prompt appears between them.
+
+**(b) bash execution — command preview + confirmation:**
+
+```bash
+$ uv run agent-code "Use bash to run pytest --version"
+...
+tool_call: bash {'command': 'pytest --version', 'timeout': 30, 'background': False}
+
+Command: pytest --version
+timeout: 30s  cwd: /your/project
+Run this command? [y/N]: y
+observation: pytest 8.x.x
+final: pytest 8.x.x is installed in this environment.
+```
+
+You see the yellow `Command:` preview and the `Run this command?` prompt; only after `y` does the command run. Press `n` and you get `observation: error: command rejected by user`.
+
+**(c) bash error — the model recovers from the exit code:**
+
+```bash
+$ uv run agent-code "Use bash to run python -c 'print(1/0)'"
+...
+observation: exit code 1
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ZeroDivisionError: division by zero
+final: The command failed — the code tried to divide by zero and Python raised ZeroDivisionError.
+```
+
+The model reads `exit code 1` + stderr and figures out what went wrong on its own.
+
+v1's bash works, but the confirmation logic still lives in `agent.py`'s if/elif chain. Every new tool adds another branch, and dangerous bash still only triggers y/N — there's no pre-confirmation blocker. The next step lifts confirmation into a real permission engine.
+
+<DiffCard
+  diffPath="/lessons/day-05/diffs/v1-bash.diff"
+  title="v1 — bash_runner + prompt_ui + bash/git_status/git_diff tools + agent.py bash interceptor branch"
+  description="Create bash_runner.py (_MINIMAL_ENV + run_sync); create prompt_ui.py (move render_diff/confirm_edit in, add confirm_command/confirm_tool_use); diff_ui.py becomes a re-export shim; tools.py imports _bash_run_sync and adds bash/_git_status/_git_diff with their three registrations; agent.py adds an elif call.name == 'bash' branch after the file_write/file_edit interceptor that prints the command preview and runs confirm_command."
+/>
+
+---
+
+## v2 — Permission engine: three modes + dangerous-command blocking
+
+v1 has three problems:
+
+1. **Confirmation logic is scattered.** `file_write` / `file_edit` diff+confirm sits in the if block; `bash` preview+confirm sits in the elif. Adding `ask_user_question` needs yet another branch.
+2. **Confirmation alone isn't enough for dangerous bash.** `echo hello` and `rm -rf /` both flow through the same y/N. Dangerous commands should be rejected before the prompt.
+3. **No mode switching.** Sometimes you want the Agent to edit freely without confirming (`acceptEdits`); sometimes you want it strictly read-only (`plan`).
+
+The permission engine solves all three. Every tool call passes through `decide_permission()`, which returns `allow | ask | deny`. The Agent Loop dispatches by decision: allow → run directly, ask → render preview + confirm, deny → return an error <Concept name="Observation">observation</Concept>.
+
+### 2.1 Create `agent_code/permissions.py`
+
+The core is one function: `decide_permission(request)`. `PermissionRequest` describes "what this tool call wants to do", `PermissionDecision` is the harness verdict. Full 93 lines in the v2 DiffCard, the key dataclass + decision skeleton:
+
+```python
+@dataclass
+class PermissionRequest:
+    """A single tool-call permission request. The tool describes intent; the harness decides."""
+    tool_name: str
+    args: dict
+    mode: str
+    cwd: Path
+
+
+@dataclass
+class PermissionDecision:
+    """Permission verdict. behavior is one of allow / ask / deny."""
+    behavior: str  # "allow" | "ask" | "deny"
+    message: str | None = None
+
+
+def decide_permission(request: PermissionRequest) -> PermissionDecision:
+    """Permission entry point: decide allow / ask / deny by tool name, args, and mode."""
+    tool_name = request.tool_name
+    args = request.args
+    mode = request.mode
+
+    if tool_name in _ASK_TOOLS:
+        return PermissionDecision("ask")
+
+    # plan mode: only read-only tools are allowed. Write tools always deny.
+    if mode == "plan":
+        if tool_name in _READONLY_TOOLS:
+            return PermissionDecision("allow")
+        return PermissionDecision("deny", f"plan mode: {tool_name} is not allowed. ...")
+
+    # Read-only tools are always allowed
+    if tool_name in _READONLY_TOOLS:
+        return PermissionDecision("allow")
+
+    # bash dangerous-command check — applies in every mode
+    if tool_name == "bash":
+        command = args.get("command", "")
+        danger_reason = _is_dangerous(command)
+        if danger_reason:
+            return PermissionDecision("deny", f"Dangerous command blocked: {danger_reason}")
+
+    # acceptEdits: file edits skip the confirmation UI, but safety checks still run in agent.py
+    if mode == "acceptEdits":
+        if tool_name in ("file_write", "file_edit"):
+            return PermissionDecision("allow")
+
+    # Default: writes and bash need confirmation
+    return PermissionDecision("ask")
+```
+
+The dangerous-command regex is the teaching-grade minimum: `rm -rf` / `sudo` / `chmod -R` / `curl ... | sh` / `git push --force` / `git push -f` / `git push` / `git reset --hard`. `_READONLY_TOOLS` whitelists `read_file` / `list_files` / `glob` / `grep` / `project_tree` / `git_status` / `git_diff` / `system_date` / `echo` so they bypass confirmation. `_ASK_TOOLS` holds `ask_user_question` / `web_fetch` / `web_search` — read-only in a sense, but the user should still know the Agent is pausing to ask a human or hitting an external resource.
+
+Why put the read-only whitelist in the permission engine and not the tool registry? Because "is this read-only?" is a property of the permission decision, not the tool itself. The same `bash` tool can run read-only or write commands; the engine asks "what does this tool do *in this call*?", not "what kind of tool is this?".
+
+### 2.2 Edit `agent_code/agent.py` — unified gate via decide_permission
+
+Replace v1's if/elif chain with a unified permission gate. Update the top of the file to import every UI function from `prompt_ui` directly, and add `from .permissions import PermissionRequest, decide_permission`.
+
+Add `permission_mode: str = "default"` to `run_agent`'s signature. Then replace the entire tool-call loop's if/elif block with the three-branch decision structure. The core change: every tool call wraps into a `PermissionRequest`, hits `decide_permission`, and dispatches into deny / ask / allow:
+
+```python
+            # Permission engine entry: wrap every tool call into a PermissionRequest
+            request = PermissionRequest(
+                tool_name=call.name,
+                args=call.arguments,
+                mode=permission_mode,
+                cwd=ctx.cwd,
+            )
+            decision = decide_permission(request)
+
+            edit_preview: tuple[str, str, str] | None = None
+            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
+                # acceptEdits skips the confirm UI but not Day 4's safety checks
+                # path resolve + read-before-edit + mtime check + apply_single_replace all run here
+                ...
+                edit_preview = (path_str, old_content, new_content)
+
+            if decision.behavior == "deny":
+                # deny path: return an error observation without any UI
+                result = ToolResult(call.id, f"error: {decision.message}", is_error=True)
+                ...
+                continue
+
+            elif decision.behavior == "ask":
+                if call.name in ("file_write", "file_edit"):
+                    # ask only owns diff + confirm; safety checks already passed
+                    ...
+                elif call.name == "bash":
+                    # command preview + confirm
+                    ...
+                elif call.name in ("web_fetch", "web_search"):
+                    # confirm_tool_use lets the user okay an external resource
+                    ...
+                elif call.name == "ask_user_question":
+                    pass  # v3 wires this up
+
+            # allow path + ask passed: run the tool
+            result = tools.run(call, ctx)
+```
+
+Three decision paths: `deny` returns an error observation immediately (no UI, no execution); `ask` dispatches to a preview UI by tool type, and only after confirmation does it fall through to `tools.run`; `allow` skips the UI and goes straight to `tools.run`. Full ~150-line replacement in the v2 DiffCard.
+
+Note: `acceptEdits` only skips confirmation, **not** safety checks. Before either the `ask` or `allow` branch, `file_write` / `file_edit` still run Day 4's `ensure_read_before_edit` + `check_mtime_conflict` + `apply_single_replace` pre-compute.
+
+### 2.3 Edit `agent_code/cli.py` — add `--permission-mode`
+
+Add to `main_command`'s signature:
+
+```python
+    permission_mode: str = typer.Option("default", "--permission-mode", help="Permission mode: default, acceptEdits, plan"),
+```
+
+Add `permission_mode: str` to `run_once`'s signature, pass it through in both `run_once(...)` call sites (the direct run and the REPL loop), and forward it to `run_agent(..., permission_mode=permission_mode)`.
+
+### 2.4 Five verifications
+
+**(a) default mode — file edits still need confirmation:**
+
+After Day 4 the `hello.txt` content is usually `hola from agent`. Have the model read the file first and switch `hola` back to `hello`:
+
+```bash
+$ uv run agent-code "Read hello.txt, then change hola to hello inside it"
+...
+tool_call: read_file {'path': 'hello.txt'}
+observation: hola from agent
+tool_call: file_edit {...}
+
+Diff for hello.txt:
+...
+Apply this edit to hello.txt? [y/N]:
+```
+
+Day 4 diff + confirm behavior unchanged.
+
+**(b) acceptEdits — file edits skip confirmation:**
+
+```bash
+$ uv run agent-code --permission-mode acceptEdits "Read hello.txt, then change hello back to hola inside it"
+...
+tool_call: file_edit {...}
+observation: Edited hello.txt: replaced 5 chars with 4 chars
+```
+
+No `Diff for` and no `Apply this edit?` — in `acceptEdits`, `decide_permission` returns `allow` for `file_write` / `file_edit`, but read-before-edit, mtime conflict, and string-replace checks still run before execution. bash still needs confirmation:
+
+```bash
+$ uv run agent-code --permission-mode acceptEdits "Use bash to run echo hello"
+...
+Command: echo hello
+Run this command? [y/N]:
+```
+
+**(c) plan mode — write tools get rejected:**
+
+```bash
+$ uv run agent-code --permission-mode plan "Create a hello.txt file"
+...
+tool_call: file_write {'file_path': 'hello.txt', 'content': 'hello'}
+observation: error: plan mode: file_write is not allowed. Only read-only tools can run in plan mode.
+final: We're in plan mode; write operations aren't allowed.
+```
+
+Read-only tools are unaffected — `read_file` lives in `_READONLY_TOOLS`:
+
+```bash
+$ uv run agent-code --permission-mode plan "Read hello.txt"
+...
+tool_call: read_file {'path': 'hello.txt'}
+observation: hola from agent
+```
+
+**(d) Dangerous git command gets blocked:**
+
+```bash
+$ uv run agent-code "Use bash to run git push --force origin main"
+...
+tool_call: bash {'command': 'git push --force origin main', 'timeout': 30, 'background': False}
+observation: error: Dangerous command blocked: git push --force overwrites remote history
+```
+
+No Command preview, no confirmation — `decide_permission` returned `PermissionDecision("deny")` at the `_is_dangerous` check.
+
+**(e) `sudo rm -rf /` may be refused by the model first:**
+
+A real model sometimes refuses extreme commands at the assistant layer and answers with a final like "I can't run this." That doesn't mean the permission engine isn't working; the model just pre-empted it. For a stable check on the engine itself, prefer `git push --force` above.
+
+The permission engine's three modes + dangerous-command blocking are now wired up. `agent.py`'s interceptor isn't a tangle of if/elif anymore — it's one unified `decision.behavior` three-branch dispatch.
+
+<DiffCard
+  diffPath="/lessons/day-05/diffs/v1-to-v2.diff"
+  title="v2 — permissions.py engine + agent.py unified gate + cli.py --permission-mode"
+  description="Create permissions.py (PermissionRequest/PermissionDecision dataclasses + _DANGEROUS_PATTERNS regex + _READONLY_TOOLS/_ASK_TOOLS whitelists + decide_permission five-branch decision); agent.py switches imports to prompt_ui, run_agent gains permission_mode, the tool-call loop moves from if/elif to PermissionRequest → decide_permission → deny/ask/allow (acceptEdits skips confirm but preserves Day 4 safety checks); cli.py adds the --permission-mode Option and threads it through both run_once call sites."
+/>
+
+---
+
+## v3 — `ask_user_question`: let the model ask you
+
+v2's permission engine handles two interactions: allow (run directly) and ask (preview + y/N). But sometimes the model needs more than "should this run?" — it needs you to pick between options, like "fix the test or fix the code?".
+
+`ask_user_question` does that. It's a first-class tool, not a slash command. The model calls it, the harness blocks the Agent Loop, the terminal pops a numbered menu, and the choice flows back as a <Concept name="Tool Result">tool_result</Concept>.
+
+### 3.1 Edit `agent_code/prompt_ui.py` — add a single-choice menu
+
+Append to the file:
+
+```python
+def prompt_single_choice(question: str, labels: list[str]) -> str | None:
+    """Show a numbered menu, return the chosen label, or None."""
+    import rich
+    console = rich.console.Console()
+    console.print(f"\n[bold yellow]? {question}[/bold yellow]")
+    for i, label in enumerate(labels, 1):
+        console.print(f"  {i}. {label}")
+    console.print(f"  0. [dim]Skip / Other[/dim]")
+
+    try:
+        choice = typer.prompt("Choice", default="0")
+        idx = int(choice)
+        if 1 <= idx <= len(labels):
+            return labels[idx - 1]
+        return None
+    except (ValueError, TypeError):
+        return None
+```
+
+### 3.2 Edit `agent_code/tools.py` — add `ask_user_question`
+
+The tool function **doesn't read stdin** — the actual interaction happens inside `agent.py`'s interceptor. The function only validates args; the normal path never calls it:
+
+```python
+def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Handled by agent.py's interceptor — this function never reads stdin itself."""
+    prompt = args.get("prompt", "")
+    options = args.get("options", [])
+    if not prompt:
+        return "error: missing required argument 'prompt'"
+    if not options or not isinstance(options, list):
+        return "error: options must be a non-empty list"
+    return "error: ask_user_question must be handled by the harness, not executed directly"
+```
+
+Append an `ask_user_question` registration after the bash registration in `default_tools()` (<Concept name="Schema">input_schema</Concept> has a `prompt` string + an `options` array). Full registration in the v3 DiffCard.
+
+### 3.3 Edit `agent_code/agent.py` — handle `ask_user_question`
+
+v2 left a placeholder `elif call.name == "ask_user_question": pass` in the interceptor. Add `prompt_single_choice` to the top import, replace `pass` with:
+
+```python
+                elif call.name == "ask_user_question":
+                    question = call.arguments.get("prompt", "")
+                    options = call.arguments.get("options", [])
+                    if not isinstance(options, list):
+                        options = []
+                    labels = [str(o) for o in options]
+                    selected = prompt_single_choice(question, labels)
+                    if selected is None:
+                        result = ToolResult(call.id, "User skipped the question.", is_error=False)
+                    else:
+                        result = ToolResult(call.id, f'User selected: "{selected}"', is_error=False)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    })
+                    continue
+```
+
+Note `ask_user_question` uses `continue` — it builds its own `ToolResult`, appends to `tool_result_blocks`, and **never** falls through to `tools.run`. That's different from `file_write` / `file_edit` / `bash`: those tools still need `tools.run` after confirmation; `ask_user_question`'s whole job is showing a menu and grabbing the answer.
+
+### 3.4 Verification
+
+```bash
+$ uv run agent-code "Should I fix the test first or the code first? Ask me with ask_user_question, three options: fix the test, fix the code, not sure"
+...
+tool_call: ask_user_question {'prompt': 'Where should we start fixing this bug?', 'options': ['fix the test', 'fix the code', 'not sure']}
+
+? Where should we start fixing this bug?
+  1. fix the test
+  2. fix the code
+  3. not sure
+  0. Skip / Other
+Choice: 2
+observation: User selected: "fix the code"
+final: You chose "fix the code". Let's start by changing the implementation...
+```
+
+The model picks up the choice and keeps reasoning. Picking `0` returns `User skipped the question.` — `is_error=False`, so the model knows "the user saw the question but didn't pick a direction", not an error.
+
+v3 stops here on purpose. This numbered menu is the smallest teaching version: it proves the full chain works — the model asks a structured question, the harness pauses the loop, the user picks an option, that choice becomes a tool_result, and the model continues.
+
+The arrow-key selector you see in Claude Code is not a different model capability; it is a richer `prompt_ui` layer. The terminal switches into raw input, listens for up/down arrows to move the highlighted option, returns the selected label on Enter, then the Agent Loop wraps it as a tool_result. In the Claude Code source, this is also a first-class tool named `AskUserQuestion`: its permission check always asks for user interaction, and the UI supports question groups, option descriptions, previews, and multi-select. We skip those pieces today so the harness boundary stays clear. To upgrade later, mostly replace `typer.prompt("Choice")` inside `prompt_single_choice()` with an arrow-key menu; the `agent.py` interception flow can stay the same.
+
+<DiffCard
+  diffPath="/lessons/day-05/diffs/v2-to-v3.diff"
+  title="v3 — prompt_single_choice + ask_user_question tool + agent.py interceptor replaces the pass"
+  description="prompt_ui.py appends prompt_single_choice (rich-rendered numbered menu + typer.prompt for 0..N); tools.py adds _ask_user_question placeholder + default_tools() registration (input_schema prompt+options); agent.py adds prompt_single_choice to its imports and replaces the v2 elif ask_user_question pass with real ToolResult + continue logic."
+/>
+
+---
+
+## Final — `bash(background=True)`: background execution
+
+v1's bash is synchronous: the model calls `bash("sleep 30")` and the Agent Loop blocks for 30 seconds. Compilation, long test runs — that doesn't fly.
+
+Background execution fixes this: the model sets `background=True`, the harness spawns the process and returns a structured observation immediately (containing `background_id`, output file paths, pid), the Agent Loop never blocks. Afterwards the model can `bash("cat .bg/<id>.out")` to check output or `bash("kill <pid>")` to stop it.
+
+### 4.1 Create `agent_code/bg_manager.py`
+
+A daemon thread waits on a `subprocess.Popen`; stdout and stderr stream to `.bg/<id>.out` and `.bg/<id>.err`. The launcher returns a dict immediately without waiting for the process to finish:
+
+```python
+def start_background(command: str, cwd: Path) -> dict:
+    """Start a shell command in the background; stream stdout/stderr to .bg/<id>.out/.err.
+    Returns immediately with structured info — doesn't wait for the process to finish."""
+    bg_id = f"bg-{uuid.uuid4().hex[:8]}"
+    bg_dir = cwd / ".bg"
+    bg_dir.mkdir(parents=True, exist_ok=True)
+    out_path = bg_dir / f"{bg_id}.out"
+    err_path = bg_dir / f"{bg_id}.err"
+
+    out_f = open(str(out_path), "w")
+    err_f = open(str(err_path), "w")
+
+    proc = subprocess.Popen(
+        command, shell=True, cwd=str(cwd), env=_MINIMAL_ENV,
+        stdout=out_f, stderr=err_f,
+    )
+
+    def _wait_and_close() -> None:
+        """Wait for the child to finish, close fds. Runs in a daemon thread."""
+        proc.wait()
+        out_f.close()
+        err_f.close()
+
+    t = threading.Thread(target=_wait_and_close, daemon=True)
+    t.start()
+
+    return {"background_id": bg_id, "output_file": ..., "stderr_file": ..., "pid": proc.pid, "message": ...}
+```
+
+A `daemon=True` thread gets reaped when the main process exits, so it never blocks the CLI from exiting. Here is the full mental model: a real background-task lifecycle is not just "start a thread". It is **create task → record task id → keep writing output → allow later reads → support cancellation → notify the model when the task finishes**.
+
+Claude Code follows that shape. Background bash is still the same `Bash` tool; the input carries `run_in_background: true`. The harness starts the subprocess, registers a local shell task, streams output into a task output file, and immediately returns `backgroundTaskId` plus the output path as the tool_result. When the task finishes, a notification can be sent back into model context. If the user stops it, the CLI uses its internal task-kill path instead of asking the model to guess a pid.
+
+Day 5 does not implement that full manager. We keep the smallest useful chain: `background=True` starts a subprocess, stdout/stderr stream into `.bg/<id>.out/.err`, and the tool_result returns `background_id`, output paths, and `pid`. Later the model can `bash("cat .bg/<id>.out")` to inspect output or `bash("kill <pid>")` to stop it. In the current 14-day path, `bg_status` / `bg_read` / `bg_cancel` and completion notifications stay out of the main track; they fit better as extras, or as a follow-up AI-assisted implementation using this lifecycle map.
+
+### 4.2 Edit `agent_code/tools.py` — wire bash's background branch
+
+In `bash`, replace:
+
+```python
+    if background:
+        return "error: background mode not implemented yet (coming in v4)"
+```
+
+with:
+
+```python
+    if background:
+        # Background execution: spawn the child, return structured info, don't block the Agent Loop
+        from .bg_manager import start_background
+        result = start_background(command, ctx.cwd)
+        return (
+            f"Command running in background with ID: {result['background_id']}.\n"
+            f"Output is being written to: {result['output_file']}\n"
+            f"Stderr is being written to: {result['stderr_file']}\n"
+            f"PID: {result['pid']}\n\n"
+            f"{result['message']}"
+        )
+```
+
+Background mode skips timeout (the child owns its own lifetime) and skips output truncation (output goes to a file, not the tool_result).
+
+### 4.3 agent.py stays put
+
+Background bash and sync bash share the same `decide_permission` flow — to the permission engine, `bash` is `bash`, sync or background. The dangerous-command check applies to both, and the user-confirmation prompt fires for background bash too. `background=True` is just a different execution mode, not a permission exemption.
+
+### 4.4 Two verifications
+
+**(a) Background execution + read output later:**
+
+```bash
+$ uv run agent-code "Use bash(background=True) to run sleep 5 && echo 'done from background'. After you get the background_id, use sync bash to run sleep 6 && cat the corresponding .bg output file."
+...
+tool_call: bash {'command': 'sleep 5 && echo done from background', 'timeout': 30, 'background': True}
+
+Command: sleep 5 && echo done from background
+Run this command? [y/N]: y
+observation: Command running in background with ID: bg-a1b2c3d4.
+Output is being written to: .bg/bg-a1b2c3d4.out
+...
+tool_call: bash {'command': 'sleep 6 && cat .bg/bg-a1b2c3d4.out', 'timeout': 10, 'background': False}
+
+Command: sleep 6 && cat .bg/bg-a1b2c3d4.out
+Run this command? [y/N]: y
+observation: done from background
+final: Background task done; output was "done from background".
+```
+
+We deliberately wait 6 seconds because `cat`-ing right after starting a background task might hit an empty file. If you're driving this with `printf`, line up at least two `y` answers — one for the background command, one for the `sleep 6 && cat ...`.
+
+**(b) Killing a background process:**
+
+```bash
+$ uv run agent-code "Use bash(background=True) to run sleep 300, then kill it"
+...
+observation: Command running in background with ID: bg-e5f6g7h8.
+PID: 12345
+...
+tool_call: bash {'command': 'kill 12345', 'timeout': 10, 'background': False}
+```
+
+The model reads the pid from the first tool_result and builds `kill <pid>`.
+
+<DiffCard
+  diffPath="/lessons/day-05/diffs/v3-to-final.diff"
+  title="Final — bg_manager.py background execution + tools.py bash wires the background branch"
+  description="Create bg_manager.py (_MINIMAL_ENV + start_background: subprocess.Popen paired with a daemon thread wait_and_close, returns background_id/output_file/stderr_file/pid immediately); tools.py replaces bash()'s 'background mode not implemented yet' placeholder with a real 'from .bg_manager import start_background' branch that returns a structured text observation. agent.py is untouched — background bash and sync bash share the same decide_permission path."
+/>
+
+---
+
+### Terminal replay
+
+Below is the terminal animation for `agent-code "Use bash to run pytest --version"` — the same 7-frame story as the Day 5 main visual: `tool_call: bash` → yellow `Command:` preview + dim `timeout/cwd` line → `Run this command? [y/N]: y` → `observation: pytest 8.4.2` → `final`:
+
+<TerminalReplay tracePath="/lessons/day-05/traces/bash-pytest-version.json" />
+
+---
+
+## What you have now
+
+- **`bash` tool**: the model can run any shell command. cwd is pinned to the project, env is restricted to `_MINIMAL_ENV`, timeout defaults to 30s, output is truncated at 12000 chars. `git_status` / `git_diff` are thin read-only wrappers — allowed by default, no popup noise.
+- **Permission engine `permissions.py`**: `PermissionRequest` describes one tool call, `PermissionDecision(allow | ask | deny)` is the verdict. Three modes — `default` (writes ask), `acceptEdits` (file edits skip confirm but preserve Day 4 safety), `plan` (writes always deny).
+- **Dangerous-command blocking**: regex coverage for `rm -rf` / `sudo` / `chmod -R` / `curl | sh` / `git push` / `git push --force` / `git reset --hard`. A match goes straight to deny with no UI.
+- **`ask_user_question` tool**: the model can stop and ask the user a structured single-choice question. The terminal pops a numbered menu; the answer flows back as a tool_result and drives the next round of reasoning.
+- **Background bash**: `bash(background=True)` spawns the child and returns `background_id` + output file paths immediately. The Agent Loop doesn't block. The model can later `bash("cat .bg/<id>.out")` or `bash("kill <pid>")`.
+- **Unified `agent.py` interceptor**: v1's if/elif chain → v2's three-branch dispatch on `decide_permission`. Adding a new tool no longer changes the interceptor shape — just give it a decision rule in the permission engine.
+
+---
+
+## FAQ
+
+**`bash` returns `command timed out after 30s`**
+
+The command ran longer than 30 seconds. Either ask the model to pass a larger `timeout` value, or switch to `background=True` for long-running work. Putting an upper bound on `timeout` is a good exercise.
+
+**Is `shell=True` safe?**
+
+The teaching version uses `shell=True` so commands look natural (the same way you'd type them). Safety leans on two layers: the permission engine's dangerous-command regex (v2) + user confirmation (v1). Production deployments still need container sandboxing, a read-only filesystem, and network isolation. The claim isn't "shell=True is safe"; it's "shell=True + harness gating is acceptable for teaching".
+
+**In plan mode the model keeps calling `file_edit` and getting denied**
+
+The model probably hasn't noticed it's in plan mode. The system prompt should announce plan mode explicitly (Day 8 adds that). For now, if the model gets stuck in a "call write tool → get denied → try again" loop, exit with `/exit` and rerun with `--permission-mode default`.
+
+**What happens when the user picks `0` in `ask_user_question`?**
+
+You get `User skipped the question.` with `is_error=False`. The model knows the user saw the question and chose not to pick — it'll usually decide on its own or rephrase the question, treating it as feedback rather than an error.
+
+**When does the background bash output file appear?**
+
+`.bg/<id>.out` is created **immediately** when `start_background` runs (the `open("w")` on `Popen` time). But the contents only fill in once the child process actually writes. If the model `cat`s right after getting `background_id`, it may see an empty file — give it a few seconds. The tutorial verification uses `bash("sleep 6 && cat .bg/<id>.out")`.
+
+---
+
+## Exercises
+
+- [ ] **Exercise 1**: Optional range for timeouts. Add `_MAX_TIMEOUT = 120` to `permissions.py` and check `timeout > _MAX_TIMEOUT` in the bash branch — over the limit, return ask with an explanation. Add a `--max-timeout` CLI flag.
+- [ ] **Exercise 2**: Remember user choices. Add a `_remembered: dict[str, str]` to `permissions.py`; after the user picks "always allow" for a tool, subsequent calls return allow directly. Add "yes to all" to `confirm_command` and `confirm_edit`.
+- [ ] **Exercise 3**: `ask_user_question` multi-select. Add a `multi_select` parameter to `prompt_single_choice` so input like `1,3` returns two labels; mirror that with a `multi_select` field in `_ask_user_question`'s schema.
+- [ ] **Exercise 4**: Background task listing. Add `list_background() -> list[dict]` to `bg_manager.py` that scans `.bg/` and returns the running/done status for every task. Add a `bg_list` tool in `tools.py` so the model can list its own background tasks.
+- [ ] **Exercise 5**: Switch `--permission-mode` inside the REPL. Add a `/permissions` slash command so typing `/permissions acceptEdits` in REPL swaps the current session's permission mode without restarting.
+
+---
+
+## Reflection
+
+A few open questions. Sit with a one-line answer before reading on — these are the harness-boundary calls that interviewers push hardest.
+
+1. **Why does `decide_permission` get called from `agent.py`'s interceptor instead of inside each tool function in `tools.py`?** (Hint: same design principle as Day 4 Reflection 2. If a tool function decided "should I show a confirm prompt?" itself, what breaks when you swap the CLI for a web frontend?)
+
+2. **`git_status` and `git_diff` are standalone tools rather than the model just calling `bash("git status")`. What does that design choice buy you, and what does it cost?** (Hint: think about how `_READONLY_TOOLS` works and what the model is likely to guess wrong when it tries to decide "is this command read-only?")
+
+3. **`plan` mode only enforces a hard constraint ("all write tools deny"), no soft constraint ("draft a plan with todo_write first"). Without the soft half, is it still Plan Mode?** (Hint: Day 8 fills the other half in. First imagine the typical behavior with only the hard constraint — what does the model do in plan mode?)
+
+4. **Background bash output lives in `.bg/<id>.out` and the model queries it with `bash("cat .bg/<id>.out")`. If you skipped the file and let the harness inject the output as a notification into the next round of messages, how would the Agent's behavior change?** (Hint: notification injection means the model doesn't need to poll, but when do you inject, and which step's model do you inject into?)
+
+---
+
+## Next day
+
+The Agent can now execute commands: it runs commands, gates with permissions, can go background, and can ask you questions. Combined with Day 3's file + web tools and Day 4's safe edits, the Agent has the basic loop for small coding tasks — read code → change code → run tests → look at results → iterate.
+
+But every time `agent-code` exits, the conversation is gone. Tomorrow we make sessions persist and resumable — JSONL session files on disk, `--resume` to bring back the last conversation, AGENT.md project memory injected into the system prompt, and a cross-session long-term memory system (memdir). The Agent finally remembers you and your project instead of starting fresh every time.

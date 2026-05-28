@@ -1,0 +1,415 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 2 · 真实模型 + tool_use / tool_result",
+  "subtitle": "这张图只放 Day 2 的核心变化：真实 Provider、Anthropic content blocks，以及 tool_result 回到下一轮 user message。",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "真实模型的 tool calling 闭环",
+      "summary": "从 user prompt 进入 messages，到 AnthropicProvider 返回 tool_use，再由 ToolRegistry 执行 system_date，最后把 tool_result 写回 messages 并让模型生成 final text。",
+      "defaultActiveNodeId": "provider",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "解析 prompt",
+          "detail": "CLI Runtime 仍然只负责接住用户输入。Day 2 的变化不在 CLI，而在 provider 和 messages 协议形状。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "role='user'",
+          "detail": "messages 是发给 Messages API 的上下文。第一轮只有用户问题；工具执行后会追加 assistant tool_use 和 user tool_result。",
+          "position": { "x": 300, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "provider",
+          "body": "messages.create(...)",
+          "detail": "AnthropicProvider 只做协议适配：把 messages 和 tools schema 发到 Anthropic-compatible API，再把返回的 content blocks 翻译成内部 ModelResponse。它不执行工具。",
+          "position": { "x": 600, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "tool_use",
+          "body": "tool_call: system_date",
+          "detail": "模型看到 system_date 的 input_schema，知道自己没有实时时钟，于是返回 tool_use content block。这里只是提议，不是执行。",
+          "position": { "x": 900, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run system_date",
+          "detail": "真正执行 system_date 的是 harness 里的 ToolRegistry。Day 2 仍然只做 registry lookup，权限检查会在 Day 5 加进来。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "current datetime",
+          "detail": "ToolResult 保存 system_date 返回的本机时间字符串。下一步不是写 role='tool'，而是打包进下一轮 user message 的 tool_result content block。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "final answer",
+          "detail": "第二次 complete(messages) 后，模型读到 tool_result，返回最终文本。CLI 打印 final，Agent Loop 结束。",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "cli-messages",
+          "source": "cli",
+          "target": "messages",
+          "label": "prompt"
+        },
+        {
+          "id": "messages-provider",
+          "source": "messages",
+          "target": "provider",
+          "label": "complete",
+          "mobileLabel": "complete"
+        },
+        {
+          "id": "provider-tool-use",
+          "source": "provider",
+          "target": "tool-use",
+          "label": "tool_use"
+        },
+        {
+          "id": "tool-use-registry",
+          "source": "tool-use",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "registry-result",
+          "source": "registry",
+          "target": "tool-result",
+          "label": "system_date()",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "label": "append",
+          "mobileLabel": "append",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "label": "final",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "message-shape",
+      "label": "Message shape",
+      "title": "Anthropic tool_use / tool_result 消息形状",
+      "summary": "Day 2 最大的协议变化：tool_result 不再是 Day 1 的 role='tool'，而是下一轮 role='user' 的 content block。",
+      "defaultActiveNodeId": "user-tool-result",
+      "nodes": [
+        {
+          "id": "user-prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "今天几号？",
+          "detail": "用户仍然只输入自然语言。CLI 不提前决定要调用 system_date，工具调用由真实模型根据 tools schema 自己提出。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "user-message",
+          "kind": "data",
+          "label": "messages[0]",
+          "eyebrow": "role='user'",
+          "body": "content=prompt",
+          "detail": "第一条 messages 仍是普通 user message。AnthropicProvider 会把它原样传给 Messages API。",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "assistant-tool-use",
+          "kind": "response",
+          "label": "assistant message",
+          "eyebrow": "type='tool_use'",
+          "body": "name='system_date'",
+          "detail": "模型返回的是 assistant content block：type='tool_use'、id、name、input。harness 必须先把这整条 assistant message append 回 messages。",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "run-tool",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "harness",
+          "body": "system_date({})",
+          "detail": "harness 读取 assistant tool_use 里的 name/input，路由到 ToolRegistry.run(call)。模型到这里仍然没有执行任何 Python 函数。",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "user-tool-result",
+          "kind": "data",
+          "label": "user message",
+          "eyebrow": "type='tool_result'",
+          "body": "tool_use_id + content",
+          "detail": "这是 Day 2 的关键协议点：tool_result 放在下一轮 role='user' 的 content block 里，并用 tool_use_id 对上上一条 tool_use id；不是 Day 1 的 role='tool'。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "final-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "final",
+          "body": "text='今天是 ...'",
+          "detail": "第二次调用 Messages API 时，模型读到 tool_result content block，才把观察结果转成最终回答。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout-shape",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "tool_call / final",
+          "detail": "页面后面的 Terminal Replay 负责展示终端上的 tool_call、observation、final 输出；这张图只解释 messages 里的协议形状。",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "prompt-user",
+          "source": "user-prompt",
+          "target": "user-message",
+          "label": "wrap"
+        },
+        {
+          "id": "user-assistant",
+          "source": "user-message",
+          "target": "assistant-tool-use",
+          "label": "returns",
+          "mobileLabel": "returns"
+        },
+        {
+          "id": "assistant-run",
+          "source": "assistant-tool-use",
+          "target": "run-tool",
+          "label": "tool_use"
+        },
+        {
+          "id": "run-user-result",
+          "source": "run-tool",
+          "target": "user-tool-result",
+          "label": "tool_result",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "user-result-final",
+          "source": "user-tool-result",
+          "target": "final-response",
+          "label": "complete",
+          "mobileLabel": "complete",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "final-stdout",
+          "source": "final-response",
+          "target": "stdout-shape",
+          "label": "render",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        }
+      ]
+    },
+    {
+      "id": "provider-boundary",
+      "label": "Provider boundary",
+      "title": "AnthropicProvider 的协议适配边界",
+      "summary": "外部 Anthropic/DeepSeek content blocks 只停在 AnthropicProvider 内部，Agent Loop 继续只认识内部 ModelResponse / ToolCall / ToolResult。",
+      "defaultActiveNodeId": "model-response",
+      "nodes": [
+        {
+          "id": "messages-input",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "input",
+          "body": "conversation context",
+          "detail": "run_agent 把累积的 messages 交给 provider。provider 可以换，但 Agent Loop 的输入边界保持不变。",
+          "position": { "x": 0, "y": 40 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "tools-list",
+          "kind": "tool",
+          "label": "ToolRegistry.list",
+          "eyebrow": "tools",
+          "body": "Tool(parameters)",
+          "detail": "ToolRegistry.list() 暴露可用工具和 parameters。Day 2 新增的 parameters 会被翻译成 Anthropic input_schema。",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "provider-adapter",
+          "kind": "model",
+          "label": "AnthropicProvider",
+          "eyebrow": "adapter",
+          "body": "_to_anthropic_tools",
+          "detail": "AnthropicProvider 把 Tool(parameters) 翻译成 Anthropic tools/input_schema，同时把 messages 传给 messages.create。",
+          "position": { "x": 310, "y": 170 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "api",
+          "kind": "model",
+          "label": "Messages API",
+          "eyebrow": "external",
+          "body": "DeepSeek-compatible",
+          "detail": "实际请求可以发到 DeepSeek 的 Anthropic-compatible endpoint，也可以换成官方 Claude。harness 只依赖 Anthropic Messages API 形状。",
+          "position": { "x": 620, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "content-blocks",
+          "kind": "response",
+          "label": "content blocks",
+          "eyebrow": "response",
+          "body": "text / tool_use",
+          "detail": "外部 API 返回 text block、tool_use block，DeepSeek 还可能返回 thinking block。provider 需要把 assistant_content 原样保留下来。",
+          "position": { "x": 930, "y": 170 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "model-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "internal",
+          "body": "text + tool_calls",
+          "detail": "这是 provider 边界的出口：外部 content blocks 被翻译成内部 ModelResponse。run_agent 不需要知道供应商返回对象长什么样。",
+          "position": { "x": 620, "y": 430 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "run-agent",
+          "kind": "runtime",
+          "label": "run_agent",
+          "eyebrow": "agent loop",
+          "body": "provider-agnostic",
+          "detail": "run_agent 只依赖 ModelProvider Protocol 和内部 ModelResponse。今天换真实模型，Agent Loop 的核心结构仍然能保住。",
+          "position": { "x": 310, "y": 430 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "messages-provider",
+          "source": "messages-input",
+          "target": "provider-adapter",
+          "label": "messages",
+          "sourceHandle": "source-right",
+          "targetHandle": "target-left",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "tools-provider",
+          "source": "tools-list",
+          "target": "provider-adapter",
+          "label": "schema",
+          "mobileLabel": "schema",
+          "sourceHandle": "source-right",
+          "targetHandle": "target-left",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "provider-api",
+          "source": "provider-adapter",
+          "target": "api",
+          "label": "create",
+          "mobileLabel": "create"
+        },
+        {
+          "id": "api-blocks",
+          "source": "api",
+          "target": "content-blocks",
+          "label": "content",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "blocks-response",
+          "source": "content-blocks",
+          "target": "model-response",
+          "label": "translate",
+          "mobileLabel": "map",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top",
+          "mobileSourceHandle": "source-left",
+          "mobileTargetHandle": "target-right"
+        },
+        {
+          "id": "response-agent",
+          "source": "model-response",
+          "target": "run-agent",
+          "label": "internal",
+          "mobileLabel": "internal",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right",
+          "mobileSourceHandle": "source-bottom",
+          "mobileTargetHandle": "target-top"
+        },
+        {
+          "id": "agent-tools",
+          "source": "run-agent",
+          "target": "tools-list",
+          "label": "tool_calls",
+          "mobileLabel": "calls",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom",
+          "mobileSourceHandle": "source-right",
+          "mobileTargetHandle": "target-bottom"
+        }
+      ]
+    }
+  ]
+}

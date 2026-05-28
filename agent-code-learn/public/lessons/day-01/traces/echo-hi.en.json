@@ -1,0 +1,10 @@
+{
+  "command": "uv run agent-code \"echo hi using the echo tool\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/you/agent-code\r\n\r\n" },
+    { "time": 800, "text": "\u001b[33mtool_call\u001b[0m: echo {'text': 'hi'}\r\n" },
+    { "time": 1400, "text": "\u001b[36mobservation\u001b[0m: hi\r\n" },
+    { "time": 2000, "text": "\u001b[32mfinal\u001b[0m: echo tool returned: hi\r\n" }
+  ]
+}

@@ -1,0 +1,18 @@
++++ agent_code/cli.py
+@@ -0,0 +1,15 @@
++from __future__ import annotations
++
++import typer
++from rich.console import Console
++
++console = Console()
++app = typer.Typer(add_completion=False)
++
++
++@app.callback(invoke_without_command=True)
++def main_command(prompt: str = typer.Argument("hi")) -> None:
++    console.print(f"回声: {prompt}")
++
++
++def main() -> None:
++    app()

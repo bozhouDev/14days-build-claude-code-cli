@@ -1,0 +1,700 @@
+---
+title: "Day 4：Safe Edit"
+description: "Day 3 让 Agent 能读项目代码了。今天让它能改——但不是说改就改：每次写盘前，harness 出 diff、要你按 y/n、自动备份旧内容。模型不知道这些机制存在，它只看到一个『file_write 失败』或者『file_edit 成功』的 observation。"
+---
+
+Day 3 让 Agent 能读项目代码。读完之后，模型很自然地会想改——"把这段重构一下"、"README 里加一行说明"。问题是：如果 CLI 不加任何检查，一句话就能覆盖你的 `app.py`，没有 diff、没有确认、没有后悔药。
+
+今天我们在"模型输出意图"和"真正落盘"之间塞一层执行控制——也就是 <Concept name="Harness">harness</Concept>。`file_write` 整文件覆盖前出 diff 等你按 y；`file_edit` 字符串替换必须先读过文件、读完后没被外部改过、`old_string` 在文件里唯一；每次成功写盘前旧内容自动快照到 `.agent/history/`。
+
+代码约 300 行，新增 `diff_ui.py` + `file_history.py`，改 `tools.py` / `agent.py` / `fs_safety.py` / `cli.py`。无新依赖——`difflib` 是标准库。
+
+---
+
+### Day 4 主视觉：写盘前的 diff 闸门 + read-before-edit
+
+先看 `Write gate` 这张图：今天 <Concept name="Harness">harness</Concept> 在落盘前要走 `resolve_in_cwd` → `ensure_read_before_edit` + `check_mtime_conflict` → `render_diff` → `typer.confirm` 一条链。`Read before edit` 解释 Day 3 埋下的 `ctx.read_state.record()` 怎么被消费；`Backup safety net` 则解释确认后的旧内容为什么会先进 `.agent/history/`。
+
+<AgentLogicMap mapPath="/lessons/day-04/logic-map.json" />
+
+---
+
+今天从 Day 3 的 `agent-code` 项目继续改。仓库里的 `packages/day-04-safe-edit/` 是参考答案快照，不是让你新建的目录。
+
+## 起手：今天的起点
+
+Day 3 已经让 Agent 能读文件、列目录、按名字找、按内容搜、抓网页。但每个工具签名里都暗藏了一个钩子：`read_file` 每次读完都调 `ctx.read_state.record(path, content)`——它把 `(mtime_ns, char_count)` 写进 `ReadFileState.entries`。整个 Day 3 没有一行代码读这份记录。今天它终于要登场。
+
+今天围绕这个钩子加四件事：
+
+- 一个新文件 `diff_ui.py`：`render_diff` 把 unified diff 着色，`confirm_edit` 弹 y/N。
+- 一个新文件 `file_history.py`：写盘前自动备份旧内容到 `.agent/history/<rel>/<ts>`。
+- 两个新工具 `file_write` / `file_edit`，但所有安全策略都不暴露给模型——它们藏在 `agent.py` 的拦截块和 `fs_safety.py` 的三个新纯函数里。
+- 把 trace 改成流式打印，让 diff 和 confirm 提示能按真实顺序穿插出现。
+
+无新依赖。`difflib` 是标准库，`rich` / `typer` 在 Day 1 就装过。
+
+提前点个坑：v1 我们会把 `_tool_result_message` 这个 helper 留着不删。Day 3 后它已经没人调用了，今天也用不着——保留只是不顺手删别人的代码。
+
+---
+
+## v1：`file_write` 整文件覆盖 + diff 预览
+
+先做最直接的需求：模型想写一个新文件或者覆盖一个已有文件，harness 在写盘前把 diff 渲染出来，让你看过再决定。这一版做三件事：新建 `diff_ui.py`、在 `tools.py` 加 `file_write`、在 `agent.py` 的工具循环里拦截 `file_write`。
+
+### 1.1 新建 `agent_code/diff_ui.py`
+
+`render_diff` 用 `difflib.unified_diff` 生成差异文本，给增删行加 rich 颜色 markup。`confirm_edit` 用 `typer.confirm` 弹一个 y/N 提示，默认 N。
+
+```python
+from __future__ import annotations
+
+import difflib
+
+import typer
+
+
+def render_diff(old: str, new: str, path: str) -> str:
+    """用 difflib 生成 unified diff，给增删行加 rich markup 着色。"""
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff_lines = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path}", tofile=f"b/{path}",
+    )
+    colored: list[str] = []
+    for line in diff_lines:
+        line = line.rstrip()
+        if line.startswith("---") or line.startswith("+++"):
+            colored.append(f"[bold]{line}[/bold]")
+        elif line.startswith("-"):
+            colored.append(f"[red]{line}[/red]")
+        elif line.startswith("+"):
+            colored.append(f"[green]{line}[/green]")
+        elif line.startswith("@@"):
+            colored.append(f"[cyan]{line}[/cyan]")
+        else:
+            colored.append(line)
+    return "\n".join(colored)
+
+
+def confirm_edit(path: str) -> bool:
+    """让用户确认是否应用这次编辑，默认不应用。"""
+    return typer.confirm(f"Apply this edit to {path}?", default=False)
+```
+
+注意这里的边界：diff 是 agent 展示给**人**看的，不是返回给模型的 observation。模型只知道自己请求了 `file_write`，根本不知道终端正在弹 diff 和 confirm。
+
+### 1.2 改 `agent_code/tools.py`：新增 `file_write`
+
+在 `web_search` 之后、`class ToolRegistry` 之前插入。这个工具函数本身保持纯净：只做"写盘 + 更新 read_state"——所有安全校验（read-before-edit、mtime 冲突、用户确认）都在 `agent.py` 的拦截块里完成。
+
+```python
+def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """整文件覆盖写入。前置校验由 agent.py 拦截块完成。"""
+    path_str = args.get("file_path", "")
+    content = args.get("content", "")
+    if not path_str:
+        return "error: missing required argument 'file_path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    # 写盘后刷新 read_state，让下一次编辑基于最新内容
+    ctx.read_state.record(path, content)
+    return f"Wrote {len(content)} chars to {path_str}"
+```
+
+然后在 `default_tools()` 的末尾、`return registry` 之前注册：
+
+```python
+    registry.register(
+        Tool(
+            name="file_write",
+            description="Write or overwrite a file. Path is relative to cwd.",
+            run=file_write,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative path inside cwd."},
+                    "content": {"type": "string", "description": "Full file content to write."},
+                },
+                "required": ["file_path", "content"],
+            },
+        )
+    )
+```
+
+为什么 `file_write` 只要 `file_path` 和 `content`？因为它描述的是模型想做的事，不描述安全策略。文件不存在时直接新建；文件已经存在时由 `agent.py` 的拦截块出 diff、问确认。
+
+### 1.3 改 `agent_code/agent.py`：流式 trace + 拦截 `file_write`
+
+核心改动两处。一是流式 trace——Day 3 的 `run_agent` 跑完才一次性 dump trace，看不出"diff 是哪一步出现的"。今天把每条 trace 立刻 print，让 diff 和 confirm 提示能按真实顺序穿插。二是 `file_write` 拦截——在 `tools.run` 之前做前置校验，通过了再渲染 diff 并 `typer.confirm`。
+
+顶部 import 多导一个 <Concept name="Tool Result">`ToolResult`</Concept>（Day 1 就在 `model.py` 里定义了，拦截块要手动构造它）和 `resolve_in_cwd`，再加两行新 import：
+
+```python
+from rich.console import Console
+
+from .diff_ui import confirm_edit, render_diff
+```
+
+模块级 console：
+
+```python
+console = Console()
+```
+
+`run_agent` 函数体里新加一个 `emit` 闭包，把 4 处 `trace.append(...)` 都改成 `emit(...)`：
+
+```python
+    def emit(line: str) -> None:
+        # 流式输出 trace：append 给测试用，print 给读者看
+        trace.append(line)
+        console.print(line)
+```
+
+然后在 `for call in response.tool_calls` 内部、`emit(f"tool_call: ...")` 之后、`result = tools.run(call, ctx)` 之前，插入 file_write 拦截块。它分五步走，每一步都可能短路成 `is_error=True` 的 <Concept name="Tool Result">tool_result</Concept>：
+
+```python
+            # file_write / file_edit 的 harness 拦截：先做前置校验，再渲染 diff，最后让用户确认
+            if call.name in ("file_write", "file_edit"):
+                path_str = call.arguments.get("file_path", "")
+
+                # 1) 路径解析：越界 cwd 直接当 error
+                try:
+                    path = resolve_in_cwd(ctx.cwd, path_str)
+                except (ValueError, OSError) as exc:
+                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
+                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+                # 2) 前置校验（v1 只对 file_write 做"文件存在则要求读过"）
+                validation_error: str | None = None
+                if call.name == "file_write" and path.exists():
+                    if path not in ctx.read_state.entries:
+                        validation_error = (
+                            f"error: file has not been read yet. "
+                            f"Read {path_str} first before editing."
+                        )
+                # file_edit 的校验在 v2 接上
+
+                # 3) 算 new_content（v1 file_edit 还没接，先跳过 diff）
+                new_content: str | None = None
+                if call.name == "file_write":
+                    new_content = call.arguments.get("content", "")
+
+                # 4) 校验失败：不渲染 diff、不问用户，直接 error observation
+                if validation_error is not None:
+                    result = ToolResult(call.id, validation_error, is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
+                # 5) 校验通过：渲染 diff + 用户确认
+                if new_content is not None:
+                    diff_text = render_diff(old_content, new_content, path_str)
+                    console.print(f"\n[bold]Diff for {path_str}:[/bold]")
+                    console.print(diff_text)
+                    if not confirm_edit(path_str):
+                        result = ToolResult(call.id, "error: edit rejected by user", is_error=True)
+                        emit(f"observation: {result.content}")
+                        tool_result_blocks.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": result.tool_call_id,
+                                "content": result.content,
+                                "is_error": True,
+                            }
+                        )
+                        continue
+```
+
+四种结局：路径越界 / 前置校验失败 / 用户拒绝都构造 `is_error=True` 的 observation 后 `continue` 跳过 `tools.run`；只有最后一种通过才落到循环底部的 `tools.run`。每一种 error 都被流式打印，模型在下一轮请求里也能把它当 feedback 吃下去。
+
+最后改 `agent_code/cli.py`：`run_once` 不再需要那个 `for line in result.trace: console.print(line)` 循环了，因为 `run_agent` 内部已经流式打印过了。
+
+### 1.4 跑两个验证
+
+先新建一个文件——新文件不要求 read-before-edit：
+
+```bash
+$ uv run agent-code "用 file_write 创建 hello.txt，内容一行 'hello from agent'"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+tool_call: file_write {'file_path': 'hello.txt', 'content': 'hello from agent'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -0,0 +1 @@
++hello from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Wrote 16 chars to hello.txt
+final: 已成功创建 hello.txt，内容为 hello from agent。
+```
+
+再覆盖已有文件——这次模型必须先 `read_file` 一次，因为 `ReadFileState` 是每次 `agent-code` 调用独立的：
+
+```bash
+$ uv run agent-code "用 read_file 读 hello.txt，然后用 file_write 把内容改成 'goodbye from agent'"
+...
+tool_call: read_file {'path': 'hello.txt'}
+observation: hello from agent
+
+tool_call: file_write {'file_path': 'hello.txt', 'content': 'goodbye from agent'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-hello from agent
++goodbye from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Wrote 18 chars to hello.txt
+final: 已完成！hello.txt 已从 'hello from agent' 改为 'goodbye from agent'。
+```
+
+`final` 的措辞可能不一样，不用逐字对；只要看到 `tool_call: file_write`、`Diff for hello.txt`、`Apply this edit`、`observation: Wrote ...` 这几段就说明 v1 跑通了。把 `y` 换成 `n` 再跑一次，observation 应该是 `error: edit rejected by user`，文件不会被改。
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v1-write.diff"
+  title="v1 阶段：diff_ui + file_write + 流式 trace + 拦截块"
+  description="新建 diff_ui.py（render_diff + confirm_edit）；tools.py 加 file_write 工具与注册；agent.py 导入 ToolResult + resolve_in_cwd + Console + diff_ui，加 emit 闭包把 4 处 trace.append 流式化，工具循环里插入 file_write/file_edit 拦截块；cli.py 删掉 trace 重复打印。"
+/>
+
+v1 的 `file_write` 能覆盖整文件了，但它有个致命缺陷：模型想把"README 第三段第五句话"改一个字，它得把整个 README 重写一遍塞进 `content`——几千 token 一秒就烧掉。下一版给它一把手术刀。
+
+---
+
+## v2：`file_edit` 字符串替换 + 三项安全检查
+
+`file_edit` 接受三个参数：`file_path`、`old_string`、`new_string`，原样匹配 + 单点替换。模型只用关心改哪段；harness 在落盘前做三件事：文件读过没？读完之后被外部改过没？`old_string` 在文件里唯一吗？这三件事都是纯函数，集中放在 `fs_safety.py`。
+
+### 2.1 改 `agent_code/fs_safety.py`：加三个纯函数
+
+在 `load_gitignore` 之后、文件末尾追加：
+
+```python
+def ensure_read_before_edit(state: ReadFileState, path: Path) -> str | None:
+    """检查文件是否在本次会话中被读过。没读过返回 error 字符串。"""
+    if path not in state.entries:
+        return (
+            f"error: file has not been read yet. "
+            f"Read {path.name} first before editing."
+        )
+    return None
+
+
+def check_mtime_conflict(state: ReadFileState, path: Path) -> str | None:
+    """检查文件在 read 之后是否被外部修改过。mtime 变了返回 error。
+    教学版不做 content-equals 兜底——mtime 变就判冲突，再读一次即可。"""
+    entry = state.entries.get(path)
+    if entry is None:
+        return None  # ensure_read_before_edit 会先拦住没读的情况
+    read_mtime_ns, _ = entry
+    try:
+        current_mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if current_mtime_ns > read_mtime_ns:
+        return (
+            f"error: file was modified after read. "
+            f"Read {path.name} again before editing."
+        )
+    return None
+
+
+def apply_single_replace(
+    content: str, old: str, new: str, replace_all: bool
+) -> tuple[str | None, str | None]:
+    """在 content 中查找 old 并替换为 new。
+    返回 (new_content, error)：成功时 error 为 None，失败时 new_content 为 None。"""
+    if old == "":
+        # str.count("") 会返回 len+1，str.replace("", x) 会在每个字符之间插入 x。
+        # 这两个行为对模型完全没用，直接拒绝。
+        return None, "error: old_string must not be empty."
+    if old == new:
+        return None, "error: old_string and new_string are exactly the same."
+
+    count = content.count(old)
+    if count == 0:
+        return None, "error: string to replace not found in file."
+    if count > 1 and not replace_all:
+        return None, (
+            f"error: found {count} matches for old_string. "
+            f"Use replace_all=True to replace all, or make old_string more specific."
+        )
+
+    if replace_all:
+        return content.replace(old, new), None
+    else:
+        return content.replace(old, new, 1), None
+```
+
+三个函数都不碰全局状态。`apply_single_replace` 返回 tuple `(结果, None)` 表示成功，`(None, 错误消息)` 表示失败。拆成纯函数是为了能单独测试，也让 `agent.py` 的拦截块读起来像一条清楚的门禁链：先确认读过，再确认没被外部改过，最后确认替换目标唯一。
+
+### 2.2 改 `agent_code/tools.py`：新增 `file_edit`
+
+顶部 `from .fs_safety import (...)` 的括号里追加 `apply_single_replace`。`ensure_read_before_edit` 和 `check_mtime_conflict` 不在 `tools.py` 用——它们在 `agent.py` 用。
+
+`file_edit` 工具函数保持纯净：解析路径 → 读盘 → 替换 → 写盘 → 刷新 read_state。read-before-edit、mtime 冲突、多匹配这三项校验都在拦截块里，工具函数里只在 `apply_single_replace` 兜一次最终的 race（diff 渲染和写盘之间老内容可能又被改过）。
+
+```python
+def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
+    """字符串替换编辑。前置校验在 agent.py 拦截块里完成。"""
+    path_str = args.get("file_path", "")
+    old_string = args.get("old_string", "")
+    new_string = args.get("new_string", "")
+    replace_all = bool(args.get("replace_all", False))
+    if not path_str:
+        return "error: missing required argument 'file_path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError) as exc:
+        return f"error: {exc}"
+
+    # 防 race：agent.py 已经做过一次 apply_single_replace 算 diff，
+    # 如果 confirm 那一刻到现在 old_content 又被外部改过，这里会再兜一次。
+    new_content, err = apply_single_replace(content, old_string, new_string, replace_all)
+    if err:
+        return err
+
+    path.write_text(new_content, encoding="utf-8")
+    ctx.read_state.record(path, new_content)
+    return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
+```
+
+在 `default_tools()` 里 `file_write` 注册之后追加 `file_edit` 注册（schema 含 `replace_all` 布尔字段，默认 false）。完整 schema 看 DiffCard。
+
+### 2.3 改 `agent_code/agent.py`：把 v1 的内联校验换成 fs_safety 函数；接进 file_edit
+
+顶部 `from .fs_safety import` 多导三个新函数。然后把 v1 拦截块里 (2) 前置校验 这段（约 8 行）替换成 fs_safety 版——`file_write` 用 `ensure_read_before_edit + check_mtime_conflict`；`file_edit` 总是要求文件存在 + read-before-edit + mtime 一致：
+
+```python
+                # 2) 前置校验：read-before-edit + mtime 冲突
+                validation_error: str | None = None
+                if call.name == "file_write":
+                    if path.exists():
+                        validation_error = (
+                            ensure_read_before_edit(ctx.read_state, path)
+                            or check_mtime_conflict(ctx.read_state, path)
+                        )
+                else:  # file_edit
+                    if not path.exists():
+                        validation_error = f"error: file does not exist: {path_str}"
+                    else:
+                        validation_error = (
+                            ensure_read_before_edit(ctx.read_state, path)
+                            or check_mtime_conflict(ctx.read_state, path)
+                        )
+```
+
+再把 (3) 算 new_content 那段替换成下面这版——`file_edit` 先在内存试跑一次 `apply_single_replace` 算 new_content。返回 error 时（多匹配 / 0 匹配 / `old==new` / `old==""`），写进 `validation_error`，让 (4) 步统一去 error observation 路径：
+
+```python
+                # 3) 算 new_content：file_write 直接拿 content；file_edit 试跑替换
+                new_content: str | None = None
+                if call.name == "file_write":
+                    new_content = call.arguments.get("content", "")
+                elif call.name == "file_edit" and validation_error is None:
+                    new_content, replace_err = apply_single_replace(
+                        old_content,
+                        call.arguments.get("old_string", ""),
+                        call.arguments.get("new_string", ""),
+                        bool(call.arguments.get("replace_all", False)),
+                    )
+                    if replace_err is not None:
+                        validation_error = replace_err
+```
+
+(4)、(5) 步原样保留。这一版的全部变化就是：所有 file_edit / file_write 的校验都先过 `validation_error`，diff 只在校验通过时出现，confirm 只问那些 diff 真能落盘的编辑。
+
+### 2.4 跑四个验证
+
+(a) 成功 edit——感受手术刀的形状：
+
+```bash
+$ uv run agent-code "先 read_file hello.txt，再用 file_edit 把里面的 goodbye 改成 hola"
+tool_call: read_file {'path': 'hello.txt'}
+observation: goodbye from agent
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'goodbye', 'new_string': 'hola'}
+
+Diff for hello.txt:
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-goodbye from agent
++hola from agent
+Apply this edit to hello.txt? [y/N]: y
+observation: Edited hello.txt: replaced 7 chars with 4 chars
+final: 修改成功！hello.txt 已从 goodbye from agent 变更为 hola from agent。
+```
+
+注意 `tool_call: file_edit` 紧跟 `Diff for ...`、再跟 `Apply this edit?`——这是流式 trace + 拦截块协作的样子。
+
+(b) 没读过就直接 edit——read-before-edit 拒绝。模型默认会先 `read_file`，所以要触发这条 error 得在 prompt 里明确禁止先读：
+
+```bash
+$ uv run agent-code "不要调用 read_file。直接用 file_edit 把 hello.txt 里的 hola 改成 hello。"
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'hola', 'new_string': 'hello'}
+observation: error: file has not been read yet. Read hello.txt first before editing.
+tool_call: read_file {'path': 'hello.txt'}
+observation: hola from agent
+...
+```
+
+校验失败时**没有**渲染 diff、**没有**弹 confirm——这是拦截块第 (4) 步的预期行为。模型收到 error 通常会立刻回去 `read_file` 再补一次 `file_edit`：error feedback 在驱动模型自我修正。
+
+(c) 多匹配——`old_string` 在文件里出现 2 次以上时被拒：
+
+```bash
+$ echo -e "line one: hello\nline two: hello" > dup.txt
+$ uv run agent-code --max-steps 2 "先 read_file dup.txt，再用 file_edit 把里面的 hello 改成 hi。old_string 必须精确等于 hello，replace_all 必须是 false。"
+tool_call: read_file {'path': 'dup.txt'}
+observation: line one: hello
+line two: hello
+
+tool_call: file_edit {'file_path': 'dup.txt', 'old_string': 'hello', 'new_string': 'hi', 'replace_all': False}
+observation: error: found 2 matches for old_string. Use replace_all=True to replace all, or make old_string more specific.
+final: reached max_steps=2
+```
+
+模型看到这条 error 后会学乖——要么加上 `replace_all=True`，要么把 `old_string` 写得更具体（比如 `line one: hello`）。
+
+(d) mtime 冲突——故意在 read 之后改文件：
+
+```bash
+$ uv run agent-code "先 read_file dup.txt，然后把 dup.txt 里的 hello 改成 bonjour。"
+```
+
+在模型调完 `read_file` 后、看到 Diff 之前，快速在另一个终端执行 `echo "外部修改" > dup.txt`，然后回到 agent-code 终端按 `y`。你会看到：
+
+```
+observation: error: file was modified after read. Read dup.txt again before editing.
+```
+
+这就是 `check_mtime_conflict` 在起作用。这里不做 content-equals 兜底——mtime 变就判冲突，再 `read_file` 一次就能刷新状态。
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v1-to-v2.diff"
+  title="v2 阶段：fs_safety 三个纯函数 + file_edit + 拦截块统一走 validation_error"
+  description="fs_safety.py 加 ensure_read_before_edit / check_mtime_conflict / apply_single_replace；tools.py 引入 apply_single_replace 并新增 file_edit 工具与注册；agent.py 把 v1 内联校验换成 fs_safety 调用，新增 file_edit 分支的内存试跑。"
+/>
+
+到这里，模型有两把写工具，但每次写都是直接覆盖——旧内容丢了就没了。v3 把这层兜底也补上。
+
+---
+
+## v3：文件历史备份
+
+`file_history.backup` 在每次成功写盘前，把文件当前内容快照到 `.agent/history/<rel>/<timestamp>`。不增加工具、不增加模型感知——这是 harness 的全局安全网，模型不知道它存在。
+
+### 3.1 新建 `agent_code/file_history.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def backup(cwd: Path, path: Path, old_content: str) -> Path | None:
+    """写盘前把文件旧内容备份到 .agent/history/<rel>/<ts>。
+    备份不是工具，模型看不到它——它是 harness 的全局安全网。
+    失败不阻塞编辑，返回 None。"""
+    try:
+        rel = path.resolve().relative_to(cwd.resolve())
+    except ValueError:
+        return None  # 路径在 cwd 外，不备份
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
+    backup_dir = cwd / ".agent" / "history" / rel
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / ts
+
+    try:
+        backup_path.write_text(old_content, encoding="utf-8")
+    except OSError:
+        return None
+    return backup_path
+```
+
+`backup` 失败（路径越界、磁盘满、权限不够）都返回 `None`，不抛异常——备份不能阻塞用户已经按了 y 的编辑。文件名用 ISO 时间戳精确到毫秒，避免同一秒内多次编辑互相覆盖。
+
+### 3.2 改 `agent_code/tools.py`：写盘前调 `backup`
+
+顶部 import 多一行 `from .file_history import backup`。
+
+`file_write`：在 `path.parent.mkdir` 之前插入"文件存在则先备份"的小块：
+
+```python
+    if path.exists():
+        # 备份旧内容（备份失败不阻塞写盘）
+        try:
+            old = path.read_text(encoding="utf-8")
+            backup(ctx.cwd, path, old)
+        except Exception:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+```
+
+`file_edit`：`content = path.read_text(...)` 之后、`apply_single_replace(...)` 之前插入一行：
+
+```python
+    backup(ctx.cwd, path, content)  # 写盘前备份旧内容
+```
+
+`file_edit` 走到 `backup` 这步时文件一定存在（拦截块已经拦住不存在的情况），所以不用判 `path.exists()`。
+
+### 3.3 跑验收
+
+先确认 hello.txt 存在，然后编辑一次：
+
+```bash
+$ uv run agent-code "先 read_file hello.txt，再把 hello 改成 hola"
+...
+tool_call: file_edit {'file_path': 'hello.txt', 'old_string': 'hello', 'new_string': 'hola'}
+Diff for hello.txt:
+...
+Apply this edit to hello.txt? [y/N]: y
+observation: Edited hello.txt: replaced 5 chars with 4 chars
+```
+
+然后看 `.agent/history/`：
+
+```bash
+$ ls .agent/history/hello.txt/
+20260526T120000.123Z
+
+$ cat .agent/history/hello.txt/20260526T120000.123Z
+hello from agent
+```
+
+旧内容被原样保存了。文件备份不是工具：模型不能调它、不能读它、prompt 里不会出现它。它的角色类似编辑器的本地历史或 git reflog——只对开发者可见，属于 harness 基础设施。
+
+<DiffCard
+  diffPath="/lessons/day-04/diffs/v2-to-final.diff"
+  title="v3 阶段：file_history.backup 全局安全网"
+  description="新建 file_history.py（backup 函数 + ISO 毫秒时间戳）；tools.py 顶部 import backup，file_write 在 path.parent.mkdir 之前判 path.exists() 做备份，file_edit 在 read_text 之后做备份——所有备份失败都吞掉不阻塞写盘。"
+/>
+
+---
+
+## 收尾：今天的终版文件改动清单
+
+今天动了 6 个文件，新增 2 个。列出每个文件的改动段：
+
+| 文件 | 新增 | 改动 |
+|---|---|---|
+| `agent_code/diff_ui.py` | 新文件：`render_diff` + `confirm_edit` | — |
+| `agent_code/file_history.py` | 新文件：`backup` | — |
+| `agent_code/fs_safety.py` | `ensure_read_before_edit` + `check_mtime_conflict` + `apply_single_replace` | — |
+| `agent_code/tools.py` | `file_write` + `file_edit` + 两个注册 + import `backup` 和 `apply_single_replace` | `file_write` / `file_edit` 写盘前加 `backup` |
+| `agent_code/agent.py` | import `ToolResult`、`resolve_in_cwd`、`apply_single_replace`、`check_mtime_conflict`、`ensure_read_before_edit`、`render_diff`、`confirm_edit`、`Console` + 模块级 `console` + `emit` 闭包 | 工具循环里插入约 50 行拦截块；4 处 `trace.append` 改成 `emit` |
+| `agent_code/cli.py` | — | `run_once` 不再重复打印 trace，因为 `run_agent` 已经流式输出 |
+
+今天不需要改 `model.py`。`ToolContext.read_state` 字段 Day 3 就在了，今天只是真正读它。
+
+---
+
+### 终端 Replay 演示
+
+下面是 `agent-code "先 read_file hello.txt，再 file_edit goodbye → hola"` 的终端动画，包含 read_file → file_edit → diff 渲染 → y/N 确认 → observation → final 整条链：
+
+<TerminalReplay tracePath="/lessons/day-04/traces/safe-edit-hello.json" />
+
+---
+
+## 今天有了什么
+
+- **`file_write` + `file_edit`**：两个写工具，一个整文件覆盖、一个字符串替换。模型有了"改代码"的能力，但所有安全策略都不暴露给它，全藏在 <Concept name="Harness">harness</Concept> 拦截块里。
+- **`ReadFileState` 钩子真正被消费**：Day 3 埋下的 `(mtime_ns, char_count)` 记录今天变成了两道实打实的门——`ensure_read_before_edit` 拦"没读过就写"，`check_mtime_conflict` 拦"读完之后又被外部改过"。
+- **diff preview + y/N 确认**：每次写盘前，harness 渲染 unified diff 到终端，你亲自决定要不要让这次编辑通过。今天先用最小的 y/N 确认；Day 5 的权限系统会把确认升级成完整的 `PermissionDecision`。
+- **文件历史备份**：每次成功写盘前，旧内容自动存到 `.agent/history/<rel>/<ts>`。模型不知道它的存在——它是 harness 的全局安全网，类似编辑器的本地历史。
+- **流式 trace**：`run_agent` 内部 `emit` 闭包把 `tool_call` / `observation` / `final` 边算边打到终端，让 diff 和 confirm 提示能按真实顺序穿插。Day 3 的"跑完一次性 dump"看不出这种交错。
+
+---
+
+## 常见问题
+
+**`file_edit` 报 `string to replace not found in file`，但模型给的 `old_string` 明明在文件里**
+
+大概率是缩进或空白不对。模型有时候会"脑补"前导空格，或者把 tab 当成 4 空格。让模型再 `read_file` 一次目标行，用更完整的上下文当 `old_string`；或者你自己用 `grep` 把目标行的 exact text 捞出来，再传给 `file_edit`。
+
+**`old_string` 和 `new_string` 一模一样也报错**
+
+`apply_single_replace` 第一行就拦了 `old == new`。这通常是模型在做"空编辑"——它觉得文件需要改，但给的 old 和 new 其实是同一段。让模型重试，给出真正有差异的 old/new。
+
+**按了 `n` 之后模型怎么处理**
+
+Agent Loop 把 `error: edit rejected by user` 当作一条 `is_error=True` 的 tool_result 交回给模型。模型通常会给一个替代方案——换个写法、用别的工具、或者直接回答"我无法修改"。和 read-before-edit / mtime 冲突 error 的处理一致：error 是 feedback，驱动下一轮推理。
+
+**为什么 "先 read 再不改内容只 touch" 也会报 mtime 冲突**
+
+Day 3 的 `ReadFileState` 只存 `(mtime_ns, char_count)`，不存文件内容。所以它只看 mtime 变了没，不判断内容是不是真的被改过。`touch` 会改变 mtime，所以这里也会被判为冲突。再 `read_file` 一次就能刷新记录。这是刻意的简化：先建立"mtime 是读写之间的一把锁"这个直觉，content-equals 兜底留作课后挑战。
+
+**Windows 上 `st_mtime_ns` 精度问题**
+
+Windows 的 NTFS 时间戳精度不如 Linux/macOS 的纳秒级。Python 的 `st_mtime_ns` 在 Windows 上由 `st_mtime`（`float` 秒）乘以 `10**9` 得到，可能丢精度，导致 read 之后立刻 edit 被判冲突。最简单的 workaround 是在 `check_mtime_conflict` 里加一个小容忍窗口（比如 1 秒）。今天先不内置——大部分学习者在 macOS/Linux 上跑。
+
+---
+
+## 课后挑战
+
+- [ ] **挑战 1**：给 `file_history` 加 `restore(cwd, path, ts) -> None`，从 `.agent/history/<rel>/<ts>` 读回旧内容覆盖当前文件。再给 CLI 加一个 slash 命令 `/rewind <path> <ts>`。
+- [ ] **挑战 2**：`--permission-mode acceptEdits` 雏形。在 `agent.py` 拦截块里加一个 `permission_mode` 参数，`acceptEdits` 模式下跳过 `confirm_edit` 直接走 `tools.run`，`default` 模式保持现在的 y/N。
+- [ ] **挑战 3**：curly quote 归一化。模型偶尔会把 `"hello"` 写成 `"hello"`（弯引号）导致 `old_string` 匹配失败。在 `apply_single_replace` 里加一个预处理，把 content 和 old_string 里的弯引号统一换成直引号再匹配。
+- [ ] **挑战 4**：`.agent/history/` 容量上限。给 `file_history.py` 加 `MAX_BACKUPS_PER_FILE = 50`，备份前检查目录里已有多少个快照，超过就删最旧的。
+- [ ] **挑战 5**：加一个 `file_diff` 工具，只出 diff、不写盘。让模型能在 `file_edit` 之前先对比两个文件，或者比较当前文件和历史快照。
+- [ ] **挑战 6**：搜索 + 编辑组合。让模型先用 `grep` 找出所有匹配行，再用 `file_edit` 逐个改。对比单次 `replace_all` 行为差异，思考为什么 harness 不把搜索和替换合进一个工具。
+
+---
+
+## 思考题
+
+几个开放性问题，先自己憋一句话答案，再继续往下看。面试官真问起 harness 边界这块，能不能讲清楚就看这关。
+
+1. **`ensure_read_before_edit` 为什么不直接拒绝 `file_edit` 的 <Concept name="Tool Call">tool_use</Concept>，而是返回结构化 error 给模型？** 如果把调用彻底吞掉，模型不知道发生了什么，能学会"先读再写"这条规则吗？
+
+2. **`render_diff` + `confirm_edit` 为什么是 `agent.py` 拦截块的事，而不是 `file_edit` / `file_write` 工具内部的功能？** 如果搬进工具函数体，会失去什么？想想 Day 5 的权限系统打算复用这套交互。
+
+3. **`check_mtime_conflict` 教学版不做 content-equals 兜底。** 如果有人在 read 和 edit 之间 `touch` 了文件（mtime 变了但内容没变），今天的实现会报冲突。这在实际使用中有什么影响？如果要补一个兜底，文件内容缓存放哪里？
+
+4. **`file_history.backup` 为什么不做成模型可见的工具？** 如果让模型能调 `restore` 或 `list_snapshots`，Agent 的行为会发生什么变化？
+
+---
+
+## 下一天
+
+今天 Agent 能安全改文件了。每次写盘前，harness 出 diff、让你按 y/N、备份旧内容——一套完整的读写保护链。
+
+下一天我们要让 Agent 跑命令：`bash` 工具 + 权限引擎。模型可以调 `bash` 跑任意 shell 命令，但运行前要经过 `PermissionRequest` → `PermissionDecision` 的完整决策链。今天的 y/N 确认会被抽象成 `PermissionDecision.ask`，再加上超时、白名单、输出截断和 cwd 固定——做出一个真正能管理"让不让模型跑命令"的权限系统。

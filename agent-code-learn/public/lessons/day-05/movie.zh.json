@@ -1,0 +1,111 @@
+{
+  "title": "Day 5 · 命令执行的权限闸门：PermissionRequest → decide_permission → bash 预览",
+  "task": "用 bash 跑一下 pytest --version",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "用 bash 跑一下 pytest --version" },
+      "ledger": { "delta": "messages += user('用 bash 跑一下 pytest --version'); permission_mode=default" },
+      "caption": "CLI 解析 prompt 和 --permission-mode（默认是 default）。run_agent 用 permission_mode='default' 构造闭包，今天所有工具调用都要先过这个模式参数。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: bash(command='pytest --version', timeout=30, background=false)" },
+      "caption": "模型看到 default_tools 末尾新注册的 bash，决定调它。bash 的 input_schema 暴露给模型的只有 command / timeout / background 三个字段——危险命令拦截、用户确认、三模式权限全都不暴露给模型。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01BASH",
+            "name": "bash",
+            "arguments": { "command": "pytest --version", "timeout": 30, "background": false }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "Day 5 招牌：PermissionRequest(bash) → decide_permission(_DANGEROUS_PATTERNS + _READONLY_TOOLS + mode 三分支) → ask → Command 预览 + confirm_command y/N", "state": "ask", "target": "bash 'pytest --version'" },
+      "caption": "agent.py 把 tool_call 包成 PermissionRequest(tool_name='bash', args={...}, mode='default', cwd=...)，丢给 decide_permission。bash 不在 _READONLY_TOOLS、不在 _ASK_TOOLS、mode 不是 plan 也不是 acceptEdits；_is_dangerous('pytest --version') 没命中任何 regex；最终返回 PermissionDecision('ask')。ask 路径里 bash 分支打印 Command: pytest --version（黄字）+ timeout/cwd（dim），confirm_command 弹 'Run this command? [y/N]'。这是 Day 5 真正的招牌帧——v1 的 if/elif 拦截块在 v2 被这一条 decide_permission 调用替代。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01BASH",
+            "name": "bash",
+            "arguments": { "command": "pytest --version", "timeout": 30, "background": false }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "bash → pytest 8.x.x" },
+      "ledger": { "delta": "subprocess.run('pytest --version', shell=True, cwd=ctx.cwd, env=_MINIMAL_ENV, timeout=30) → stdout='pytest 8.x.x'; truncate_output(max_chars=12000)" },
+      "caption": "用户按 y，控制权落回 tools.run(bash) → bash_runner.run_sync。subprocess.run 用 shell=True 跑命令，cwd 锁在 ctx.cwd（不是宿主机当前目录），env 用 _MINIMAL_ENV 只透传 PATH/HOME/USER/SHELL——其他环境变量不漏给子进程。stdout 跑完截断到 12000 字符，returncode=0 所以直接返回内容。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result(bash)])" },
+      "caption": "和 Day 4 一样：assistant 的 tool_use 整条 message 先 append，然后这一轮所有 tool_result 打包进同一条 user 消息的 content blocks。今天的拦截块在 emit 之后流式打印 'Command: ...'/'Run this command?'/'observation: pytest 8.x.x'，让终端读者按真实时间顺序看到 tool_call → 命令预览 → 用户输入 y → observation。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: 当前环境中安装了 pytest 8.x.x。" },
+      "caption": "第二次请求。模型读到 tool_result 里的 'pytest 8.x.x'，知道命令执行成功，返回纯文本，stop_reason=end_turn。for step in range(max_steps) 在这一帧退出。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ],
+      "modelResponse": {
+        "text": "当前环境中安装了 pytest 8.x.x。",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: 当前环境中安装了 pytest 8.x.x。'" },
+      "caption": "emit 已经在循环里把 tool_call / Command 预览 / observation / final 全部按真实顺序打到终端。如果同样的 prompt 把命令换成 'git push --force origin main'，第 3 帧会直接走 deny 路径——_is_dangerous 命中 regex，PermissionDecision('deny') 返回 'Dangerous command blocked'，根本不会渲染 Command 预览、也不会弹 confirm。",
+      "messages": [
+        { "role": "user", "content": "用 bash 跑一下 pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ],
+      "modelResponse": {
+        "text": "当前环境中安装了 pytest 8.x.x。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

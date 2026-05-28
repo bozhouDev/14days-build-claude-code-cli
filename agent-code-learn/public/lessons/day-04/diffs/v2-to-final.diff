@@ -1,0 +1,62 @@
+--- /dev/null
++++ agent_code/file_history.py
+@@ -0,0 +1,25 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++from pathlib import Path
++
++
++def backup(cwd: Path, path: Path, old_content: str) -> Path | None:
++    """写盘前把文件旧内容备份到 .agent/history/<rel>/<ts>。
++    备份不是工具，模型看不到它——它是 harness 的全局安全网。
++    失败不阻塞编辑，返回 None。"""
++    try:
++        rel = path.resolve().relative_to(cwd.resolve())
++    except ValueError:
++        return None  # 路径在 cwd 外，不备份
++
++    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
++    backup_dir = cwd / ".agent" / "history" / rel
++    backup_dir.mkdir(parents=True, exist_ok=True)
++    backup_path = backup_dir / ts
++
++    try:
++        backup_path.write_text(old_content, encoding="utf-8")
++    except OSError:
++        return None
++    return backup_path
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ 顶部 import 多一行 backup @@
+ from .model import ToolCall, ToolResult
++from .file_history import backup
+
+@@ file_write: 在 path.parent.mkdir 之前插入"文件存在则先备份"的小块 @@
+     try:
+         path = resolve_in_cwd(ctx.cwd, path_str)
+     except ValueError as exc:
+         return f"error: {exc}"
++    if path.exists():
++        # 备份旧内容（备份失败不阻塞写盘）
++        try:
++            old = path.read_text(encoding="utf-8")
++            backup(ctx.cwd, path, old)
++        except Exception:
++            pass
+     path.parent.mkdir(parents=True, exist_ok=True)
+     path.write_text(content, encoding="utf-8")
+     # 写盘后刷新 read_state，让下一次编辑基于最新内容
+     ctx.read_state.record(path, content)
+     return f"Wrote {len(content)} chars to {path_str}"
+
+@@ file_edit: 在 content = path.read_text(...) 之后、apply_single_replace 之前插入 backup @@
+     try:
+         content = path.read_text(encoding="utf-8")
+     except (FileNotFoundError, IsADirectoryError) as exc:
+         return f"error: {exc}"
++    backup(ctx.cwd, path, content)  # 写盘前备份旧内容
+     # 防 race：agent.py 已经做过一次 apply_single_replace 算 diff，
+     # 如果 confirm 那一刻到现在 old_content 又被外部改过，这里会再兜一次。
+     new_content, err = apply_single_replace(content, old_string, new_string, replace_all)

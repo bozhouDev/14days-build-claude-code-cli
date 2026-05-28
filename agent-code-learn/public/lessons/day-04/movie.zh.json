@@ -1,0 +1,111 @@
+{
+  "title": "Day 4 · 写盘前的 diff 闸门 + read-before-edit",
+  "task": "用 file_write 创建 hello.txt，内容一行 'hello from agent'",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "用 file_write 创建 hello.txt，内容 'hello from agent'" },
+      "ledger": { "delta": "messages += user('用 file_write 创建 hello.txt...')" },
+      "caption": "CLI 解析 prompt 并构造 ToolContext。今天 ctx 里那个 Day 3 就埋好的 read_state 终于要派上用场——一会儿写盘前会查它。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: file_write(file_path='hello.txt', content='hello from agent')" },
+      "caption": "模型看到 default_tools 末尾新注册的 file_write，决定调它。注意 file_write 只有 file_path / content 两个字段——所有安全策略（read-before-edit / mtime 冲突 / diff 预览 / y/N 确认）都不暴露给模型。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01WRITE",
+            "name": "file_write",
+            "arguments": { "file_path": "hello.txt", "content": "hello from agent" }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "Day 4 招牌：resolve_in_cwd → ensure_read_before_edit + check_mtime_conflict → render_diff → typer.confirm y/N", "state": "ask", "target": "hello.txt" },
+      "caption": "agent.py 拦截 file_write/file_edit。新文件这一路：路径锁回 cwd 通过，文件不存在所以跳过 read-before-edit + mtime 检查，render_diff 把 '+hello from agent' 着色摆出来，最后 typer.confirm 弹 'Apply this edit to hello.txt? [y/N]' 等用户拍板。这是 Day 4 真正的招牌帧——模型说要写、harness 决定能不能写。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01WRITE",
+            "name": "file_write",
+            "arguments": { "file_path": "hello.txt", "content": "hello from agent" }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "file_write → Wrote 16 chars to hello.txt" },
+      "ledger": { "delta": "path.exists()=False 跳过 backup; path.write_text(...); ctx.read_state.record(hello.txt)" },
+      "caption": "用户按 y，控制权落回 tools.run。file_write 看到 path.exists()=False，整个 backup 分支被跳过——新文件没有旧内容，没必要快照；然后 path.write_text 把内容落盘；最后 ctx.read_state.record(hello.txt, content) 把 (mtime_ns, char_count) 写进 read_state，让接下来如果模型想 file_edit 这个文件，ensure_read_before_edit 检查能直接通过。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result])" },
+      "caption": "和 Day 3 一样：assistant 的 tool_use 整条 message 先 append，然后这一轮所有 tool_result 打包进同一条 user 消息的 content blocks。今天新增的拦截块在 emit 之后流式打印 diff 和 confirm，让终端读者能按真实时间顺序看到 tool_call → diff → 用户输入 y → observation。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: 已成功创建 hello.txt，内容为 hello from agent。" },
+      "caption": "第二次请求。模型读到 tool_result 里的 'Wrote 16 chars to hello.txt'，知道落盘成功，返回纯文本，stop_reason=end_turn。for step in range(max_steps) 在这一帧退出。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ],
+      "modelResponse": {
+        "text": "已成功创建 hello.txt，内容为 hello from agent。",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: 已成功创建 hello.txt...'" },
+      "caption": "emit 已经在循环里把 tool_call / diff / observation / final 全部按真实顺序打到终端。注意 ReadFileState 里现在已经有 hello.txt 的记录——下一轮如果模型再 file_edit 它，就能直接走过 ensure_read_before_edit 这道门，而不用先 read_file 一次。",
+      "messages": [
+        { "role": "user", "content": "用 file_write 创建 hello.txt，内容一行 'hello from agent'" },
+        { "role": "assistant", "content": "[tool_use: file_write(id=toolu_01WRITE, file_path=hello.txt, content='hello from agent')]" },
+        { "role": "user", "content": "[tool_result(toolu_01WRITE): Wrote 16 chars to hello.txt]" }
+      ],
+      "modelResponse": {
+        "text": "已成功创建 hello.txt，内容为 hello from agent。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

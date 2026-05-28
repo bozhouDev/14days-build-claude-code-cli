@@ -1,0 +1,706 @@
+---
+title: "Day 7：Slash Commands + Hooks + Cron 定时任务"
+description: "Day 6 让 Agent 有了三层记忆。今天给 harness 打开三个扩展面：slash 注册表、生命周期 hooks、Cron 定时自唤醒。"
+---
+
+Day 6 让 Agent 有了三层记忆：会话历史、`AGENT.md` 项目规则、跨 session 长期记忆。单 Agent CLI 的核心能力到这里基本完整，但 `cli.py` 里还有一个历史遗留问题：`/help`、`/exit` 这些运行时控制命令仍然硬编码在主循环里。
+
+今天给 <Concept name="Harness">harness</Concept> 开三个扩展面：把 slash command 拆成注册表，把工具调用前后的自定义脚本做成 hooks，再让 REPL 能通过 cron job 定时把一条 slash 或 prompt 排回 Agent Loop。
+
+代码约 520 行新增，新建 4 个文件，主要改 `agent.py`、`cli.py`、`tools.py`、`permissions.py`，再检查一次 `pyproject.toml` 的命令入口。
+
+---
+
+### Day 7 主视觉：CLI 扩展面的三条边界
+
+先看这张 Agent Logic Map。它不复述终端每一行输出，只抓今天最容易混在一起的三条线：slash 是 CLI 控制面，hooks 是工具生命周期 gate，cron 是 REPL 的定时 pending queue。
+
+```txt
+slash 管本地控制；hooks 管工具前后；cron 只 enqueue，主线程再顺序执行。
+```
+
+<AgentLogicMap mapPath="/lessons/day-07/logic-map.json" />
+
+---
+
+今天从 Day 6 的 `agent-code` 项目继续改。仓库里 Day 6/Day 7 的 `packages/day-*` 参考快照暂未补齐，本页面的 diff 以 `docs/day-07-extensibility.md` 里的代码块为事实依据。
+
+## 起手：今天的起点
+
+从 Day 6 项目根目录跑：
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+输入 /help 查看命令，输入 /exit 退出。
+> /help
+可用命令：/help, /exit
+```
+
+现在只有早期硬编码的 `/help`，没有 `/context`、`/permissions`、`/plan`。更麻烦的是，如果你想在每次 `file_edit` 后自动跑脚本，或者让 REPL 每隔几分钟自己检查一次状态，现在也做不到。
+
+今天新增 4 个文件：
+
+```txt
+agent_code/slash.py           slash 注册表 + dispatch
+agent_code/hooks.py           hooks.json 加载 + PreToolUse / PostToolUse 执行
+agent_code/scheduler.py       CronJob 管理 + 后台调度线程
+agent_code/cron_tools.py      cron_create / cron_list / cron_cancel 工具
+```
+
+改动主线分四步：v1 把 slash 拆出来，v2 加 hooks 生命周期拦截，v3 全局安装让 `agent-code` 在任意目录可用，v4 加 cron 定时自唤醒。
+
+---
+
+## v1：Slash 注册表
+
+Day 1 到现在，`cli.py` 里的 slash 处理大概是一个 `handle_slash()` 函数：遇到 `/help` 就打印帮助，遇到 `/exit` 就退出。这个写法在小项目里没问题，但每加一个命令就要多一个 `if`，而且 handler 读不到当前 session、provider、权限模式这些运行时状态。
+
+v1 做三件事：新建 `slash.py` 定义注册表和 dispatch，往注册表里填 6 个内置命令，再把 `cli.py` 的 `handle_slash` 替换成 `dispatch_slash`。
+
+### 1.1 新建 `agent_code/slash.py`
+
+先定义三个数据结构：handler 能看到的运行时快照、handler 返回给 CLI 的结果、注册表里的命令元数据。
+
+```python
+@dataclass
+class SlashContext:
+    """slash handler 接收的运行时上下文。"""
+    cwd: Path
+    permission_mode: str
+    model: str
+    provider: str
+    session_id: str | None
+
+
+class SlashResult:
+    """slash command 执行结果。should_query=True 时会把 prompt 送回 Agent Loop。"""
+
+    def __init__(
+        self,
+        handled: bool = True,
+        should_query: bool = False,
+        prompt: str = "",
+        message: str = "",
+    ) -> None:
+        self.handled = handled
+        self.should_query = should_query
+        self.prompt = prompt
+        self.message = message
+```
+
+`SlashContext` 给 handler 的是状态快照，不是全局变量引用。`SlashResult.should_query` 则把本地命令和转模型命令分开：`/help` 只打印消息，未来 `/review` 这类命令可以展开成 prompt 再送回 Agent Loop。
+
+### 1.2 注册内置命令
+
+注册表只有一个字典和一个 `dispatch_slash()`。解析规则保持简单：`/` 开头，第一段是 command name，后面都是 args。
+
+```python
+_registry: dict[str, SlashCommand] = {}
+
+
+def register(name: str, description: str, handler: SlashHandler) -> None:
+    _registry[name] = SlashCommand(name=name, description=description, handler=handler)
+
+
+def dispatch_slash(line: str, ctx: SlashContext) -> SlashResult:
+    if not line.startswith("/"):
+        return SlashResult(handled=False)
+    try:
+        parts = shlex.split(line[1:].strip())
+    except ValueError as exc:
+        return SlashResult(handled=True, message=f"Invalid command syntax: {exc}")
+    if not parts:
+        return SlashResult(handled=False)
+    cmd = _registry.get(parts[0])
+    if cmd is None:
+        return SlashResult(handled=True, message=f"Unknown command: /{parts[0]}")
+    return cmd.handler(parts[1:], ctx)
+```
+
+底部注册 `/help`、`/model`、`/context`、`/compact`、`/permissions`、`/plan`。这里的 `/permissions` 和 `/plan` 先只显示状态，不在 REPL 里热切换 `permission_mode`。完整 Plan Mode 审批闭环留到 Day 8。
+
+### 1.3 改 `cli.py`：统一入口
+
+`cli.py` 里新增 `run_user_input()`。一次性模式、REPL 输入、后面 cron 到点的 pending prompt 都走这个函数：
+
+```python
+def run_user_input(line: str) -> None:
+    nonlocal session
+    slash_result = dispatch_slash(
+        line,
+        SlashContext(
+            cwd=resolved_cwd,
+            permission_mode=permission_mode,
+            model=model,
+            provider=provider,
+            session_id=session.session_id if session else None,
+        ),
+    )
+    if slash_result.handled:
+        if slash_result.message:
+            console.print(slash_result.message)
+        if slash_result.should_query:
+            if session is None:
+                session = Session.create(resolved_cwd)
+            run_once(slash_result.prompt, resolved_cwd, provider, model, base_url, max_steps,
+                     permission_mode, session=session, system_prompt=system_prompt)
+        return
+
+    if session is None:
+        session = Session.create(resolved_cwd)
+    run_once(line, resolved_cwd, provider, model, base_url, max_steps,
+             permission_mode, session=session, system_prompt=system_prompt)
+```
+
+### 1.4 跑验证
+
+`/help` 是本地命令，不调用模型，不创建 session：
+
+```bash
+$ uv run agent-code "/help"
+可用命令：
+  /compact  显示 compact 状态
+  /context  显示当前 session、cwd、权限模式
+  /help     显示所有可用 slash command
+  /model    显示当前模型/provider
+  /permissions  显示权限模式 (default/acceptEdits/plan)
+  /plan     显示 plan 模式提示
+```
+
+`/context` 能读到运行时快照：
+
+```bash
+$ uv run agent-code "/context"
+cwd: /your/project
+session: (none)
+permission: default
+model: anthropic/deepseek-v4-flash
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v1-slash-registry.diff"
+  title="v1 阶段：Slash 注册表"
+  description="新建 slash.py；把 /help、/context、/permissions、/plan 等命令放进注册表；cli.py 统一走 run_user_input。"
+/>
+
+---
+
+## v2：Hooks — 工具生命周期钩子
+
+v1 解决的是 CLI 控制面。v2 解决工具调用前后的扩展点：比如每次 `file_edit` 后写日志、跑格式化，或者在某些 `bash` 命令执行前做额外检查。
+
+主线加一个 `hooks.json`：里面写事件、匹配工具名、要跑的本地命令。harness 在工具调用前后查这份配置，匹配到就执行。
+
+### 2.1 新建 `agent_code/hooks.py`
+
+hook 系统分三段：加载配置、匹配工具名、执行命令。
+
+```python
+def load_hooks(cwd: Path) -> dict[str, list[dict[str, Any]]]:
+    """加载 hooks.json。文件不存在返回空 dict——不是错误，只是没配置。"""
+    file_path = cwd / HOOKS_FILE
+    if not file_path.exists():
+        return {}
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("hooks", data)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[hook warning] failed to load {file_path}: {exc}")
+        return {}
+
+
+def _matches(tool_name: str, matcher: str) -> bool:
+    if matcher == "*":
+        return True
+    if "|" in matcher:
+        return tool_name in matcher.split("|")
+    return matcher == tool_name
+```
+
+`run_hooks()` 用 `subprocess.run()` 执行命令，stdin 传一段 JSON：`event`、`tool_name`、`tool_input`、`tool_result`、`cwd`。主线只支持 command hook 和精确匹配，不做正则、HTTP hook 或 agent hook。
+
+### 2.2 接进 `agent.py`
+
+先把 `emit()` 的 Rich markup 关掉，因为 hook observation 里会出现 `[hook]` 这样的字面量：
+
+```python
+def emit(line: str) -> None:
+    trace.append(line)
+    console.print(line, markup=False)
+```
+
+然后把 `PreToolUse` 放在 `decide_permission()` 之后、真正执行工具之前：
+
+```python
+if decision.behavior != "deny":
+    pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+    pre_blocked = [h for h in pre_hooks if not h["success"]]
+    if pre_blocked:
+        blocked_msgs = "\n".join(
+            f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked
+        )
+        observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
+        emit(f"observation: {observation}")
+        tool_result_blocks.append({
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": observation,
+            "is_error": True,
+        })
+        continue
+```
+
+这个顺序很重要：plan 模式已经 deny 的写工具不会再触发本地 hook 副作用；default/acceptEdits 下，hook 仍然能在确认 UI 或工具执行前拦掉这次调用。
+
+`PostToolUse` 放在 `tools.run()` 之后。它只打印状态，不阻断，也不把 stdout/stderr 喂给模型：
+
+```python
+result = tools.run(call, ctx)
+emit(f"observation: {result.content}")
+
+if not result.is_error:
+    post_hooks = run_hooks(
+        "PostToolUse", call.name, call.arguments, ctx.cwd,
+        tool_result=result.content,
+    )
+    for h in post_hooks:
+        status = "ok" if h["success"] else f"warning: {h['output']}"
+        console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
+```
+
+### 2.3 顺手修一个遗留 bug：空 `file_path` 不能当 cwd 读
+
+跑验证前，把 Day 4 留下来的一个小坑补掉。真实模型偶尔会发出 `file_write {}` 这种缺参数的 <Concept name="Tool Call">tool call</Concept>，哪怕 `tools.py` 的 <Concept name="Schema">Schema</Concept> 已经把 `file_path` 标成 required。Schema 是给模型看的说明书，不是 harness 的安全边界；Agent Loop 还是要把工具参数当不可信输入。
+
+不修的话，`path_str = call.arguments.get("file_path", "")` 拿到空串，`resolve_in_cwd(ctx.cwd, "")` 把空路径解析成 cwd 本身，下一行 `path.read_text()` 把当前目录当文件读，直接抛 `IsADirectoryError`，CLI 崩掉。
+
+修法只在 `file_write` / `file_edit` 的预览块里，`resolve_in_cwd()` 前加一层空路径 guard，解析完之后再加一层目录 guard：
+
+```python
+path_str = call.arguments.get("file_path", "")
+if not path_str:
+    result = ToolResult(call.id, "error: missing required argument 'file_path'", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+
+try:
+    path = resolve_in_cwd(ctx.cwd, path_str)
+except (ValueError, OSError) as exc:
+    result = ToolResult(call.id, f"error: {exc}", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+
+if path.is_dir():
+    result = ToolResult(call.id, f"error: path is a directory: {path_str}", is_error=True)
+    emit(f"observation: {result.content}")
+    tool_result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": True,
+    })
+    continue
+```
+
+模型给错参数时，CLI 把错误作为 <Concept name="Observation">observation</Concept> 回灌给模型，让它自己重试。
+
+### 2.4 跑验证
+
+先创建一个 PostToolUse hook，让 `file_edit` 成功后写 `hook.log`：
+
+```bash
+$ cat > hooks.json << 'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "file_edit", "run": "python3 -c \"import json,pathlib,sys; d=json.load(sys.stdin); pathlib.Path('hook.log').write_text('post '+d['tool_name'])\""}
+    ]
+  }
+}
+EOF
+
+$ printf 'print("hello")\n' > hook_demo.py
+$ uv run agent-code --permission-mode acceptEdits "先读 hook_demo.py，再把 hello 改成 hello hook"
+Agent Code
+cwd: /your/project
+session: a1b2c3d4e5f6
+
+tool_call: read_file {...}
+observation: ...
+tool_call: file_edit {...}
+observation: Edited hook_demo.py: replaced 5 chars with 10 chars
+hook: PostToolUse file_edit ok
+
+final: 已更新 hook_demo.py。
+```
+
+再检查 hook 写出的文件：
+
+```bash
+$ cat hook.log
+post file_edit
+```
+
+PreToolUse 可以阻断危险命令：
+
+```bash
+$ cat > hooks.json << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "run": "python3 -c \"import json,sys; d=json.load(sys.stdin); cmd=d.get('tool_input',{}).get('command',''); sys.exit(1 if 'BLOCK_ME' in cmd else 0)\""}
+    ]
+  }
+}
+EOF
+
+$ uv run agent-code --permission-mode acceptEdits "用 bash 跑 echo BLOCK_ME"
+...
+tool_call: bash {'command': 'echo BLOCK_ME'}
+observation: tool blocked by PreToolUse hook:
+  [hook] python3 -c ...: ...
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v1-to-v2.diff"
+  title="v2 阶段：Hooks 生命周期拦截"
+  description="新建 hooks.py；agent.py 在工具执行前插入 PreToolUse，在工具成功后插入 PostToolUse。"
+/>
+
+---
+
+## v3：全局安装
+
+这一版不写新 Python 代码，只确认 `pyproject.toml` 里还有 Day 1 的命令入口，然后用 uv 把当前项目安装成全局工具。
+
+### 3.1 检查 `[project.scripts]`
+
+打开 `pyproject.toml`，确认入口仍然存在：
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+`agent_code.cli:main` 指向 `cli.py` 里的 `main()` 函数；`main()` 再调用 Typer app。uv 会把它包装成一个 shell 入口。
+
+### 3.2 安装并验证
+
+```bash
+$ uv tool install -e .
+Installed 1 executable: agent-code
+
+$ agent-code --help
+Usage: agent-code [OPTIONS] [PROMPT] COMMAND [ARGS]...
+...
+Options:
+  --cwd
+  --provider
+  --model
+  --base-url
+  --max-steps
+  --permission-mode
+  --resume
+  --continue
+  --help
+```
+
+不同 Typer 版本的 help 文案、列宽和中英文提示可能略有差异。这里验证的不是排版，而是全局命令能被 shell 找到，并且 Day 5/Day 6/Day 7 需要的 option 都还在。
+
+### 3.3 在任意目录测试
+
+```bash
+$ cd /tmp
+$ agent-code --cwd /your/project "/context"
+cwd: /your/project
+session: (none)
+permission: default
+model: anthropic/deepseek-v4-flash
+```
+
+`--cwd` 控制工作目录，所有文件操作、session JSONL、`AGENT.md`、memdir、`hooks.json` 的查找都基于 `cwd`，不是你 shell 的当前目录。
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v2-to-v3.diff"
+  title="v3 阶段：全局安装入口"
+  description="确认 [project.scripts] 的 agent-code 入口，并用 uv tool install -e . 安装成任意目录可调用的命令。"
+/>
+
+---
+
+## v4：Cron `/loop` 定时自唤醒
+
+v3 之后 `agent-code` 可以在任意目录跑了。但 REPL 还是“你说话它才动”。v4 加一个调度器：注册一条 slash/prompt 和执行间隔，后台线程到点把它排进 pending queue，REPL 主线程再顺序执行。
+
+### 4.1 新建 `agent_code/scheduler.py`
+
+`CronScheduler` 维护 job 列表、`.agent/cron.json` 持久化、后台线程和 pending queue。
+
+```python
+class CronScheduler:
+    """REPL 内的 cron 调度器。维护 job 列表 + 后台 daemon thread + pending queue。"""
+
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
+        self._jobs: list[CronJob] = _load_jobs(cwd)
+        self._pending: Queue[str] = Queue()
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def add_job(self, slash: str, every_seconds: int, label: str = "") -> CronJob:
+        jid = uuid.uuid4().hex[:12]
+        job = CronJob(job_id=jid, slash=slash, every_seconds=every_seconds, label=label)
+        with self._lock:
+            self._jobs.append(job)
+            _save_jobs(self.cwd, self._jobs)
+        return job
+
+    def drain_pending(self) -> list[str]:
+        items: list[str] = []
+        while not self._pending.empty():
+            items.append(self._pending.get_nowait())
+        return items
+```
+
+关键设计是：后台线程只 enqueue，不直接调 `run_agent`。否则一个线程正在 `file_edit`，另一个线程突然开始 `bash`，cwd 下的文件状态会变得不可控。
+
+### 4.2 新建 `agent_code/cron_tools.py`
+
+`cron_create`、`cron_list`、`cron_cancel` 是模型能调用的一等工具。REPL 模式下，它们复用 `cli.py` 创建的 `CronScheduler`；一次性模式下，它们临时打开同一份 `.agent/cron.json` 做 add/list/cancel，但不启动后台线程。
+
+```python
+_scheduler: Any = None
+
+
+def set_scheduler(scheduler: Any) -> None:
+    global _scheduler
+    _scheduler = scheduler
+
+
+def cron_create(args: dict[str, Any], ctx: ToolContext) -> str:
+    scheduler = _get_scheduler(ctx)
+    slash = args.get("slash", "")
+    every_seconds = int(args.get("every_seconds", 0))
+    label = args.get("label", "")
+    if not slash:
+        return "error: missing required argument 'slash'"
+    if every_seconds <= 0:
+        return "error: every_seconds must be positive"
+    job = scheduler.add_job(slash, every_seconds, label)
+    return f"Cron job created: {job.id} — every {every_seconds}s: {slash}"
+```
+
+`slash` 可以是一条 slash command（`/context`），也可以是一段自然语言 prompt。到点后 scheduler 直接把这个字符串放进 pending queue。
+
+### 4.3 注册 cron 工具和权限
+
+在 `default_tools()` 里注册三个工具；权限上 `cron_list` 是纯读，`cron_create` / `cron_cancel` 会写 `.agent/cron.json`，属于低风险写：
+
+```python
+_READONLY_TOOLS = frozenset({
+    "read_file", "list_files", "glob", "grep", "project_tree",
+    "git_status", "git_diff",
+    "system_date", "echo",
+    "memory_recall",
+    "cron_list",
+})
+
+_LOW_RISK_WRITES = frozenset({
+    "memory_write",
+    "cron_create",
+    "cron_cancel",
+})
+```
+
+不要把 `cron_create` / `cron_cancel` 加进只读集合。它们写入范围很小，但仍然会修改 `.agent/cron.json`；plan 模式上方的 deny 分支仍然要拦住它们。
+
+### 4.4 REPL 启动 scheduler
+
+REPL 分支创建并启动 scheduler，然后用输入线程 + 主线程轮询 pending queue：
+
+```python
+scheduler = CronScheduler(resolved_cwd)
+set_scheduler(scheduler)
+scheduler.start()
+
+try:
+    while True:
+        for pp in scheduler.drain_pending():
+            console.print(f"[dim]cron: running scheduled job → {pp}[/dim]")
+            run_user_input(pp)
+
+        try:
+            line = input_queue.get(timeout=0.5)
+        except Empty:
+            continue
+
+        if line is None:
+            break
+        if not line:
+            continue
+        if line == "/exit":
+            console.print("Bye.")
+            break
+        run_user_input(line)
+finally:
+    stop_repl.set()
+    scheduler.stop()
+```
+
+主线程每 0.5 秒醒一次，先 drain cron pending，再处理用户输入。Agent Loop 仍然只在主线程顺序执行。
+
+### 4.5 注册 `/loop`
+
+`/loop add/list/cancel` 是本地 slash，直接操作 scheduler，不经过模型。它和 `cron_create/list/cancel` 工具共享同一套 `CronScheduler` 实例和 `.agent/cron.json`。
+
+```python
+def _cmd_loop(args: list[str], ctx: SlashContext) -> SlashResult:
+    """管理 cron 定时任务：/loop add/list/cancel。"""
+    if not args:
+        return SlashResult(
+            handled=True,
+            message="用法: /loop add <slash或prompt> --every <60s|5m|2h> --label <标签>\n      /loop list\n      /loop cancel <id>",
+        )
+    subcommand = args[0]
+    rest = args[1:]
+    if subcommand == "add":
+        return _cmd_loop_add(rest, ctx)
+    if subcommand == "list":
+        return _cmd_loop_list(rest, ctx)
+    if subcommand == "cancel":
+        return _cmd_loop_cancel(rest, ctx)
+    return SlashResult(handled=True, message=f"Unknown /loop subcommand: {subcommand}")
+
+
+register("loop", "管理 cron 定时任务: add/list/cancel", _cmd_loop)
+```
+
+### 4.6 跑验证
+
+在 REPL 里添加一个定时任务：
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+> /loop add /context --every 120 --label 上下文检查
+Cron job created: f7e8d9c0a1b2 — every 120s: /context
+
+> /loop list
+  [f7e8d9c0a1b2] every 120s: /context — 上下文检查  (last: never)
+>
+```
+
+每 2 分钟后会看到：
+
+```txt
+cron: running scheduled job → /context
+```
+
+这一步最好在真实交互 REPL 里看。用 `printf` 管道做自动化验证也可以，但 prompt 可能会挤成 `>: >:`；只要能看到 `cron: running scheduled job → /context` 和 `/context` 的输出，就说明 pending queue 通了。
+
+模型也能通过工具创建 cron job：
+
+```bash
+> 帮我设一个定时任务，每 3 分钟跑一次 /context，标签叫'定期检查'
+Agent Code
+cwd: /your/project
+session: c1d2e3f4a5b6
+
+tool_call: cron_create {'slash': '/context', 'every_seconds': 180, 'label': '定期检查'}
+observation: Cron job created: a7b8c9d0e1f2 — every 180s: /context
+final: 已创建定时任务 a7b8c9d0e1f2，每 3 分钟自动运行 /context。
+```
+
+<DiffCard
+  diffPath="/lessons/day-07/diffs/v3-to-final.diff"
+  title="v4 阶段：Cron /loop 定时自唤醒"
+  description="新建 scheduler.py 和 cron_tools.py；注册 cron_* 工具和权限；REPL 启动 scheduler 并 drain pending queue；slash.py 增加 /loop。"
+/>
+
+---
+
+### 终端 Replay 演示
+
+下面是 `/loop add /context` 的终端动画。重点看定时任务到点后只是进入 pending queue，最终仍由 `run_user_input("/context")` 走 slash dispatch。
+
+<TerminalReplay tracePath="/lessons/day-07/traces/loop-context.json" />
+
+---
+
+## 今天有了什么
+
+- **Slash 注册表**：`/help`、`/model`、`/context`、`/compact`、`/permissions`、`/plan` 通过 `slash.py` 统一注册和 dispatch，不再硬编码在 `cli.py`。
+- **Hooks 生命周期拦截**：`hooks.json` 放在 cwd 下，`PreToolUse` 在工具执行前能阻断，`PostToolUse` 在工具成功后运行只告警不阻断。
+- **全局安装**：`uv tool install -e .` 让 `agent-code` 在任意目录可用，`--cwd` 控制工作目录。
+- **Cron 定时自唤醒**：`CronScheduler` 管理 job 列表、后台 daemon thread、pending queue 和 `.agent/cron.json` 持久化。
+- **`/loop` 人类控制面板**：`/loop add/list/cancel` 是本地 slash，`cron_create/list/cancel` 是模型工具，两条路径共享同一套 scheduler。
+
+---
+
+## 常见问题
+
+**`/permissions` 和 `/plan` 切换后没生效**
+
+v1 的 `/permissions` 和 `/plan` 只打印信息，不真正修改 `cli.py` 里的 `permission_mode` 变量。要切换权限模式，目前需要退出 REPL 重新用 `--permission-mode plan` 启动。让 slash 改运行态变量需要传入可变对象或 callback，这个留给课后挑战。
+
+**`hooks.json` 配好了但 hook 没触发**
+
+常见原因有三个：`hooks.json` 没放在 cwd 下；matcher 写错，例如写了 `"FileEdit"` 而不是 `"file_edit"`；hook command 本身不能正常退出 0。先用命令行单独跑一下 hook 命令，确认它能读 stdin JSON 并正常结束。
+
+**cron job 到点没自动跑**
+
+先确认你在 REPL 模式，一次性模式 `agent-code "prompt"` 不启动 scheduler。再用 `/loop list` 看 job 是否存在、`last_run_at` 是否更新。刚创建的 job 需要等到 `every_seconds` 秒过去才会第一次触发。
+
+---
+
+## 课后挑战
+
+1. **让 `/permissions` 和 `/plan` 真正切换运行态模式**：给 `SlashContext` 加一个 callback 字段，或者让 handler 返回 `new_permission_mode` 字段，`cli.py` 在收到 slash 结果后更新循环里的 `permission_mode`。
+
+2. **hook 输出注入模型上下文**：修改 `agent.py` 的 PostToolUse 处理，如果 hook 的 stdout 非空，把它作为一条额外 context block 插进 `tool_result` 后面，让模型知道 hook 做了什么。
+
+3. **支持 cron 5 字段表达式**：给 `CronJob` 增加 `cron` 字段，让 `/loop add` 可以接 `--cron "*/5 * * * *"`。主线先用 `every_seconds`，是为了把注意力放在“到点 enqueue，不重入 Agent Loop”这个边界上。
+
+4. **给 cron job 加最大数量限制**：在 `CronScheduler.add_job()` 里限制最多 20 条任务，超过就返回错误，避免模型误创建大量定时任务。
+
+---
+
+## 思考题
+
+1. **slash command 为什么不等于工具？** 提示：slash 的 handler 能不能调模型？能不能写文件？能不能读 session 状态？`SlashResult.should_query` 这个字段是要解决什么问题？
+
+2. **`PreToolUse` hook 和 `decide_permission` 的先后关系为什么重要？** 提示：如果 hook allow 绕过了 plan 模式的 deny，安全边界在哪里？
+
+3. **`CronScheduler` 为什么不在后台线程直接调 `run_agent`？** 提示：工具读写文件时，如果另一个线程突然开始跑 `bash`，磁盘状态会怎样？
+
+4. **全局安装后 `--cwd` 影响哪些文件？** 提示：列出 Day 6 的 session/memdir/`AGENT.md` 加上 Day 7 的 `hooks.json`/`cron.json`，它们的查找起点是什么？
+
+---
+
+## 下一天
+
+今天给 harness 加了三个扩展面：slash 运行时控制、hooks 生命周期拦截、cron 定时自唤醒。单 Agent CLI 的 7 天基础建设到这里完成：它会读代码、改文件、跑命令、有权限、能记住、还能扩展。
+
+下一天开始后 7 天的“升级成完整 harness”段：**Day 8：TodoWrite + Plan Mode 闭环**。Day 5 的 plan 模式给出了只读硬约束，Day 8 把 `exit_plan_mode` 拦截、计划渲染、用户批准接进来，让 Agent 在动手改代码之前先写 todo、交给用户审视、批准后才开始真正执行。

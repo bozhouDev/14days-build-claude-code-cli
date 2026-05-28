@@ -1,0 +1,238 @@
+--- /dev/null
++++ agent_code/fs_safety.py
+@@ -0,0 +1,80 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from pathlib import Path
++
++# 文本文件后缀白名单：直接放行，不用 peek 文件头。
++TEXT_SUFFIXES = {
++    ".py", ".pyi", ".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json",
++    ".cfg", ".ini", ".env", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx",
++    ".jsx", ".html", ".css", ".sql", ".lock", ".gitignore",
++}
++
++# 单文件大小上限。和官方 256 KiB 对齐。
++MAX_READ_BYTES = 256 * 1024
++
++# 单次工具 observation 上限。模型上下文有限，过长直接截尾。
++DEFAULT_MAX_CHARS = 8000
++
++# 默认跳过的目录名。
++DEFAULT_SKIP_DIRS = frozenset({
++    ".git", ".venv", "venv", "node_modules", "dist", "build",
++    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
++})
++
++@dataclass
++class SkipPolicy:
++    skip_dirs: frozenset[str] = DEFAULT_SKIP_DIRS
++
++    @classmethod
++    def default(cls) -> "SkipPolicy":
++        return cls()
++
++@dataclass
++class ReadFileState:
++    # path -> (mtime_ns, char_count)。Day 4 read-before-edit 用得到。
++    entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
++
++    def record(self, path: Path, content: str) -> None:
++        try:
++            mtime_ns = path.stat().st_mtime_ns
++        except OSError:
++            return
++        self.entries[path] = (mtime_ns, len(content))
++
++def resolve_in_cwd(cwd: Path, user_path: str) -> Path:
++    candidate = (cwd / user_path).resolve()
++    cwd_resolved = cwd.resolve()
++    try:
++        candidate.relative_to(cwd_resolved)
++    except ValueError as exc:
++        raise ValueError(f"path escapes cwd: {user_path}") from exc
++    return candidate
++
++def ensure_text_file(path: Path) -> None:
++    if path.suffix.lower() in TEXT_SUFFIXES:
++        return
++    with path.open("rb") as f:
++        if b"\x00" in f.read(1024):
++            raise ValueError(f"binary file: {path.name}")
++
++def ensure_within_size(path: Path, max_bytes: int = MAX_READ_BYTES) -> None:
++    size = path.stat().st_size
++    if size > max_bytes:
++        raise ValueError(
++            f"file too large: {size} bytes > {max_bytes}; "
++            f"read a smaller file or use grep instead"
++        )
++
++def should_skip(rel_path: Path, policy: SkipPolicy) -> bool:
++    return any(part in policy.skip_dirs for part in rel_path.parts)
++
++def truncate_output(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
++    if len(text) <= max_chars:
++        return text
++    return text[:max_chars] + f"\n[truncated {len(text) - max_chars} chars]"
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ -1,8 +1,18 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ from datetime import datetime
++from pathlib import Path
+ from typing import Any, Callable
+ 
++from .fs_safety import (
++    ReadFileState,
++    SkipPolicy,
++    ensure_text_file,
++    ensure_within_size,
++    resolve_in_cwd,
++    should_skip,
++    truncate_output,
++)
+ from .model import ToolCall, ToolResult
+ 
+-
+-ToolFunc = Callable[[dict[str, Any]], str]
++@dataclass
++class ToolContext:
++    # 工具运行时上下文。Day 3 装 cwd、skip 规则、ReadFileState。
++    cwd: Path
++    skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
++    read_state: ReadFileState = field(default_factory=ReadFileState)
++
++ToolFunc = Callable[[dict[str, Any], ToolContext], str]
+@@ -22,11 +32,46 @@ class Tool:
+-def echo(args: dict[str, Any]) -> str:
++def echo(args: dict[str, Any], ctx: ToolContext) -> str:
+     return str(args.get("text", ""))
+ 
+-def system_date(args: dict[str, Any]) -> str:
++def system_date(args: dict[str, Any], ctx: ToolContext) -> str:
+     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
++
++def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
++    # 模型只给相对路径；fs_safety 把它锁回 cwd 内，探测二进制，再卡大小上限。
++    path_str = args.get("path", "")
++    if not path_str:
++        return "error: missing required argument 'path'"
++    try:
++        path = resolve_in_cwd(ctx.cwd, path_str)
++        ensure_text_file(path)
++        ensure_within_size(path)
++        text = path.read_text(encoding="utf-8", errors="replace")
++    except (FileNotFoundError, IsADirectoryError, ValueError) as exc:
++        return f"error: {exc}"
++    # 记录"模型看到的版本"，给 Day 4 read-before-edit 留底。
++    ctx.read_state.record(path, text)
++    return truncate_output(text)
++
++def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
++    path_str = args.get("path", ".")
++    try:
++        base = resolve_in_cwd(ctx.cwd, path_str)
++    except ValueError as exc:
++        return f"error: {exc}"
++    if not base.is_dir():
++        return f"error: not a directory: {path_str}"
++    entries: list[str] = []
++    for child in sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
++        rel = child.relative_to(ctx.cwd)
++        if should_skip(rel, ctx.skip_policy):
++            continue
++        entries.append(f"{child.name}/" if child.is_dir() else child.name)
++    return truncate_output("\n".join(entries) or "(empty)")
+@@ -45,8 +90,8 @@ class ToolRegistry:
+-    def run(self, call: ToolCall) -> ToolResult:
++    def run(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
+         tool = self._tools.get(call.name)
+         if tool is None:
+             return ToolResult(
+                 tool_call_id=call.id,
+                 content=f"unknown tool: {call.name}",
+                 is_error=True,
+             )
+-        return ToolResult(tool_call_id=call.id, content=tool.run(call.arguments))
++        return ToolResult(tool_call_id=call.id, content=tool.run(call.arguments, ctx))
+@@ -80,4 +125,38 @@ def default_tools() -> ToolRegistry:
+     registry.register(
+         Tool(name="system_date", description="Return the current system date and time.", run=system_date)
+     )
++    registry.register(
++        Tool(
++            name="read_file",
++            description="Read a text file inside the project. Path is relative to cwd.",
++            run=read_file,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "path": {"type": "string", "description": "Relative path inside cwd."},
++                },
++                "required": ["path"],
++            },
++        )
++    )
++    registry.register(
++        Tool(
++            name="list_files",
++            description="List files and directories at a path inside cwd.",
++            run=list_files,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "path": {
++                        "type": "string",
++                        "description": "Relative path; defaults to '.'.",
++                        "default": ".",
++                    },
++                },
++                "required": [],
++            },
++        )
++    )
+     return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from pathlib import Path
+ from typing import Any
+ 
+ from .model import ModelProvider, ModelResponse
+-from .tools import ToolRegistry
++from .tools import ToolContext, ToolRegistry
+@@ -52,8 +53,11 @@ def run_agent(
+     prompt: str,
+     provider: ModelProvider,
+     tools: ToolRegistry,
+     max_steps: int = 8,
++    cwd: Path | None = None,
+ ) -> AgentResult:
++    # 单点构造 ToolContext。所有工具都通过 ctx 拿 cwd 和后续的运行时状态。
++    ctx = ToolContext(cwd=cwd or Path.cwd())
+     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+     trace: list[str] = []
+@@ -67,7 +71,7 @@ def run_agent(
+         for call in response.tool_calls:
+             trace.append(f"tool_call: {call.name} {call.arguments}")
+-            result = tools.run(call)
++            result = tools.run(call, ctx)
+             trace.append(f"observation: {result.content}")
+             messages.append(_tool_result_message(result.tool_call_id, result.content, result.is_error))
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ -42,3 +42,3 @@ def run_once(
+     provider = create_provider(provider_name, model, base_url)
+-    result = run_agent(prompt, provider, default_tools(), max_steps=max_steps)
++    result = run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd)
+     for line in result.trace:

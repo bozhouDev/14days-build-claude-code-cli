@@ -1,0 +1,11 @@
+{
+  "command": "uv run agent-code \"What's today's date? Use the system_date tool.\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/you/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n\r\n" },
+    { "time": 1200, "text": "\u001b[33mtool_call\u001b[0m: system_date {}\r\n" },
+    { "time": 1900, "text": "\u001b[36mobservation\u001b[0m: 2026-05-20 14:32:00 CST\r\n" },
+    { "time": 2700, "text": "\u001b[32mfinal\u001b[0m: Today is May 20, 2026.\r\n" }
+  ]
+}

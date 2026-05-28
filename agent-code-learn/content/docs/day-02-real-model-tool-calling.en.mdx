@@ -1,0 +1,567 @@
+---
+title: "Day 2 — Real Model & Tool Calling"
+description: "Day 1 ran the Agent Loop on a MockProvider, but that 'model' was fake. Today we swap it for a real model and drive a full tool_use / tool_result round-trip on the Anthropic Messages API protocol."
+---
+
+Day 1 ran the Agent Loop on a `MockProvider`, but that "model" was fake — no matter what you said, it only echoed. Today we replace the fake and wire up a real model.
+
+What will you see by the end? The model doesn't know today's date, but it proactively asks for the `system_date` tool. The <Concept name="Harness">harness</Concept> runs the tool, hands the result back, and the model gives the final answer. That round-trip is the full tool-calling loop.
+
+About 260 lines total, ~130 new. We learn the Anthropic Messages API `tool_use` / `tool_result` protocol, but by default we hit DeepSeek's Anthropic-compatible endpoint — cheap to run. The code follows the Anthropic protocol; we only point `base_url` at DeepSeek. The harness is not tied to any one vendor.
+
+---
+
+### Day 2 main visual — real tool_use / tool_result flow
+
+<AgentLogicMap mapPath="/lessons/day-02/logic-map.json" />
+
+Start with the `Message shape` diagram: Day 1 ran a mock loop on `{"role": "tool"}` as a shortcut. Day 2 must switch to the public Anthropic shape — `tool_result` lives inside the **next user message** as a content block, not as a standalone `tool` role. This protocol detail is the easiest pitfall and the easiest thing to explain clearly today.
+
+---
+
+We keep editing the same `agent-code` project from Day 1. The `packages/day-*` snapshots are reference answers, not new projects you create each day.
+
+## Setup — today's starting point
+
+Day 1 gave us the CLI, `MockProvider`, `ModelResponse / ToolCall / ToolResult`, the `echo` tool, and the minimum Agent Loop. Today we don't touch that structure — we only swap the brain: `MockProvider` → real model; internal simplified messages → public Anthropic protocol.
+
+Install the Anthropic Python SDK:
+
+```bash
+uv add anthropic
+```
+
+If your shell routes through a SOCKS proxy (Clash, Surge, Shadowrocket, etc.), you also need SOCKS support in `httpx`. The Anthropic SDK uses `httpx` under the hood and will automatically pick up `ALL_PROXY` / `HTTPS_PROXY`:
+
+```bash
+uv add "httpx[socks]"
+```
+
+Then set API key and base URL:
+
+```bash
+export ANTHROPIC_AUTH_TOKEN="sk-..."
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+```
+
+The default model is `deepseek-v4-flash` — cheap and fast. In the finishing section you can flip `--model` to `deepseek-v4-pro` or any other Anthropic tool-use-compatible model.
+
+Want the official Claude? Swap `ANTHROPIC_AUTH_TOKEN` for `ANTHROPIC_API_KEY`, point `ANTHROPIC_BASE_URL` at the official API, and you're done. The harness only knows the Anthropic Messages API shape; it doesn't care which vendor sits behind it.
+
+---
+
+## v1 — let the real model say one line
+
+Step one: don't pass any tools, just prove `agent-code` can reach a real model.
+
+Open `agent_code/model.py` and add a <Concept name="Provider">ModelProvider</Concept> interface after `ModelResponse`. Anything that has a `complete(messages, tools=None)` method counts as a model for the Agent Loop:
+
+```python
+class ModelProvider(Protocol):
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+    ) -> ModelResponse:
+        ...
+```
+
+`Protocol` is Python's duck-typed interface. `agent.py` depends on "the capability", not a specific concrete class — swapping providers tomorrow won't touch `agent.py`.
+
+Next, add `AnthropicProvider` beside `MockProvider`. This pass doesn't handle tools yet — it just sends `messages` and joins the returned text into `ModelResponse.text`:
+
+```python
+class AnthropicProvider:
+    def __init__(
+        self,
+        model: str = "deepseek-v4-flash",
+        max_tokens: int = 1024,
+        base_url: str | None = None,
+    ) -> None:
+        # Accept ANTHROPIC_AUTH_TOKEN (DeepSeek style) or ANTHROPIC_API_KEY (official style).
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set ANTHROPIC_AUTH_TOKEN, e.g.: export ANTHROPIC_AUTH_TOKEN='sk-...'")
+        self.model = model
+        self.max_tokens = max_tokens
+        self.base_url = base_url or os.environ.get(
+            "ANTHROPIC_BASE_URL",
+            "https://api.deepseek.com/anthropic",
+        )
+        self.client = Anthropic(api_key=api_key, base_url=self.base_url)
+```
+
+`cli.py` only needs two lines changed: `MockProvider` → `AnthropicProvider`.
+
+Run:
+
+```bash
+$ uv run agent-code "Hi, introduce yourself in one sentence"
+Agent Code
+cwd: /your/project
+
+final: Hi, I'm an AI coding assistant that helps you read code, explain problems, and complete programming tasks.
+```
+
+The exact wording will vary — that's fine. What matters is that the answer comes from a real model, not Day 1's hard-coded `MockProvider` script.
+
+<DiffCard 
+  diffPath="/lessons/day-02/diffs/v1-anthropic-provider.diff" 
+  title="v1 — wire up a real Anthropic client" 
+  description="model.py grows a ModelProvider Protocol and an AnthropicProvider class; cli.py swaps MockProvider for AnthropicProvider. This pass doesn't pass tools yet — it just proves we can reach a real model." 
+/>
+
+The model can chat now, but it doesn't know what tools it has. Next pass we hand it the tool list.
+
+---
+
+## v2 — let the model ask for the system_date tool
+
+You might think: doesn't the model know what time it is? **No.** LLMs have no wall clock. If they want the time, they must request a tool. That is precisely why tool calling exists.
+
+In the Anthropic Messages API, the model doesn't execute tools itself. It returns a <Concept name="Tool Call">tool_use</Concept> content block — "I'd like to call this tool with these arguments." The harness is what actually runs it.
+
+There's one important protocol difference to flag early. Day 1's mock used an internal shortcut:
+
+```python
+{"role": "tool", "tool_call_id": "...", "content": "..."}
+```
+
+The real Anthropic Messages API requires the <Concept name="Tool Result">tool_result</Concept> to sit inside the **next** `user` message as a content block:
+
+```python
+{
+    "role": "user",
+    "content": [
+        {
+            "type": "tool_result",
+            "tool_use_id": "...",
+            "content": "...",
+        }
+    ],
+}
+```
+
+This isn't us mimicking some private implementation — it's the documented Anthropic Messages API shape. Day 1's simplification was just to get the loop running; Day 2 must use the real protocol.
+
+This pass touches three files in three steps.
+
+### 2.1 tools.py — tools need an input_schema
+
+A <Concept name="Schema">JSON Schema</Concept> is the function manual we hand to the model: what it's called, what arguments it takes, which types, which are required. The model reads it to know exactly how to phrase the tool call.
+
+Give `Tool` a `parameters` field with an empty default schema:
+
+```python
+@dataclass
+class Tool:
+    name: str
+    description: str
+    run: ToolFunc
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {"type": "object", "properties": {}, "required": []}
+    )
+```
+
+Add `system_date()` after `echo()`. It takes no arguments, so it ignores `args`:
+
+```python
+def system_date(args: dict[str, Any]) -> str:
+    # system_date is the capability the model asks the harness for when it has no system clock.
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+```
+
+Add a `list()` method to `ToolRegistry` so the provider can read all tool descriptions out. In `default_tools()`, give `echo` a full JSON schema and register `system_date`.
+
+### 2.2 model.py — parse the model's tool_use
+
+Add three helpers before `AnthropicProvider`. The first translates our `Tool` into the Anthropic tools schema — note Anthropic calls the field `input_schema`, not `parameters` like OpenAI-compatible APIs:
+
+```python
+def _to_anthropic_tools(tools: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.parameters,
+        }
+        for tool in tools
+    ]
+```
+
+The third helper converts an SDK content block into a plain dict. I've hit this trap personally: DeepSeek's Anthropic-compatible endpoint may return a `thinking` block, and on the next call you must echo the previous assistant content blocks back verbatim into `messages`, or you get `content[].thinking ... must be passed back`:
+
+```python
+def _content_block_to_dict(block: Any) -> dict[str, Any]:
+    if hasattr(block, "model_dump"):
+        return block.model_dump(exclude_none=True)
+    if hasattr(block, "dict"):
+        return block.dict(exclude_none=True)
+    data = {"type": block.type}
+    for name in ("text", "id", "name", "input", "thinking", "signature"):
+        if hasattr(block, name):
+            data[name] = getattr(block, name)
+    return data
+```
+
+Then replace the entire `AnthropicProvider.complete()` body. It does four things at once: pass `tools` on the request, parse plain text, parse `tool_use`, and preserve the raw assistant content blocks.
+
+```python
+def complete(
+    self,
+    messages: list[dict[str, Any]],
+    tools: list[Any] | None = None,
+) -> ModelResponse:
+    kwargs: dict[str, Any] = {
+        "model": self.model,
+        "max_tokens": self.max_tokens,
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = _to_anthropic_tools(tools)
+
+    response = self.client.messages.create(**kwargs)
+
+    text_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    assistant_content: list[dict[str, Any]] = []
+
+    for block in response.content:
+        # Preserve assistant content verbatim — otherwise DeepSeek thinking blocks get dropped on the next turn.
+        assistant_content.append(_content_block_to_dict(block))
+        if block.type == "text":
+            text_parts.append(block.text)
+        elif block.type == "tool_use":
+            tool_calls.append(
+                ToolCall(id=block.id, name=block.name, arguments=_parse_tool_input(block.input))
+            )
+
+    return ModelResponse(
+        text="\n".join(text_parts) or None,
+        tool_calls=tool_calls or None,
+        assistant_content=assistant_content or None,
+        stop_reason=response.stop_reason or "end_turn",
+    )
+```
+
+`stop_reason` will be `tool_use` or `end_turn`. Today `agent.py` mostly checks `if not response.tool_calls` to decide whether to stop: no tool calls means final, otherwise keep going. We keep `stop_reason` around for debugging (and for streaming later).
+
+### 2.3 agent.py — feed tool_result back
+
+`agent.py` has several edits: switch imports to `ModelProvider`, add a `messages` field to `AgentResult` (so tests can verify both tool_use and tool_result got saved), and add two helpers.
+
+`_assistant_message()` turns an internal `ModelResponse` back into Anthropic assistant content blocks. **Check `response.assistant_content` first** for a reason: in DeepSeek's thinking mode the model returns `thinking` blocks, and we must hand them back verbatim. If we rebuilt only `text/tool_use` ourselves, we'd drop `thinking` and the next call would 400.
+
+```python
+def _assistant_message(response: ModelResponse) -> dict[str, Any]:
+    if response.assistant_content:
+        return {"role": "assistant", "content": response.assistant_content}
+    # Fallback: mock provider has no assistant_content, so we synthesize one.
+    content: list[dict[str, Any]] = []
+    if response.text:
+        content.append({"type": "text", "text": response.text})
+    for call in response.tool_calls or []:
+        content.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments})
+    return {"role": "assistant", "content": content}
+```
+
+`_tool_result_message()` is the single biggest Day 1 → Day 2 protocol change: the real Anthropic API needs tool results in the **next user message**.
+
+```python
+def _tool_result_message(tool_call_id: str, content: str, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": content,
+                "is_error": is_error,
+            }
+        ],
+    }
+```
+
+Finally rewrite `run_agent()` to do one "tool_use → tool_result → final" round. Not multi-step yet — first get the protocol right:
+
+```python
+def run_agent(prompt: str, provider: ModelProvider, tools: ToolRegistry) -> AgentResult:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    trace: list[str] = []
+
+    response = provider.complete(messages, tools=tools.list())
+    messages.append(_assistant_message(response))
+
+    for call in response.tool_calls or []:
+        trace.append(f"tool_call: {call.name} {call.arguments}")
+        result = tools.run(call)
+        trace.append(f"observation: {result.content}")
+        messages.append(_tool_result_message(result.tool_call_id, result.content, result.is_error))
+        response = provider.complete(messages, tools=tools.list())
+
+    final = response.text or ""
+    trace.append(f"final: {final}")
+    return AgentResult(final=final, trace=trace, messages=messages)
+```
+
+Run:
+
+```bash
+$ uv run agent-code "What's today's date? Use the system_date tool."
+Agent Code
+cwd: /your/project
+
+tool_call: system_date {}
+observation: 2026-05-20 14:32:00 CST
+final: Today is May 20, 2026.
+```
+
+Exact wording will vary. As long as you see `tool_call: system_date`, `observation`, and `final`, the real tool-calling loop is working end-to-end.
+
+<DiffCard 
+  diffPath="/lessons/day-02/diffs/v1-to-v2.diff" 
+  title="v2 — tool_use / tool_result protocol lands" 
+  description="tools.py gives Tool a parameters field and registers system_date; model.py adds three helpers and rewrites complete(); agent.py adds _assistant_message / _tool_result_message and reshapes run_agent into the Anthropic message form." 
+/>
+
+---
+
+## v3 — multi-step Agent Loop
+
+v2 handles "model requests tool → run it → ask model again", but only one round. If the model calls `system_date` first and `echo` next, v2 won't catch it.
+
+Replace `run_agent()` with a multi-step loop:
+
+```txt
+model -> tool_use -> tool -> tool_result -> model -> ...
+```
+
+When do we stop? Two conditions:
+
+```txt
+1. The model returned no tool_calls — final answer ready.
+2. step reaches max_steps — the harness force-stops to prevent infinite tool calls.
+```
+
+Add `max_steps` to `run_agent()` and switch the body to `for step in range(max_steps)`:
+
+```python
+def run_agent(
+    prompt: str,
+    provider: ModelProvider,
+    tools: ToolRegistry,
+    max_steps: int = 8,
+) -> AgentResult:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    trace: list[str] = []
+
+    for step in range(max_steps):
+        response = provider.complete(messages, tools=tools.list())
+        messages.append(_assistant_message(response))
+
+        if not response.tool_calls:
+            final = response.text or ""
+            trace.append(f"final: {final}")
+            return AgentResult(final=final, trace=trace, messages=messages)
+
+        for call in response.tool_calls:
+            trace.append(f"tool_call: {call.name} {call.arguments}")
+            result = tools.run(call)
+            trace.append(f"observation: {result.content}")
+            messages.append(_tool_result_message(result.tool_call_id, result.content, result.is_error))
+
+    final = f"reached max_steps={max_steps}"
+    trace.append(f"final: {final}")
+    return AgentResult(final=final, trace=trace, messages=messages)
+```
+
+Order matters: after each model response, append the assistant message into <Concept name="Messages">messages</Concept> first. If this round has tool calls, append each tool result as the next user message. The next model request then sees the full context.
+
+Run a prompt that deliberately wants two tool calls:
+
+```bash
+$ uv run agent-code "Don't answer directly. First call system_date for today's date. Then call echo to repeat back what system_date returned. Then answer."
+Agent Code
+cwd: /your/project
+
+tool_call: system_date {}
+observation: 2026-05-20 14:32:00 CST
+tool_call: echo {'text': '2026-05-20 14:32:00 CST'}
+observation: 2026-05-20 14:32:00 CST
+final: Today is May 20, 2026. The echo tool repeated: 2026-05-20 14:32:00 CST.
+```
+
+If the model only made one tool call, make the prompt sterner. The point isn't that the model behaves identically every time — it's that the harness now handles multi-step tool use.
+
+<DiffCard 
+  diffPath="/lessons/day-02/diffs/v2-to-v3.diff" 
+  title="v3 — single for → while step < max_steps" 
+  description="run_agent gains a max_steps parameter and the body becomes a for step in range(max_steps) loop. No tool_calls returns final; the loop hitting its limit produces reached max_steps." 
+/>
+
+That gives us the full Agent Loop: the harness keeps asking the model "next step, use a tool?". Plain text → final answer. `tool_use` → harness runs it → result goes back → ask again. As long as the model keeps requesting tools, the loop continues; it stops when the model stops asking, or when `max_steps` is reached.
+
+---
+
+## Finishing touches — provider options and a mock test entrypoint
+
+Last, round out the CLI surface:
+
+```txt
+--provider anthropic | mock
+--model deepseek-v4-flash
+--base-url https://api.deepseek.com/anthropic
+--max-steps 8
+```
+
+`MockProvider` no longer pretends to simulate `system_date` or multi-step reasoning. It keeps a minimal echo flow so tests don't depend on the network.
+
+Add a provider factory at the bottom of `agent_code/model.py` so the CLI doesn't need to know each provider's construction details:
+
+```python
+def create_provider(name: str, model: str, base_url: str | None = None) -> ModelProvider:
+    if name == "anthropic":
+        return AnthropicProvider(model=model, base_url=base_url)
+    if name == "mock":
+        return MockProvider()
+    raise ValueError(f"unknown provider: {name}")
+```
+
+Then update `agent_code/cli.py`. `render_header()` now prints the provider, model, and base URL so you can confirm which one is running. `run_once()` takes four more parameters; `main_command()` gets four new typer options:
+
+```python
+@app.callback(invoke_without_command=True)
+def main_command(
+    prompt: str = typer.Argument("", help="Prompt to send to the agent."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", "-C"),
+    provider: str = typer.Option("anthropic", "--provider"),
+    model: str = typer.Option("deepseek-v4-flash", "--model"),
+    base_url: str | None = typer.Option(None, "--base-url"),
+    max_steps: int = typer.Option(8, "--max-steps"),
+) -> None:
+    ...
+```
+
+Two acceptance runs. First, the real model:
+
+```bash
+$ uv run agent-code "What's today's date? Use the system_date tool."
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+tool_call: system_date {}
+observation: 2026-05-20 14:32:00 CST
+final: Today is May 20, 2026.
+```
+
+Then offline mock, to confirm no network dependency:
+
+```bash
+$ uv run agent-code --provider mock "echo hi using the echo tool"
+Agent Code
+cwd: /your/project
+provider: mock  model: deepseek-v4-flash
+
+tool_call: echo {'text': 'hi'}
+observation: hi
+final: echo tool returned: hi
+```
+
+<DiffCard 
+  diffPath="/lessons/day-02/diffs/v3-to-final.diff" 
+  title="v4 — provider factory + CLI options" 
+  description="model.py grows a create_provider factory at the end; cli.py swaps AnthropicProvider for the factory, render_header / run_once thread provider/model/base_url through, and main_command adds --provider / --model / --base-url / --max-steps." 
+/>
+
+---
+
+### Terminal replay
+
+Here's `agent-code "What's today's date? Use the system_date tool."` end-to-end:
+
+<TerminalReplay tracePath="/lessons/day-02/traces/system-date.json" />
+
+---
+
+## What you have today
+
+- **ModelProvider**: CLI and Agent Loop no longer depend on a concrete provider class — swapping models is a factory-arg change.
+- **AnthropicProvider**: real model via Anthropic Messages API, defaulting to DeepSeek's Anthropic-compatible endpoint. Code isn't tied to a vendor.
+- **Tool description handoff**: `Tool` carries a JSON Schema, not just a Python function, so the model knows how to call it.
+- **messages shape fix**: from Day 1's internal shortcut to the public `tool_use` / `tool_result` Anthropic protocol.
+- **Multi-step Agent Loop**: `max_steps` caps the loop — the model can chain tool calls but can't run away forever.
+
+---
+
+## FAQ
+
+**`ANTHROPIC_AUTH_TOKEN` error**
+
+Most common pitfall — you must re-export in every new shell window.
+
+Check the current shell:
+
+```bash
+export ANTHROPIC_AUTH_TOKEN="sk-..."
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+```
+
+Then run `uv run agent-code ...` in the same shell.
+
+**`Using SOCKS proxy, but the 'socksio' package is not installed`**
+
+Your shell has a SOCKS proxy set (e.g. `ALL_PROXY=socks5://...`). The Anthropic SDK's underlying `httpx` will auto-route through it, but SOCKS support isn't installed by default.
+
+One-time fix:
+
+```bash
+uv add "httpx[socks]"
+```
+
+**Why is the class still called `AnthropicProvider`**
+
+Because the provider adapts the Anthropic Messages API shape: `tool_use`, `tool_result`, `input_schema`. DeepSeek serves an Anthropic-compatible endpoint, and we just point the SDK's `base_url` at it. The default vendor today is DeepSeek, but the code is teaching the Anthropic protocol and the Agent Loop.
+
+**The model isn't calling tools**
+
+Make the prompt more explicit:
+
+```bash
+uv run agent-code "Don't answer directly. Call the system_date tool to get today's date, then answer."
+```
+
+Tool calling is the model deciding from the tool descriptions whether to call. Early on, an explicit prompt validates the harness more reliably.
+
+**Why is `tool_result` a user message**
+
+It's the public Anthropic Messages API shape. The model returns assistant `tool_use`, the harness runs the tool, and the result goes back as a `tool_result` content block inside the **next user message**. Day 1's `{"role": "tool"}` was a mock-only shortcut; Day 2's real model demands the public Anthropic shape.
+
+---
+
+## Challenges
+
+- [ ] **Challenge 1**: use `python-dotenv` to auto-load `.env` so you don't `export` both env vars every shell.
+- [ ] **Challenge 2**: add a `--api-key-env` option so users can pick which env var holds the API key.
+- [ ] **Challenge 3**: give `system_date` a `timezone` parameter to practice parameterized JSON schemas.
+- [ ] **Challenge 4**: rewrite `complete()` to stream, so the terminal shows text deltas live.
+
+---
+
+## Thinking questions
+
+A few open-ended questions. Try to answer each in one sentence before reading on.
+
+1. **What does the Anthropic Messages API `tool_use` / `tool_result` protocol look like?** Why does `tool_result` have to live inside the next `user` message's content blocks rather than as a standalone `tool` role? (Hint: compare against Day 1's `{"role": "tool"}` mock shortcut.)
+
+2. **Why does `AnthropicProvider.complete()` preserve `assistant_content` verbatim** instead of rebuilding `{"type": "text"}` / `{"type": "tool_use"}` from `text` and `tool_calls`? (Hint: the DeepSeek thinking-block 400 error.)
+
+3. **What is `max_steps` doing inside the Agent Loop?** Remove it — what's the worst the model could do to you?
+
+4. **`ModelProvider` is a `Protocol`, not an ABC.** What does that choice make `agent.py`'s dependency on a concrete provider look like? When swapping vendors, what do you _not_ have to change?
+
+---
+
+## Tomorrow
+
+Today the Agent talked to a real model for the first time, and we shaped `messages` with the Anthropic tool-call protocol. Tomorrow we expand tools from `echo` and `system_date` to your project files: `read_file`, `list_files`, `glob`, `grep`, and `project_tree`. That's when `--cwd` becomes a real filesystem boundary — the Agent starts being able to "see" your code.

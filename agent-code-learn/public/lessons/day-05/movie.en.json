@@ -1,0 +1,111 @@
+{
+  "title": "Day 5 — Command-execution permission gate: PermissionRequest → decide_permission → bash preview",
+  "task": "Use bash to run pytest --version",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "Use bash to run pytest --version" },
+      "ledger": { "delta": "messages += user('Use bash to run pytest --version'); permission_mode=default" },
+      "caption": "The CLI parses the prompt and --permission-mode (default is 'default'). run_agent threads permission_mode='default' through the loop closure — today every tool call has to flow through this mode flag.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: bash(command='pytest --version', timeout=30, background=false)" },
+      "caption": "The model sees the new bash tool registered at the end of default_tools and decides to call it. The input_schema exposes only command / timeout / background — the dangerous-command list, user confirmation, and three-mode permission engine stay invisible to the model.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01BASH",
+            "name": "bash",
+            "arguments": { "command": "pytest --version", "timeout": 30, "background": false }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "Day 5 signature: PermissionRequest(bash) → decide_permission (_DANGEROUS_PATTERNS + _READONLY_TOOLS + mode triage) → ask → Command preview + confirm_command y/N", "state": "ask", "target": "bash 'pytest --version'" },
+      "caption": "agent.py wraps the tool_call into PermissionRequest(tool_name='bash', args={...}, mode='default', cwd=...) and hands it to decide_permission. bash is not in _READONLY_TOOLS, not in _ASK_TOOLS, the mode is neither plan nor acceptEdits; _is_dangerous('pytest --version') matches none of the regex patterns; the function returns PermissionDecision('ask'). The ask branch's bash arm prints Command: pytest --version (yellow) plus timeout/cwd (dim), then confirm_command pops 'Run this command? [y/N]'. This is Day 5's signature frame — v1's if/elif chain in agent.py gets replaced by this one decide_permission call in v2.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          {
+            "id": "toolu_01BASH",
+            "name": "bash",
+            "arguments": { "command": "pytest --version", "timeout": 30, "background": false }
+          }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "bash → pytest 8.x.x" },
+      "ledger": { "delta": "subprocess.run('pytest --version', shell=True, cwd=ctx.cwd, env=_MINIMAL_ENV, timeout=30) → stdout='pytest 8.x.x'; truncate_output(max_chars=12000)" },
+      "caption": "The user presses y, control returns to tools.run(bash) → bash_runner.run_sync. subprocess.run uses shell=True so the model writes commands the same way you'd type them in a terminal; cwd is pinned to ctx.cwd (not the host's CWD); env is restricted to _MINIMAL_ENV which only forwards PATH/HOME/USER/SHELL so secret env vars never leak into the child process. stdout is truncated to 12000 chars; returncode=0 so the content is returned verbatim.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result(bash)])" },
+      "caption": "Same shape as Day 4: the assistant's tool_use is appended as one message, then this round's tool_result blocks land inside one user message. Today's interceptor streams 'Command: ...', 'Run this command?', and 'observation: pytest 8.x.x' interleaved with emit so the terminal reader sees tool_call → command preview → user types y → observation in real wall-clock order.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: pytest 8.x.x is installed in this environment." },
+      "caption": "Second request. The model reads 'pytest 8.x.x' from the tool_result, decides the command succeeded, returns plain text with stop_reason=end_turn. for step in range(max_steps) exits on this frame.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ],
+      "modelResponse": {
+        "text": "pytest 8.x.x is installed in this environment.",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: pytest 8.x.x is installed in this environment.'" },
+      "caption": "emit has already streamed tool_call / Command preview / observation / final to the terminal in wall-clock order. If the same prompt had used 'git push --force origin main' instead, frame 3 would route to the deny path — _is_dangerous matches the regex, PermissionDecision('deny') returns 'Dangerous command blocked', and no Command preview or confirm prompt ever appears.",
+      "messages": [
+        { "role": "user", "content": "Use bash to run pytest --version" },
+        { "role": "assistant", "content": "[tool_use: bash(id=toolu_01BASH, command='pytest --version', timeout=30, background=false)]" },
+        { "role": "user", "content": "[tool_result(toolu_01BASH): pytest 8.x.x]" }
+      ],
+      "modelResponse": {
+        "text": "pytest 8.x.x is installed in this environment.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

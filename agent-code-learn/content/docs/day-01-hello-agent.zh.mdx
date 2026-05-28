@@ -1,0 +1,324 @@
+---
+title: "Day 1：Hello Agent"
+description: "今天我们写一个大约 150 行的 Python CLI，叫 `agent-code`。跑完之后，你会看到模型不是直接回答你，而是先请求工具 → 执行 → 拿到结果 → 再回答。这就是 Agent 和 Chatbot 的分水岭。"
+---
+
+今天我们写一个大约 150 行的 Python CLI，叫 `agent-code`。
+
+跑完之后，你会看到模型不是直接回答你，而是**先请求工具 → 执行 → 拿到结果 → 再回答**。这就是 Agent 和 Chatbot 的分水岭。
+
+这是一个教学项目。我们以 Claude Code 源码快照作为架构参考，用 Python 重新实现一个最小可跑、便于教学的版本，不把官方实现细节原样翻译进教程。二进制命令也故意叫 `agent-code`，不和官方 CLI 混淆。
+
+---
+
+### 💡 核心链路图速览
+
+在开始动笔前，先看这张 Agent Logic Map。它不会复述每一帧执行细节，只抓今天最终要建立的两条主线：最小 Agent Loop，以及 Day 1 暂时采用的 `messages` 形状。
+
+```txt
+model proposes tool_call → harness executes tool → observation returns to messages
+```
+
+注意中间的 **harness** 边界：模型只『提议』动作，真正执行 `echo` 的是 `ToolRegistry`。后面几天我们会继续往这条边界上加真实模型协议、文件工具和权限规则。
+
+<AgentLogicMap mapPath="/lessons/day-01/logic-map.json" />
+
+---
+
+我们会从最笨的回声 CLI 开始，分三次小迭代把它变成一个会调用工具的 Agent。每一版你都能 `uv run` 跑出来，亲眼看到这一版多了什么。
+
+## 起手：建一个空项目
+
+在本地终端执行以下命令创建工程：
+
+```bash
+mkdir agent-code && cd agent-code
+uv init --package
+uv add typer rich
+uv add --dev pytest
+mkdir -p agent_code tests
+touch agent_code/__init__.py
+```
+
+把 `pyproject.toml` 的关键部分改成下面这样（其它字段保留 `uv init` 生成的就行）：
+
+```toml
+[project]
+name = "agent-code"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "rich>=13.7.0",
+  "typer>=0.12.0",
+]
+
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+`[project.scripts]` 这一行很关键：它让 `uv run agent-code` 知道入口是 `agent_code/cli.py` 里的 `main()`。
+
+> [!NOTE]
+> 仓库里的完成版我会放在 `packages/day-01-hello-agent/`。那是参考答案快照，**不是**让你每天新建一个目录。后面 7 天你都在同一个 `agent-code` 项目里继续改。
+
+---
+
+## v1：能回声的 CLI（约 15 行）
+
+先写一个最笨的版本：CLI 接收一段文字，原样回声。
+
+新建 `agent_code/cli.py`：
+
+```python
+from __future__ import annotations
+
+import typer
+from rich.console import Console
+
+console = Console()
+app = typer.Typer(add_completion=False)
+
+
+@app.callback(invoke_without_command=True)
+def main_command(prompt: str = typer.Argument("hi")) -> None:
+    console.print(f"回声: {prompt}")
+
+
+def main() -> None:
+    app()
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code "hi"
+回声: hi
+```
+
+这是个 `cat` 命令的复杂版本。它没有“模型”，没有“工具”，更不会“做事”。但它已经帮我们把骨架立起来了：`uv run agent-code` 能跑、`pyproject.toml` 入口接对了、`typer` 接住了参数。
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v1-cli.diff" 
+  title="v1 阶段：从空目录到最小 CLI 入口" 
+  description="创建了 cli.py 入口，打通了 typer 参数解析以及 rich 控制台输出。" 
+/>
+
+---
+
+## v2：把“模型”分出去（再加约 20 行）
+
+要让程序变成 Agent，第一步是承认：**回答用户的不应该是 CLI，而是“模型”**。
+
+哪怕今天我们用一个假模型，也要先把这条边界画清楚。下一天换成真实 Claude 时，CLI 就一处都不用改。
+
+新建 `agent_code/model.py`：
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class ModelResponse:
+    # 一次模型响应。v2 只有最终文本；v3 我们会加上工具调用。
+    text: str
+
+
+class MockProvider:
+    def complete(self, prompt: str) -> ModelResponse:
+        # 一个假模型，固定回一句话，够用来打通 CLI <-> Provider 这条边界。
+        return ModelResponse(text=f"我是 MockProvider，你说了：{prompt}")
+```
+
+此时，<Concept name="Harness">CLI Harness</Concept> 与 <Concept name="Provider">Provider</Concept> 的边界就被拉开了。
+
+`cli.py` 改动两处。先在顶部加一行 import：
+
+```python
+from .model import MockProvider
+```
+
+然后把 `main_command` 里 v1 的那一行：
+
+```python
+console.print(f"回声: {prompt}")
+```
+
+替换成：
+
+```python
+provider = MockProvider()
+response = provider.complete(prompt)
+console.print(f"final: {response.text}")
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code "hi"
+final: 我是 MockProvider，你说了：hi
+```
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v1-to-v2.diff" 
+  title="v2 阶段：模型边界拆离" 
+  description="把回答的逻辑外包给 MockProvider。通过 ModelResponse 返回结构，使 CLI 不再亲自决定显示文案。" 
+/>
+
+现在 CLI 不再亲自回答了 —— 它把活外包给了 `MockProvider`。但这个“模型”还是只能用嘴说话：你让它“用 echo 工具说 hi”，它也只会复述这句话。要让它真正动手做事，它能输出的东西就不能只是 `text`。
+
+---
+
+## v3：让模型请求工具（Agent Loop 上线）
+
+要让模型动手，它得能输出：“我想调用工具 X，参数是 Y。” 然后程序去执行，把结果交回去，模型再继续。
+
+这个 **“模型想做什么 → 程序执行 → 把结果交回模型”** 的循环，就是 <Concept name="Harness">Agent Loop</Concept>。
+
+我们分三步完成：扩协议、写工具表、串循环。
+
+### 3.1 扩展 model.py，让模型能开“工具调用单”
+
+`MockProvider` 现在有两个新需求：
+
+- `ModelResponse` 除了 `text`，还要能装一个或多个 <Concept name="Tool Call">工具调用 (Tool Call)</Concept>。
+- `complete()` 接收的不再是单句 `prompt`，而是 <Concept name="Messages">消息上下文 (Messages List)</Concept> —— 因为模型完成工具调用之后还要看到完整对话，才能把工具结果变成最终回答。
+
+把 `agent_code/model.py` 整体重写。
+
+### 3.2 工具注册表
+
+模型现在会说“我想用 `echo`”。程序得有个地方把工具名映射到真正的 Python 函数。
+
+新建 `agent_code/tools.py` 声明工具抽象和注册表容器。
+
+后面要加 `read_file`、`bash` 等工具，都是在 `default_tools()` 这里多 `register` 一行。
+
+### 3.3 把 model 和 tools 串成 Agent Loop
+
+现在所有零件都到齐了。新建 `agent_code/agent.py` 来处理对话的持续迭代。
+
+今天循环只跑一轮（一次 `tool_call` → <Concept name="Observation">observation</Concept> → 一次最终回答）。这里的 `{"role": "tool"}` 是 Day 1 为了跑通 mock loop 做的内部简化；下一天接真实 Claude 时，会换成 Anthropic Messages API 公开要求的 `tool_use` / `tool_result` 消息形状。
+
+最后把 `cli.py` 接到 `run_agent`。改两处。顶部 import 调整为：
+
+```python
+from .agent import run_agent
+from .model import MockProvider
+from .tools import default_tools
+```
+
+`main_command` 里 v2 的三行替换成：
+
+```python
+result = run_agent(prompt, MockProvider(), default_tools())
+for line in result.trace:
+    console.print(line)
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code "用 echo 工具说 hi"
+tool_call: echo {'text': 'hi'}
+observation: hi
+final: echo 工具返回：hi
+```
+
+看一下此时 v2 到 v3 的完整代码变动 Diff：
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v2-to-v3.diff" 
+  title="v3 阶段：完整的 Mock Agent 循环" 
+  description="重写了 model.py，加入了 tools.py 的 ToolRegistry 和 agent.py 的运行控制。Harness 在接收到 tool_call 后执行逻辑，再把 Observation 喂回 messages 上下文。" 
+/>
+
+**这就是 Agent Loop 的最小形态**：
+
+```txt
+model -> tool_call -> tool -> observation -> model -> final
+```
+
+v1 的 CLI 只能回声、v2 的“模型”只能用嘴说话，到 v3 模型才第一次动了手。
+
+---
+
+## 收尾：REPL、slash 命令和 --cwd
+
+v3 只支持“一次性模式”：`agent-code "..."` 跑一次就退出。公开的 Claude Code 还可以直接敲 `claude` 进 REPL，里面用 `/help`、`/exit` 这类 slash 命令。我们也加上这层。同时把 `--cwd` 工作目录参数补上，Day 3 的文件工具会用到。
+
+把 `agent_code/cli.py` 改成终版：
+
+<DiffCard 
+  diffPath="/lessons/day-01/diffs/v3-to-final.diff" 
+  title="v4 阶段：补充 CWD 边界与交互式 Shell (REPL)" 
+  description="对 cli.py 进行了最后的包装。添加了对工作目录 --cwd 参数的解析，并开启了 stdin 循环读取 (REPL)。另外添加了 handle_slash 拦截内置命令。" 
+/>
+
+这里有个我希望你记住的边界：**slash 命令是 CLI 自己处理的，不会被当成 prompt 发给模型。** 后面 Day 7 我们再把它做成可扩展的注册系统。
+
+---
+
+### 🚀 终端 Replay 演示
+
+下面是我们在 REPL 模式和一次性模式下运行的动画：
+
+<TerminalReplay tracePath="/lessons/day-01/traces/echo-hi.json" />
+
+---
+
+## 今天有了什么
+
+- **CLI runtime**：`uv run agent-code` 既支持一次性 prompt，也支持 REPL，认识 `--cwd`，会拦截 `/help` / `/exit`。
+- **ModelResponse 协议**：v3 把它定下来。下一天换真实 Claude，协议同一份，CLI 不用改。
+- **Tool Calling**：模型可以输出“我想用工具 X”，而不只是文本。
+- **Observation**：工具结果回到 messages 里，推动下一轮回答。
+- **Agent Loop**：`model -> tool -> observation -> model` 是代码 Agent 的最小核心。
+
+---
+
+## 常见问题
+
+**`agent-code` 命令找不到**
+
+确认 `pyproject.toml` 里有：
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+```
+
+然后使用 `uv run agent-code`，不要直接运行 `agent-code`。
+
+**输出里的字典引号和示例不同**
+
+Python 打印 dict 可能使用单引号。只要看到 `tool_call`、`observation`、`final` 这三段就对了。
+
+---
+
+## 课后挑战
+
+- [ ] **挑战 1**：加一个 `uppercase` 工具，把输入变大写。
+- [ ] **挑战 2**：给 `ToolRegistry.run()` 写一个更友好的“未知工具”错误（例如附上可用工具列表）。
+- [ ] **挑战 3**：让 `/help` 打印当前注册的所有工具。
+
+---
+
+## 思考题
+
+几个开放性问题，先自己憋一句话答案，再继续往下看。面试官真问起 Agent 这块，能不能讲清楚就看这关。
+
+1. **用一句话说说 Agent Loop 是什么？** 它和普通 chatbot 的根本差别在哪？
+
+2. **`ToolRegistry` 这个对象在 harness 里担任什么角色？** 没有它，直接在 Agent Loop 里写一串 `if call.name == "echo": ...` 派发到具体函数，会出什么问题？
+
+3. **v2 我们专门把“模型”分到 `MockProvider` 里，CLI 当天根本用不到这条边界——这一步是不是多此一举？** （提示：去看一眼 Day 2 接真实模型时，`cli.py` 实际改了几行。）
+
+4. **v3 的输出 `tool_call → observation → final` 就是 Agent Loop 的最小形态。** 如果让你给同事用三句话讲清楚这条链上 `model` / `harness` / `tool` 各自干了什么，你会怎么讲？
+
+---
+
+## 下一天
+
+今天我们用 `MockProvider` 跑通了最小 Agent Loop。下一天把 `MockProvider` 换成真实 Claude provider，再把今天的单步 `for` 扩成 `while step < max_steps`。因为 `ModelResponse` 已经定下来了，下一天不用重写 Agent Loop —— 只是换个 provider。

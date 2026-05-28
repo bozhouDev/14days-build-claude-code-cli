@@ -1,0 +1,202 @@
+--- agent_code/fs_safety.py
++++ agent_code/fs_safety.py
+@@ load_gitignore 之后、文件末尾追加三个纯函数 @@
+ def load_gitignore(cwd: Path) -> pathspec.PathSpec | None:
+     # 只读 cwd 根的 .gitignore；嵌套 gitignore 留作课后挑战。
+     gitignore = cwd / ".gitignore"
+     if not gitignore.exists():
+         return None
+     lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
+     return pathspec.PathSpec.from_lines("gitwildmatch", lines)
++
++def ensure_read_before_edit(state: ReadFileState, path: Path) -> str | None:
++    """检查文件是否在本次会话中被读过。没读过返回 error 字符串。"""
++    if path not in state.entries:
++        return (
++            f"error: file has not been read yet. "
++            f"Read {path.name} first before editing."
++        )
++    return None
++
++
++def check_mtime_conflict(state: ReadFileState, path: Path) -> str | None:
++    """检查文件在 read 之后是否被外部修改过。mtime 变了返回 error。
++    教学版不做 content-equals 兜底——mtime 变就判冲突，再读一次即可。"""
++    entry = state.entries.get(path)
++    if entry is None:
++        return None  # ensure_read_before_edit 会先拦住没读的情况
++    read_mtime_ns, _ = entry
++    try:
++        current_mtime_ns = path.stat().st_mtime_ns
++    except OSError:
++        return None
++    if current_mtime_ns > read_mtime_ns:
++        return (
++            f"error: file was modified after read. "
++            f"Read {path.name} again before editing."
++        )
++    return None
++
++
++def apply_single_replace(
++    content: str, old: str, new: str, replace_all: bool
++) -> tuple[str | None, str | None]:
++    """在 content 中查找 old 并替换为 new。
++    返回 (new_content, error)：成功时 error 为 None，失败时 new_content 为 None。"""
++    if old == "":
++        # str.count("") 会返回 len+1，str.replace("", x) 会在每个字符之间插入 x。
++        # 这两个行为对模型完全没用，直接拒绝。
++        return None, "error: old_string must not be empty."
++    if old == new:
++        return None, "error: old_string and new_string are exactly the same."
++
++    count = content.count(old)
++    if count == 0:
++        return None, "error: string to replace not found in file."
++    if count > 1 and not replace_all:
++        return None, (
++            f"error: found {count} matches for old_string. "
++            f"Use replace_all=True to replace all, or make old_string more specific."
++        )
++
++    if replace_all:
++        return content.replace(old, new), None
++    else:
++        return content.replace(old, new, 1), None
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ -13,11 +13,13 @@
+ from .fs_safety import (
+     ReadFileState,
+     SkipPolicy,
++    apply_single_replace,
+     ensure_text_file,
+     ensure_within_size,
+     resolve_in_cwd,
+     should_skip,
+     truncate_output,
+ )
+ from .model import ToolCall, ToolResult
+
+@@ 在 file_write 之后、default_tools 之前新增 file_edit @@
++def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
++    """字符串替换编辑。前置校验在 agent.py 拦截块里完成。"""
++    path_str = args.get("file_path", "")
++    old_string = args.get("old_string", "")
++    new_string = args.get("new_string", "")
++    replace_all = bool(args.get("replace_all", False))
++    if not path_str:
++        return "error: missing required argument 'file_path'"
++    try:
++        path = resolve_in_cwd(ctx.cwd, path_str)
++    except ValueError as exc:
++        return f"error: {exc}"
++
++    try:
++        content = path.read_text(encoding="utf-8")
++    except (FileNotFoundError, IsADirectoryError) as exc:
++        return f"error: {exc}"
++
++    # 防 race：agent.py 已经做过一次 apply_single_replace 算 diff，
++    # 如果 confirm 那一刻到现在 old_content 又被外部改过，这里会再兜一次。
++    new_content, err = apply_single_replace(content, old_string, new_string, replace_all)
++    if err:
++        return err
++
++    path.write_text(new_content, encoding="utf-8")
++    ctx.read_state.record(path, new_content)
++    return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
++
+
+@@ default_tools(): 在 file_write 注册之后追加 file_edit 注册 @@
++    registry.register(
++        Tool(
++            name="file_edit",
++            description=(
++                "Edit a file by replacing old_string with new_string. "
++                "old_string must be unique in the file (or use replace_all=True). "
++                "You must read the file before editing."
++            ),
++            run=file_edit,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "file_path": {"type": "string", "description": "Relative path inside cwd."},
++                    "old_string": {
++                        "type": "string",
++                        "description": "Exact string to replace. Must match including whitespace and indentation.",
++                    },
++                    "new_string": {
++                        "type": "string",
++                        "description": "String to replace it with.",
++                    },
++                    "replace_all": {
++                        "type": "boolean",
++                        "description": "Replace all occurrences. Default false.",
++                        "default": False,
++                    },
++                },
++                "required": ["file_path", "old_string", "new_string"],
++            },
++        )
++    )
+     return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ from .fs_safety import 顶部多导三个函数 @@
+-from .fs_safety import SkipPolicy, load_gitignore, resolve_in_cwd
++from .fs_safety import (
++    SkipPolicy,
++    apply_single_replace,
++    check_mtime_conflict,
++    ensure_read_before_edit,
++    load_gitignore,
++    resolve_in_cwd,
++)
+
+@@ 拦截块第 (2) 步：把 v1 的内联校验换成 fs_safety 函数；新增 file_edit 分支 @@
+                 # 2) 前置校验（v1 只对 file_write 做"文件存在则要求读过"）
+                 validation_error: str | None = None
+-                if call.name == "file_write" and path.exists():
+-                    if path not in ctx.read_state.entries:
+-                        validation_error = (
+-                            f"error: file has not been read yet. "
+-                            f"Read {path_str} first before editing."
+-                        )
+-                # file_edit 的校验在 v2 接上
++                # 2) 前置校验：read-before-edit + mtime 冲突
++                if call.name == "file_write":
++                    if path.exists():
++                        validation_error = (
++                            ensure_read_before_edit(ctx.read_state, path)
++                            or check_mtime_conflict(ctx.read_state, path)
++                        )
++                else:  # file_edit
++                    if not path.exists():
++                        validation_error = f"error: file does not exist: {path_str}"
++                    else:
++                        validation_error = (
++                            ensure_read_before_edit(ctx.read_state, path)
++                            or check_mtime_conflict(ctx.read_state, path)
++                        )
+
+@@ 拦截块第 (3) 步：file_edit 先在内存试跑一次 apply_single_replace 算 new_content @@
+-                # 3) 算 new_content（v1 file_edit 还没接，先跳过 diff）
+-                new_content: str | None = None
+-                if call.name == "file_write":
+-                    new_content = call.arguments.get("content", "")
++                # 3) 算 new_content：file_write 直接拿 content；file_edit 试跑替换
++                new_content: str | None = None
++                if call.name == "file_write":
++                    new_content = call.arguments.get("content", "")
++                elif call.name == "file_edit" and validation_error is None:
++                    new_content, replace_err = apply_single_replace(
++                        old_content,
++                        call.arguments.get("old_string", ""),
++                        call.arguments.get("new_string", ""),
++                        bool(call.arguments.get("replace_all", False)),
++                    )
++                    if replace_err is not None:
++                        validation_error = replace_err

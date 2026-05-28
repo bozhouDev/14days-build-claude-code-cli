@@ -1,0 +1,16 @@
+{
+  "command": "uv run agent-code",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/xc/my/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n\r\n" },
+    { "time": 900, "text": "> /loop add /context --every 120 --label 上下文检查\r\n" },
+    { "time": 1300, "text": "\u001b[32mCron job created\u001b[0m: f7e8d9c0a1b2 — every 120s: /context\r\n\r\n" },
+    { "time": 1800, "text": "> /loop list\r\n" },
+    { "time": 2200, "text": "  [f7e8d9c0a1b2] every 120s: /context — 上下文检查  (last: never)\r\n\r\n" },
+    { "time": 3300, "text": "\u001b[36mcron\u001b[0m: running scheduled job → /context\r\n" },
+    { "time": 3700, "text": "cwd: /Users/xc/my/agent-code\r\nsession: a1b2c3d4e5f6\r\npermission: default\r\nmodel: anthropic/deepseek-v4-flash\r\n" },
+    { "time": 4700, "text": "\r\n> /loop cancel f7e8d9c0a1b2\r\n" },
+    { "time": 5100, "text": "\u001b[32mCron job cancelled\u001b[0m: f7e8d9c0a1b2\r\n" }
+  ]
+}

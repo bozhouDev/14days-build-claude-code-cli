@@ -1,0 +1,21 @@
+{
+  "title": "Day 1：Hello Agent",
+  "steps": [
+    {
+      "id": "v1-cli",
+      "title": "能回声的 CLI"
+    },
+    {
+      "id": "v2-provider",
+      "title": "把模型分出去"
+    },
+    {
+      "id": "v3-agent-loop",
+      "title": "让模型请求工具"
+    },
+    {
+      "id": "v4-repl",
+      "title": "REPL 与收尾"
+    }
+  ]
+}

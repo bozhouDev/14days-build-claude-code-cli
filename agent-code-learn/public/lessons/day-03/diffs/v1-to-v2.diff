@@ -1,0 +1,224 @@
+--- agent_code/fs_safety.py
++++ agent_code/fs_safety.py
+@@ -1,7 +1,8 @@
+ from __future__ import annotations
+ 
++import pathspec
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -24,11 +25,12 @@ DEFAULT_SKIP_DIRS = frozenset({
+ @dataclass
+ class SkipPolicy:
+     skip_dirs: frozenset[str] = DEFAULT_SKIP_DIRS
++    gitignore: pathspec.PathSpec | None = None
+ 
+     @classmethod
+-    def default(cls) -> "SkipPolicy":
+-        return cls()
++    def default(cls, gitignore: pathspec.PathSpec | None = None) -> "SkipPolicy":
++        return cls(gitignore=gitignore)
+@@ -60,4 +62,9 @@ def ensure_within_size(path: Path, max_bytes: int = MAX_READ_BYTES) -> None:
+ def should_skip(rel_path: Path, policy: SkipPolicy) -> bool:
+-    return any(part in policy.skip_dirs for part in rel_path.parts)
++    if any(part in policy.skip_dirs for part in rel_path.parts):
++        return True
++    if policy.gitignore is not None and policy.gitignore.match_file(str(rel_path)):
++        return True
++    return False
+@@ -68,3 +75,11 @@ def truncate_output(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+     if len(text) <= max_chars:
+         return text
+     return text[:max_chars] + f"\n[truncated {len(text) - max_chars} chars]"
++
++def load_gitignore(cwd: Path) -> pathspec.PathSpec | None:
++    # 只读 cwd 根的 .gitignore；嵌套 gitignore 留作课后挑战。
++    gitignore = cwd / ".gitignore"
++    if not gitignore.exists():
++        return None
++    lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
++    return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ -1,5 +1,8 @@
+ from __future__ import annotations
+ 
++import re
++import shutil
++import subprocess
+ from dataclasses import dataclass, field
+@@ -65,4 +68,123 @@ def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
+         entries.append(f"{child.name}/" if child.is_dir() else child.name)
+     return truncate_output("\n".join(entries) or "(empty)")
++
++def glob(args: dict[str, Any], ctx: ToolContext) -> str:
++    pattern = args.get("pattern", "")
++    if not pattern:
++        return "error: missing required argument 'pattern'"
++    matches: list[Path] = []
++    try:
++        for path in ctx.cwd.rglob(pattern):
++            rel = path.relative_to(ctx.cwd)
++            if should_skip(rel, ctx.skip_policy):
++                continue
++            matches.append(path)
++    except NotImplementedError as exc:
++        return f"error: {exc}"
++    # 按 mtime 倒序，让"最近改过的文件"排在前面。
++    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
++    matches = matches[:200]
++    lines = [str(p.relative_to(ctx.cwd)) for p in matches]
++    return truncate_output("\n".join(lines) or "(no matches)")
++
++def grep(args: dict[str, Any], ctx: ToolContext) -> str:
++    pattern = args.get("pattern", "")
++    if not pattern:
++        return "error: missing required argument 'pattern'"
++    path_arg = args.get("path", ".")
++    glob_arg = args.get("glob")
++    ignore_case = bool(args.get("ignore_case", False))
++    try:
++        base = resolve_in_cwd(ctx.cwd, path_arg)
++    except ValueError as exc:
++        return f"error: {exc}"
++    # 系统装了 ripgrep 就走它，速度差一个数量级；否则退化纯 Python。
++    if shutil.which("rg"):
++        return _grep_ripgrep(pattern, base, glob_arg, ignore_case, ctx)
++    return _grep_python(pattern, base, glob_arg, ignore_case, ctx)
++
++def _grep_ripgrep(pattern, base, glob_arg, ignore_case, ctx):
++    args: list[str] = ["rg", "--line-number", "--no-heading", "--max-columns", "500"]
++    if ignore_case:
++        args.append("-i")
++    for name in ctx.skip_policy.skip_dirs:
++        args.extend(["--glob", f"!{name}/**"])
++    if glob_arg:
++        args.extend(["--glob", glob_arg])
++    args.append(pattern)
++    args.append(str(base))
++    try:
++        proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
++    except (subprocess.TimeoutExpired, OSError) as exc:
++        return f"error: {exc}"
++    # ripgrep 没匹配会返回 exit code 1，这不是错。
++    if proc.returncode not in (0, 1):
++        return f"error: rg: {proc.stderr.strip() or proc.returncode}"
++    return truncate_output(_relativize_rg_output(proc.stdout, ctx.cwd) or "(no matches)")
++
++def _relativize_rg_output(stdout: str, cwd: Path) -> str:
++    cwd_prefix = f"{cwd}/"
++    lines = [
++        line[len(cwd_prefix):] if line.startswith(cwd_prefix) else line
++        for line in stdout.splitlines()
++    ]
++    return "\n".join(lines).strip()
++
++def _grep_python(pattern, base, glob_arg, ignore_case, ctx):
++    flags = re.IGNORECASE if ignore_case else 0
++    try:
++        regex = re.compile(pattern, flags)
++    except re.error as exc:
++        return f"error: invalid regex: {exc}"
++    if base.is_file():
++        candidates: list[Path] = [base]
++    else:
++        candidates = []
++        for path in base.rglob(glob_arg or "*"):
++            if not path.is_file():
++                continue
++            rel = path.relative_to(ctx.cwd)
++            if should_skip(rel, ctx.skip_policy):
++                continue
++            candidates.append(path)
++    hits: list[str] = []
++    for path in candidates:
++        try:
++            ensure_text_file(path)
++        except ValueError:
++            continue
++        try:
++            text = path.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            continue
++        rel = path.relative_to(ctx.cwd)
++        for lineno, line in enumerate(text.splitlines(), start=1):
++            if regex.search(line):
++                hits.append(f"{rel}:{lineno}:{line}")
++    return truncate_output("\n".join(hits) or "(no matches)")
+@@ -160,4 +282,42 @@ def default_tools() -> ToolRegistry:
+         )
+     )
++    registry.register(
++        Tool(
++            name="glob",
++            description="Find files by glob pattern, e.g. '**/*.py'.",
++            run=glob,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "pattern": {"type": "string", "description": "Glob pattern."},
++                },
++                "required": ["pattern"],
++            },
++        )
++    )
++    registry.register(
++        Tool(
++            name="grep",
++            description="Search file contents with a regular expression (ripgrep if available).",
++            run=grep,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "pattern": {"type": "string", "description": "Regular expression."},
++                    "path": {"type": "string", "description": "Relative path; defaults to '.'.", "default": "."},
++                    "glob": {"type": "string", "description": "Optional file glob filter, e.g. '*.py'."},
++                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match.", "default": False},
++                },
++                "required": ["pattern"],
++            },
++        )
++    )
+     return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ -7,4 +7,5 @@ from typing import Any
+ from .model import ModelProvider, ModelResponse
+ from .tools import ToolContext, ToolRegistry
++from .fs_safety import SkipPolicy, load_gitignore
+@@ -58,5 +59,9 @@ def run_agent(
+ ) -> AgentResult:
+-    ctx = ToolContext(cwd=cwd or Path.cwd())
++    resolved_cwd = cwd or Path.cwd()
++    ctx = ToolContext(
++        cwd=resolved_cwd,
++        skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
++    )
+     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+     trace: list[str] = []
+@@ -69,8 +74,21 @@ def run_agent(
+             trace.append(f"final: {final}")
+             return AgentResult(final=final, trace=trace, messages=messages)
+ 
+-        for call in response.tool_calls:
+-            trace.append(f"tool_call: {call.name} {call.arguments}")
+-            result = tools.run(call, ctx)
+-            trace.append(f"observation: {result.content}")
+-            messages.append(_tool_result_message(result.tool_call_id, result.content, result.is_error))
++        # Anthropic 协议：同一轮 assistant 的所有 tool_use，
++        # 对应 tool_result 必须打包进紧接着的一条 user 消息。
++        tool_result_blocks: list[dict[str, Any]] = []
++        for call in response.tool_calls:
++            trace.append(f"tool_call: {call.name} {call.arguments}")
++            result = tools.run(call, ctx)
++            trace.append(f"observation: {result.content}")
++            tool_result_blocks.append(
++                {
++                    "type": "tool_result",
++                    "tool_use_id": result.tool_call_id,
++                    "content": result.content,
++                    "is_error": result.is_error,
++                }
++            )
++        messages.append({"role": "user", "content": tool_result_blocks})

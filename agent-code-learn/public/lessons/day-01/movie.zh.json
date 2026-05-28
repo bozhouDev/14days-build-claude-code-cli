@@ -1,0 +1,95 @@
+{
+  "title": "Day 1 · Hello Agent",
+  "task": "用 echo 工具说 hi",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "用 echo 工具说 hi" },
+      "ledger": { "delta": "messages += user('用 echo 工具说 hi')" },
+      "caption": "CLI 解析用户输入，包成 user message，丢到 messages 上下文。这是模型『看到』的第一份资料。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: echo(text='hi')" },
+      "caption": "MockProvider 看到 user 消息，识别出工具意图，返回 tool_calls=[echo]。注意：模型只『提议』动作，不亲自执行。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "tool registry lookup", "state": "open", "target": "echo" },
+      "caption": "harness 在 ToolRegistry 里找 echo。Day 1 还没有权限层，只要工具登记过就放行 —— 这道门后面几天会越来越严。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "call_echo_1", "name": "echo", "arguments": { "text": "hi" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "echo({'text': 'hi'}) → 'hi'" },
+      "caption": "harness 调用 Python 函数，拿到结果 'hi'。WORLD 这一侧今天只是个本地函数，Day 3 起会变成文件，Day 5 起会变成 shell。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += tool_result(call_echo_1, 'hi')" },
+      "caption": "harness 把 observation 写回 messages，role='tool'，tool_call_id 对得上模型的提案。这是 world → model 的回流。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: echo 工具返回：hi" },
+      "caption": "MockProvider 第二次接收 messages，看到最新的 tool 结果，这次返回纯文本回复，stop_reason=end_turn。Agent Loop 退出。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo 工具返回：hi",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'echo 工具返回：hi'" },
+      "caption": "CLI 把模型的 final text 打到终端。整条 trace（user → tool_use → tool_result → final）都在 messages 里，可以保存、可以回放。",
+      "messages": [
+        { "role": "user", "content": "用 echo 工具说 hi" },
+        { "role": "tool", "tool_call_id": "call_echo_1", "content": "hi" }
+      ],
+      "modelResponse": {
+        "text": "echo 工具返回：hi",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "nodes": [
+    { "id": "user", "label": "User", "type": "process" },
+    { "id": "anthropic", "label": "AnthropicProvider", "type": "model" },
+    { "id": "messages", "label": "Messages", "type": "data" },
+    { "id": "tool", "label": "Tool Runtime", "type": "tool" }
+  ],
+  "frames": [
+    {
+      "step": 1,
+      "focus": "user",
+      "caption": "1. The user types 'What's today's date? Use the system_date tool.'. The CLI wraps it as a user message.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "anthropic",
+      "caption": "2. AnthropicProvider sends messages + tool schemas (including system_date) to the Messages API. The model has no clock and returns a tool_use content block, stop_reason = tool_use.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." }
+      ],
+      "modelResponse": {
+        "tool_calls": [
+          { "id": "toolu_01ABC", "name": "system_date", "arguments": {} }
+        ],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "messages",
+      "caption": "3. Harness appends the whole assistant tool_use message back into messages. The key Day 2 shift vs Day 1: messages no longer carry plain strings — they carry content blocks.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" }
+      ]
+    },
+    {
+      "step": 4,
+      "focus": "tool",
+      "caption": "4. ToolRegistry resolves system_date, runs datetime.now().astimezone(), and returns the wall-clock string as the observation.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "messages",
+      "caption": "5. Harness packs the tool result into a user message: role=user, content=[tool_result(tool_use_id=toolu_01ABC, content='2026-05-20 14:32:00 CST')]. This is the Anthropic protocol shape.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "anthropic",
+      "caption": "6. Second Anthropic call with updated messages. This time the model reads the tool_result and returns plain text, stop_reason = end_turn. The while step < max_steps loop exits here.",
+      "messages": [
+        { "role": "user", "content": "What's today's date? Use the system_date tool." },
+        { "role": "assistant", "content": "[tool_use: system_date(id=toolu_01ABC)]" },
+        { "role": "user", "tool_call_id": "toolu_01ABC", "content": "[tool_result] 2026-05-20 14:32:00 CST" }
+      ],
+      "modelResponse": {
+        "text": "Today is May 20, 2026.",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

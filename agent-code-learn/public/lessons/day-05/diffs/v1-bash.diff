@@ -1,0 +1,247 @@
+--- /dev/null
++++ agent_code/bash_runner.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++import os
++import subprocess
++from pathlib import Path
++
++from .fs_safety import truncate_output
++
++# bash 执行的环境变量最小集合——不让宿主机的敏感变量漏进子进程
++_MINIMAL_ENV = {
++    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
++    "HOME": os.environ.get("HOME", ""),
++    "USER": os.environ.get("USER", ""),
++    "SHELL": os.environ.get("SHELL", "/bin/bash"),
++}
++
++
++def run_sync(command: str, cwd: Path, timeout: int = 30) -> str:
++    """同步执行 shell 命令。cwd 锁定在项目目录，超时后杀进程。"""
++    try:
++        proc = subprocess.run(
++            command,
++            shell=True,
++            cwd=str(cwd),
++            env=_MINIMAL_ENV,
++            capture_output=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return f"error: command timed out after {timeout}s"
++
++    output = proc.stdout.decode("utf-8", errors="replace")
++    if proc.stderr:
++        stderr_text = proc.stderr.decode("utf-8", errors="replace")
++        if stderr_text.strip():
++            output += "\n[stderr]\n" + stderr_text
++
++    # 统一截断，防止长输出撑爆上下文
++    truncated = truncate_output(output.strip(), max_chars=12000)
++
++    if proc.returncode != 0:
++        return f"exit code {proc.returncode}\n{truncated}"
++    return truncated if truncated else "(no output)"
++
+
+--- /dev/null
++++ agent_code/prompt_ui.py
+@@ -0,0 +1,46 @@
++from __future__ import annotations
++
++import difflib
++
++import typer
++
++
++def render_diff(old: str, new: str, path: str) -> str:
++    """用 difflib 生成 unified diff，给增删行加 rich markup 着色。"""
++    old_lines = old.splitlines(keepends=True)
++    new_lines = new.splitlines(keepends=True)
++    diff_lines = difflib.unified_diff(
++        old_lines, new_lines,
++        fromfile=f"a/{path}", tofile=f"b/{path}",
++    )
++    colored: list[str] = []
++    for line in diff_lines:
++        line = line.rstrip()
++        if line.startswith("---") or line.startswith("+++"):
++            colored.append(f"[bold]{line}[/bold]")
++        elif line.startswith("-"):
++            colored.append(f"[red]{line}[/red]")
++        elif line.startswith("+"):
++            colored.append(f"[green]{line}[/green]")
++        elif line.startswith("@@"):
++            colored.append(f"[cyan]{line}[/cyan]")
++        else:
++            colored.append(line)
++    return "\n".join(colored)
++
++
++def confirm_edit(path: str) -> bool:
++    """让用户确认是否应用这次编辑，默认不应用。"""
++    return typer.confirm(f"Apply this edit to {path}?", default=False)
++
++
++def confirm_command(command: str) -> bool:
++    """让用户确认是否执行这条 bash 命令，默认不执行。"""
++    return typer.confirm(f"Run this command?", default=False)
++
++
++def confirm_tool_use(tool_name: str, detail: str) -> bool:
++    """让用户确认非 bash 的 ask 类工具，例如访问外部网络。"""
++    return typer.confirm(f"Allow {tool_name}: {detail}?", default=False)
++
+
+--- agent_code/diff_ui.py
++++ agent_code/diff_ui.py
+@@ -1,34 +1,8 @@
+ from __future__ import annotations
+
+-import difflib
++# Day 5：render_diff 和 confirm_edit 的实现迁到了 prompt_ui.py。
++# 这里保留 re-export，老 import 路径不受影响。
++from .prompt_ui import confirm_edit, render_diff
+
+-import typer
+-
+-
+-def render_diff(old: str, new: str, path: str) -> str:
+-    """用 difflib 生成 unified diff，给增删行加 rich markup 着色。"""
+-    old_lines = old.splitlines(keepends=True)
+-    new_lines = new.splitlines(keepends=True)
+-    diff_lines = difflib.unified_diff(
+-        old_lines, new_lines,
+-        fromfile=f"a/{path}", tofile=f"b/{path}",
+-    )
+-    colored: list[str] = []
+-    for line in diff_lines:
+-        line = line.rstrip()
+-        if line.startswith("---") or line.startswith("+++"):
+-            colored.append(f"[bold]{line}[/bold]")
+-        elif line.startswith("-"):
+-            colored.append(f"[red]{line}[/red]")
+-        elif line.startswith("+"):
+-            colored.append(f"[green]{line}[/green]")
+-        elif line.startswith("@@"):
+-            colored.append(f"[cyan]{line}[/cyan]")
+-        else:
+-            colored.append(line)
+-    return "\n".join(colored)
+-
+-
+-def confirm_edit(path: str) -> bool:
+-    """让用户确认是否应用这次编辑，默认不应用。"""
+-    return typer.confirm(f"Apply this edit to {path}?", default=False)
++__all__ = ["confirm_edit", "render_diff"]
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ 顶部 import 区域：在 from .file_history import backup 之后追加 @@
+ from .file_history import backup
++from .bash_runner import run_sync as _bash_run_sync
+
+@@ 在 file_edit 函数之后、class ToolRegistry 之前插入 bash / _git_status / _git_diff @@
++def _git_status(args: dict[str, Any], ctx: ToolContext) -> str:
++    """薄包装 git status——只读、默认 allow。"""
++    return _bash_run_sync("git status", ctx.cwd, timeout=10)
++
++
++def _git_diff(args: dict[str, Any], ctx: ToolContext) -> str:
++    """薄包装 git diff——只读、默认 allow。"""
++    return _bash_run_sync("git diff", ctx.cwd, timeout=10)
++
++
++def bash(args: dict[str, Any], ctx: ToolContext) -> str:
++    """执行 shell 命令。前置校验和用户确认在 agent.py 拦截块完成。"""
++    command = args.get("command", "")
++    if not command:
++        return "error: missing required argument 'command'"
++    timeout = int(args.get("timeout", 30))
++    background = bool(args.get("background", False))
++
++    # v1 只做同步；v4 接 background=True 分支
++    if background:
++        return "error: background mode not implemented yet (coming in v4)"
++
++    return _bash_run_sync(command, ctx.cwd, timeout=timeout)
++
+
+@@ default_tools()：在 file_edit 注册之后、return registry 之前追加三个注册 @@
++    registry.register(
++        Tool(
++            name="git_status",
++            description="Run git status to see the current state of the working directory.",
++            run=_git_status,
++            parameters={"type": "object", "properties": {}, "required": []},
++        )
++    )
++    registry.register(
++        Tool(
++            name="git_diff",
++            description="Run git diff to see unstaged changes in the working directory.",
++            run=_git_diff,
++            parameters={"type": "object", "properties": {}, "required": []},
++        )
++    )
++    registry.register(
++        Tool(
++            name="bash",
++            description=(
++                "Execute a shell command. Working directory persists but shell state "
++                "does not (each call is a fresh shell). timeout in seconds (default 30). "
++                "Avoid cd; use the tool's implicit cwd instead."
++            ),
++            run=bash,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "command": {"type": "string", "description": "Shell command to execute."},
++                    "timeout": {
++                        "type": "integer",
++                        "description": "Timeout in seconds, default 30.",
++                        "default": 30,
++                    },
++                    "background": {
++                        "type": "boolean",
++                        "description": "Run in background. Returns immediately with a background_id. Default false.",
++                        "default": False,
++                    },
++                },
++                "required": ["command"],
++            },
++        )
++    )
+     return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ 顶部 import：在 from .diff_ui import confirm_edit, render_diff 之后追加 @@
+ from .diff_ui import confirm_edit, render_diff
++from .prompt_ui import confirm_command
+
+@@ for call in response.tool_calls 内部：在 if call.name in ("file_write", "file_edit"): ... 整块之后、result = tools.run(call, ctx) 之前插入 bash 拦截分支 @@
+                         continue
+
++            # bash 拦截：打印命令预览，让用户确认后再执行
++            elif call.name == "bash":
++                command = call.arguments.get("command", "")
++                timeout = call.arguments.get("timeout", 30)
++                console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
++                console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
++                if not confirm_command(command):
++                    result = ToolResult(call.id, "error: command rejected by user", is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
+             result = tools.run(call, ctx)

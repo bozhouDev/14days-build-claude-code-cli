@@ -1,0 +1,73 @@
+--- agent_code/model.py
++++ agent_code/model.py
+@@ -1,5 +1,10 @@
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+-from typing import Any
++from typing import Any, Protocol
++
++from anthropic import Anthropic
+ 
+@@ -25,4 +30,40 @@ class ModelResponse:
+     stop_reason: str = "end_turn"
+ 
+ 
++class ModelProvider(Protocol):
++    def complete(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[Any] | None = None,
++    ) -> ModelResponse:
++        ...
++
++
++class AnthropicProvider:
++    def __init__(
++        self,
++        model: str = "deepseek-v4-flash",
++        max_tokens: int = 1024,
++        base_url: str | None = None,
++    ) -> None:
++        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
++        if not api_key:
++            raise RuntimeError("请先设置 ANTHROPIC_AUTH_TOKEN，例如：export ANTHROPIC_AUTH_TOKEN='sk-...'")
++        self.model = model
++        self.max_tokens = max_tokens
++        self.base_url = base_url or os.environ.get(
++            "ANTHROPIC_BASE_URL",
++            "https://api.deepseek.com/anthropic",
++        )
++        self.client = Anthropic(api_key=api_key, base_url=self.base_url)
++
++    def complete(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[Any] | None = None,
++    ) -> ModelResponse:
++        response = self.client.messages.create(
++            model=self.model,
++            max_tokens=self.max_tokens,
++            messages=messages,
++        )
++        text_parts = [block.text for block in response.content if block.type == "text"]
++        return ModelResponse(text="\n".join(text_parts) or None, stop_reason=response.stop_reason)
++
++
+ class MockProvider:
+     def complete(self, messages: list[dict[str, str]]) -> ModelResponse:
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ -7,3 +7,3 @@
+ from .agent import run_agent
+-from .model import MockProvider
++from .model import AnthropicProvider
+ from .tools import default_tools
+@@ -30,3 +30,3 @@
+ def run_once(prompt: str, cwd: Path) -> None:
+     render_header(cwd)
+-    result = run_agent(prompt, MockProvider(), default_tools())
++    result = run_agent(prompt, AnthropicProvider(), default_tools())
+     for line in result.trace:

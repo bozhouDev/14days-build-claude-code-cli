@@ -1,0 +1,59 @@
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ -185,4 +185,33 @@ def _grep_python(pattern, base, glob_arg, ignore_case, ctx):
+     return truncate_output("\n".join(hits) or "(no matches)")
++
++def project_tree(args: dict[str, Any], ctx: ToolContext) -> str:
++    # 一次拿到整张项目结构图，避免反复调 list_files 浪费 token。
++    max_depth = int(args.get("max_depth", 3))
++    max_nodes = 200
++    lines: list[str] = [f"{ctx.cwd.name}/"]
++    nodes = 0
++
++    def walk(directory: Path, depth: int) -> None:
++        nonlocal nodes
++        if depth > max_depth:
++            return
++        children = sorted(
++            (
++                c for c in directory.iterdir()
++                if not should_skip(c.relative_to(ctx.cwd), ctx.skip_policy)
++            ),
++            key=lambda p: (not p.is_dir(), p.name),
++        )
++        for child in children:
++            if nodes >= max_nodes:
++                if nodes == max_nodes:
++                    lines.append("  " * depth + "...[truncated]")
++                    nodes += 1
++                return
++            suffix = "/" if child.is_dir() else ""
++            lines.append("  " * depth + child.name + suffix)
++            nodes += 1
++            if child.is_dir():
++                walk(child, depth + 1)
++
++    walk(ctx.cwd, 1)
++    return truncate_output("\n".join(lines))
+@@ -320,4 +349,21 @@ def default_tools() -> ToolRegistry:
+         )
+     )
++    registry.register(
++        Tool(
++            name="project_tree",
++            description="Show the project directory tree from cwd.",
++            run=project_tree,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "max_depth": {
++                        "type": "integer",
++                        "description": "Maximum recursion depth.",
++                        "default": 3,
++                    },
++                },
++                "required": [],
++            },
++        )
++    )
+     return registry

@@ -1,0 +1,11 @@
+{
+  "command": "uv run agent-code \"Use read_file on pyproject.toml; tell me the project name\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/you/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n\r\n" },
+    { "time": 1200, "text": "\u001b[33mtool_call\u001b[0m: read_file {'path': 'pyproject.toml'}\r\n" },
+    { "time": 2200, "text": "\u001b[36mobservation\u001b[0m: [project]\r\nname = \"agent-code\"\r\nversion = \"0.1.0\"\r\nrequires-python = \">=3.10\"\r\n...\r\n" },
+    { "time": 3200, "text": "\u001b[32mfinal\u001b[0m: The project name is agent-code.\r\n" }
+  ]
+}

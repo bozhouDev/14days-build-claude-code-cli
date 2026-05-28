@@ -1,0 +1,284 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 7 · Slash + Hooks + Cron",
+  "subtitle": "This map covers Day 7's three extension surfaces: a slash registry for CLI control commands, hook gates inside the tool lifecycle, and a cron scheduler that wakes the REPL on time.",
+  "diagrams": [
+    {
+      "id": "slash-registry",
+      "label": "Slash registry",
+      "title": "How slash commands leave cli.py if/elif blocks",
+      "summary": "The CLI sends every input line through dispatch_slash first. A registry hit returns SlashResult for local output or a generated prompt; only misses continue into the Agent Loop.",
+      "defaultActiveNodeId": "dispatch",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "REPL line / one-shot text",
+          "detail": "One-shot mode and REPL mode both call run_user_input. That gives normal prompts, slash input, and later cron pending prompts the same entry point.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "SlashContext",
+          "eyebrow": "snapshot",
+          "body": "cwd / mode / model / session",
+          "detail": "Slash handlers receive a runtime snapshot, not mutable provider or session internals. They can read current state without silently changing the CLI loop.",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "dispatch",
+          "kind": "runtime",
+          "label": "dispatch_slash",
+          "eyebrow": "parser",
+          "body": "shlex split / lookup",
+          "detail": "dispatch_slash checks the slash prefix, splits the command name and args with shlex, and looks up the name in _registry. Unknown commands become local handled errors.",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "registry",
+          "kind": "data",
+          "label": "SlashRegistry",
+          "eyebrow": "commands",
+          "body": "/help /context /plan",
+          "detail": "Built-in commands register with register(name, description, handler). Adding a command changes slash.py's registry instead of adding another if/elif branch to cli.py.",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "SlashResult",
+          "eyebrow": "decision",
+          "body": "handled / should_query",
+          "detail": "handled=True means the CLI should not treat the line as a normal prompt. should_query=True is the bridge that lets a handler expand a slash into a model prompt.",
+          "position": { "x": 600, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "runner",
+          "kind": "runtime",
+          "label": "run_user_input",
+          "eyebrow": "router",
+          "body": "print or run_once",
+          "detail": "Local commands only print message. Generated prompts and ordinary user prompts create a Session and call run_once.",
+          "position": { "x": 900, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "agent-loop",
+          "kind": "model",
+          "label": "Agent Loop",
+          "eyebrow": "fallback",
+          "body": "normal prompt",
+          "detail": "Slash is a CLI control surface, not a model tool. Input reaches the model only when slash dispatch misses or SlashResult.should_query is true.",
+          "position": { "x": 900, "y": 520 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-dispatch", "source": "cli", "target": "dispatch", "label": "line" },
+        { "id": "cli-ctx", "source": "cli", "target": "ctx", "label": "snapshot", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ctx-dispatch", "source": "ctx", "target": "dispatch", "label": "ctx", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "dispatch-registry", "source": "dispatch", "target": "registry", "label": "lookup" },
+        { "id": "registry-result", "source": "registry", "target": "result", "label": "handler", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "dispatch-result", "source": "dispatch", "target": "result", "label": "unknown / parse error", "sourceHandle": "source-bottom", "targetHandle": "target-left" },
+        { "id": "result-runner", "source": "result", "target": "runner", "label": "handled" },
+        { "id": "runner-loop", "source": "runner", "target": "agent-loop", "label": "handled=false or should_query", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "hook-gate",
+      "label": "Hook gate",
+      "title": "Hooks sit between permission and tools.run",
+      "summary": "The model only proposes tool_use. The harness makes the permission decision first, then PreToolUse may block, and PostToolUse runs after success as a warning-only hook.",
+      "defaultActiveNodeId": "pre",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "model",
+          "label": "Model tool_use",
+          "eyebrow": "proposal",
+          "body": "file_edit / bash / cron_create",
+          "detail": "The model still only proposes a tool call. It does not know the concrete hooks.json commands and cannot execute local scripts directly.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "request",
+          "kind": "data",
+          "label": "PermissionRequest",
+          "eyebrow": "policy input",
+          "body": "tool + args + mode + cwd",
+          "detail": "The Day 5 permission engine remains the first safety boundary. Hooks cannot bypass plan mode or a deny decision.",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "gate",
+          "body": "allow / ask / deny",
+          "detail": "Permission is computed before PreToolUse. Already-denied tools do not run local hooks, so a denied action cannot still cause hook side effects.",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "pre",
+          "kind": "tool",
+          "label": "PreToolUse",
+          "eyebrow": "hook",
+          "body": "can block",
+          "detail": "PreToolUse matches the tool name and runs a command through subprocess. A non-zero exit becomes a blocked-tool observation; after success, the ask path still goes through confirmation UI before execution.",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "tools.run",
+          "eyebrow": "tool runtime",
+          "body": "real world effect",
+          "detail": "The harness executes the tool only after permission has not denied it, PreToolUse has not blocked it, and the ask path has been confirmed by the user. File writes, bash, and cron JSON writes happen here.",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "post",
+          "kind": "tool",
+          "label": "PostToolUse",
+          "eyebrow": "hook",
+          "body": "warn only",
+          "detail": "PostToolUse runs after a successful tool call. The main path only prints hook status to the terminal; it does not inject hook output into model context or block the result.",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "observation",
+          "kind": "response",
+          "label": "Observation",
+          "eyebrow": "tool_result",
+          "body": "success or error",
+          "detail": "Whether the tool succeeds or PreToolUse blocks it, the model receives a harness-created Observation. Hooks never grant the model direct local execution.",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-request", "source": "tool-use", "target": "request", "label": "wrap" },
+        { "id": "request-permission", "source": "request", "target": "permission", "label": "decide" },
+        { "id": "permission-pre", "source": "permission", "target": "pre", "label": "allow / ask", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "permission-observation", "source": "permission", "target": "observation", "label": "deny", "sourceHandle": "source-left", "targetHandle": "target-top" },
+        { "id": "pre-tools", "source": "pre", "target": "tools-run", "label": "allow or confirmed ask" },
+        { "id": "pre-observation", "source": "pre", "target": "observation", "label": "blocked", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "tools-post", "source": "tools-run", "target": "post", "label": "success", "sourceHandle": "source-top", "targetHandle": "target-bottom" },
+        { "id": "tools-observation", "source": "tools-run", "target": "observation", "label": "tool_result", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "cron-wakeup",
+      "label": "Cron wakeup",
+      "title": "Cron enqueues on time; it does not re-enter the Agent Loop",
+      "summary": "Human /loop add and model cron_create share CronScheduler. The background thread only places slash or prompt text into a pending queue; the REPL main thread drains it and calls run_user_input in order.",
+      "defaultActiveNodeId": "pending",
+      "nodes": [
+        {
+          "id": "loop",
+          "kind": "runtime",
+          "label": "/loop add",
+          "eyebrow": "human",
+          "body": "/context --every 120",
+          "detail": "/loop is a local slash command that calls the same cron_create function logic without going through the model. It is the human control panel for recurring jobs.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "cron-tool",
+          "kind": "tool",
+          "label": "cron_create",
+          "eyebrow": "model tool",
+          "body": "same scheduler API",
+          "detail": "The model can manage jobs through cron_create, cron_list, and cron_cancel. cron_list is readonly; create and cancel are low-risk writes, still denied in plan mode.",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "scheduler",
+          "kind": "runtime",
+          "label": "CronScheduler",
+          "eyebrow": "repl runtime",
+          "body": "jobs + lock + daemon",
+          "detail": "The REPL creates a scheduler and injects it into cron_tools. One-shot mode can read and write cron.json, but it does not start a background thread.",
+          "position": { "x": 300, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "cron-json",
+          "kind": "data",
+          "label": ".agent/cron.json",
+          "eyebrow": "persist",
+          "body": "jobs list",
+          "detail": "add, cancel, and due-time updates rewrite this JSON file. Job counts are small, so full-file writes are simpler than incremental patches for the teaching version.",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "thread",
+          "kind": "runtime",
+          "label": "Background Thread",
+          "eyebrow": "tick",
+          "body": "wake every 1s",
+          "detail": "The background thread checks every second whether now - last_run_at exceeds every_seconds. It never calls run_agent; it only enqueues.",
+          "position": { "x": 600, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "pending",
+          "kind": "data",
+          "label": "Pending Queue",
+          "eyebrow": "handoff",
+          "body": "slash / prompt",
+          "detail": "The pending queue is the concurrency boundary. The background thread puts strings in the queue; the main thread consumes them, preventing two Agent Loops from touching the same cwd at once.",
+          "position": { "x": 900, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "main-thread",
+          "kind": "runtime",
+          "label": "REPL Main Thread",
+          "eyebrow": "single loop",
+          "body": "drain_pending()",
+          "detail": "The main thread wakes every 0.5 seconds, drains scheduled jobs first, then handles user input. The Agent Loop remains sequential and single-threaded.",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "runner",
+          "kind": "runtime",
+          "label": "run_user_input",
+          "eyebrow": "reuse",
+          "body": "slash dispatch again",
+          "detail": "A scheduled /context re-enters Day 7's unified input path: slash dispatch handles it locally and prints status without calling the model.",
+          "position": { "x": 1180, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "loop-scheduler", "source": "loop", "target": "scheduler", "label": "add_job" },
+        { "id": "tool-scheduler", "source": "cron-tool", "target": "scheduler", "label": "add/list/cancel" },
+        { "id": "scheduler-json", "source": "scheduler", "target": "cron-json", "label": "save/load" },
+        { "id": "scheduler-thread", "source": "scheduler", "target": "thread", "label": "start", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "thread-pending", "source": "thread", "target": "pending", "label": "enqueue" },
+        { "id": "pending-main", "source": "pending", "target": "main-thread", "label": "drain", "sourceHandle": "source-top", "targetHandle": "target-bottom" },
+        { "id": "main-runner", "source": "main-thread", "target": "runner", "label": "run" },
+        { "id": "runner-scheduler", "source": "runner", "target": "scheduler", "label": "loop commands", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,261 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 1 · Hello Agent",
+  "subtitle": "A compact map of today's core agent logic: model proposes, harness executes, observation returns to messages.",
+  "diagrams": [
+    {
+      "id": "main-loop",
+      "label": "Main loop",
+      "title": "The minimum Agent Loop",
+      "summary": "The prompt enters messages, MockProvider proposes a tool_call, ToolRegistry runs echo, ToolResult returns as observation, and the model produces final text.",
+      "defaultActiveNodeId": "registry",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "parse prompt and cwd",
+          "detail": "CLI Runtime catches user input, resolves the working directory boundary, and passes the prompt into run_agent. It does not answer the user itself.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "append user message",
+          "detail": "messages is the context sent back to the model each round. Day 1 starts with a role='user' prompt, then appends the tool observation.",
+          "position": { "x": 250, "y": 80 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "MockProvider",
+          "eyebrow": "model",
+          "body": "read messages",
+          "detail": "MockProvider is the teaching fake model. On the first round it sees a user message and returns a tool_call; on the second round it sees a tool message and returns final text.",
+          "position": { "x": 500, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "proposal",
+          "body": "tool_call: echo",
+          "detail": "The model only proposes tool_call: echo(text='hi'). Nothing has changed in the world yet; the intent is handed to the harness.",
+          "position": { "x": 840, "y": 80 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "registry",
+          "kind": "tool",
+          "label": "ToolRegistry",
+          "eyebrow": "harness",
+          "body": "run echo(args)",
+          "detail": "The model proposes `tool_call`; the harness executes the tool. ToolRegistry maps the tool name to a Python function, which is the first important boundary in Day 1.",
+          "position": { "x": 840, "y": 280 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "content='hi'",
+          "detail": "ToolResult is the observation from tool execution. It carries the tool_call_id back into messages so the model can see what echo returned.",
+          "position": { "x": 500, "y": 280 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "final text",
+          "detail": "After the second complete(messages), MockProvider returns final text. The CLI prints it to the terminal and the Agent Loop exits.",
+          "position": { "x": 0, "y": 280 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "cli-messages",
+          "source": "cli",
+          "target": "messages",
+          "label": "prompt"
+        },
+        {
+          "id": "messages-provider",
+          "source": "messages",
+          "target": "provider",
+          "label": "complete(messages)"
+        },
+        {
+          "id": "provider-response",
+          "source": "provider",
+          "target": "response",
+          "label": "tool_call"
+        },
+        {
+          "id": "response-registry",
+          "source": "response",
+          "target": "registry",
+          "label": "dispatch",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "registry-result",
+          "source": "registry",
+          "target": "tool-result",
+          "label": "echo(args)",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "result-messages",
+          "source": "tool-result",
+          "target": "messages",
+          "label": "append observation",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-bottom"
+        },
+        {
+          "id": "provider-stdout",
+          "source": "provider",
+          "target": "stdout",
+          "label": "final",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        }
+      ]
+    },
+    {
+      "id": "message-shape",
+      "label": "Message shape",
+      "title": "Day 1 message shape",
+      "summary": "Day 1 uses a simplified role='tool' shape to make the mock loop run. Day 2 swaps this for Anthropic tool_use / tool_result content blocks.",
+      "defaultActiveNodeId": "tool-message",
+      "nodes": [
+        {
+          "id": "prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "echo hi using echo",
+          "detail": "The user input is still natural language. The CLI does not parse tool arguments; it places the raw prompt into messages.",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "user-message",
+          "kind": "data",
+          "label": "messages[0]",
+          "eyebrow": "role='user'",
+          "body": "content=prompt",
+          "detail": "run_agent initializes messages = [{ role: 'user', content: prompt }]. This is the first context the model sees.",
+          "position": { "x": 250, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "tool-call",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "stop_reason",
+          "body": "tool_calls=[echo]",
+          "detail": "MockProvider returns ModelResponse(tool_calls=[ToolCall(name='echo')]). This means the model wants the harness to execute a tool.",
+          "position": { "x": 500, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "run-tool",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "harness",
+          "body": "echo({'text':'hi'})",
+          "detail": "ToolRegistry.run(call) looks up the echo function by call.name and passes call.arguments into it.",
+          "position": { "x": 840, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "tool-message",
+          "kind": "data",
+          "label": "messages += tool",
+          "eyebrow": "role='tool'",
+          "body": "tool_call_id + content",
+          "detail": "This is the Day 1 teaching simplification: role='tool' stores the ToolResult. Day 2 changes this to the Anthropic Messages API tool_use / tool_result content blocks.",
+          "position": { "x": 840, "y": 250 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "final-response",
+          "kind": "response",
+          "label": "ModelResponse",
+          "eyebrow": "final",
+          "body": "text='echo tool returned: hi'",
+          "detail": "MockProvider sees that the newest message is a tool observation, then returns final text with stop_reason back to end_turn.",
+          "position": { "x": 500, "y": 250 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "stdout-shape",
+          "kind": "output",
+          "label": "stdout",
+          "eyebrow": "terminal",
+          "body": "print final",
+          "detail": "The CLI renders the trace: tool_call, observation, final. The Terminal Replay later in the lesson still shows this runnable output.",
+          "position": { "x": 250, "y": 250 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        {
+          "id": "prompt-user",
+          "source": "prompt",
+          "target": "user-message",
+          "label": "wrap"
+        },
+        {
+          "id": "user-tool-call",
+          "source": "user-message",
+          "target": "tool-call",
+          "label": "complete"
+        },
+        {
+          "id": "tool-call-run",
+          "source": "tool-call",
+          "target": "run-tool",
+          "label": "ToolCall"
+        },
+        {
+          "id": "run-tool-message",
+          "source": "run-tool",
+          "target": "tool-message",
+          "label": "ToolResult",
+          "sourceHandle": "source-bottom",
+          "targetHandle": "target-top"
+        },
+        {
+          "id": "tool-message-final",
+          "source": "tool-message",
+          "target": "final-response",
+          "label": "second complete",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        },
+        {
+          "id": "final-stdout",
+          "source": "final-response",
+          "target": "stdout-shape",
+          "label": "render",
+          "sourceHandle": "source-left",
+          "targetHandle": "target-right"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,205 @@
+--- /dev/null
++++ agent_code/hooks.py
+@@ -0,0 +1,102 @@
++from __future__ import annotations
++
++import json
++import subprocess
++from pathlib import Path
++from typing import Any
++
++# hooks.json 放在 cwd 下，是项目级的钩子配置
++HOOKS_FILE = "hooks.json"
++
++
++def load_hooks(cwd: Path) -> dict[str, list[dict[str, Any]]]:
++    """加载 hooks.json。文件不存在返回空 dict——不是错误，只是没配置。"""
++    file_path = cwd / HOOKS_FILE
++    if not file_path.exists():
++        return {}
++    try:
++        with open(file_path, encoding="utf-8") as f:
++            data = json.load(f)
++            # 主线使用 {"hooks": {"PostToolUse": [...]}}。
++            # 也兼容直接写 {"PostToolUse": [...]}，方便手工调试。
++            return data.get("hooks", data)
++    except (json.JSONDecodeError, OSError) as exc:
++        # 坏 JSON 不阻塞 Agent 启动，打印 warning 后当无配置
++        print(f"[hook warning] failed to load {file_path}: {exc}")
++        return {}
++
++
++def _matches(tool_name: str, matcher: str) -> bool:
++    """matcher 和 tool_name 的匹配规则：
++    - "*" 匹配所有工具
++    - 单值精确匹配
++    - "a|b" 多值匹配
++    不做正则和支持通配符，保持简单可预期。"""
++    if matcher == "*":
++        return True
++    if "|" in matcher:
++        return tool_name in matcher.split("|")
++    return matcher == tool_name
++
++
++def _run_hook_command(command: str, input_data: dict[str, Any], cwd: Path, timeout: int = 30) -> tuple[bool, str]:
++    """执行一个 hook command。subprocess 跑，stdin 传 JSON，timeout 默认 30s。
++    返回 (success, output) 二元组——success 为 True 表示退出码 0。"""
++    try:
++        result = subprocess.run(
++            command,
++            shell=True,
++            cwd=str(cwd),
++            input=json.dumps(input_data, ensure_ascii=False),
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++        output = result.stdout.strip() or result.stderr.strip()
++        return result.returncode == 0, output
++    except subprocess.TimeoutExpired:
++        return False, "hook timed out"
++    except Exception as exc:
++        return False, f"hook execution error: {exc}"
++
++
++def run_hooks(
++    event: str,
++    tool_name: str,
++    tool_input: dict[str, Any],
++    cwd: Path,
++    tool_result: str = "",
++) -> list[dict[str, Any]]:
++    """在给定 event 下执行所有匹配 tool_name 的 hooks。
++    返回一个 list，每个元素是 {"event": ..., "tool": ..., "success": bool, "output": str}。
++    空 list 表示没有匹配到 hook。
++
++    这是 harness 的 hook dispatch 入口——agent.py 在工具前后调用本函数。"""
++    config = load_hooks(cwd)
++    entries = config.get(event, [])
++    results: list[dict[str, Any]] = []
++    for entry in entries:
++        matcher = entry.get("matcher", "*")
++        if not _matches(tool_name, matcher):
++            continue
++        commands: list[str] = []
++        if "run" in entry:
++            commands = [entry["run"]]
++        elif "hooks" in entry:
++            for h in entry["hooks"]:
++                if isinstance(h, dict) and h.get("type") == "command":
++                    cmd = h.get("command", "")
++                    if cmd:
++                        commands.append(cmd)
++        for cmd in commands:
++            input_data = {
++                "event": event,
++                "tool_name": tool_name,
++                "tool_input": tool_input,
++                "tool_result": tool_result,
++                "cwd": str(cwd),
++            }
++            success, output = _run_hook_command(cmd, input_data, cwd)
++            results.append({
++                "event": event,
++                "tool": tool_name,
++                "command": cmd,
++                "success": success,
++                "output": output,
++            })
++    return results
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ hook imports and emit @@
++from .hooks import run_hooks  # Day 7：生命周期钩子
++
+     def emit(line: str) -> None:
+         # 流式输出 trace：append 给测试用，print 给读者看
+         trace.append(line)
+-        console.print(line)
++        console.print(line, markup=False)
+@@ pre tool hook @@
+             request = PermissionRequest(
+                 tool_name=call.name,
+                 args=call.arguments,
+                 mode=permission_mode,
+                 cwd=ctx.cwd,
+             )
+             decision = decide_permission(request)
++            # Day 7：PreToolUse hooks — 在工具执行前跑，能阻断工具
++            # plan 模式等 deny 决策已经在上面算出，deny 不再执行本地 hook，避免 hook 副作用。
++            if decision.behavior != "deny":
++                pre_hooks = run_hooks(
++                    "PreToolUse", call.name, call.arguments, ctx.cwd,
++                )
++                pre_blocked = [h for h in pre_hooks if not h["success"]]
++                if pre_blocked:
++                    blocked_msgs = "\n".join(
++                        f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked
++                    )
++                    observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
++                    emit(f"observation: {observation}")
++                    tool_result_blocks.append({
++                        "type": "tool_result",
++                        "tool_use_id": call.id,
++                        "content": observation,
++                        "is_error": True,
++                    })
++                    continue
+@@ file preview argument guard @@
+             edit_preview: tuple[str, str, str] | None = None
+             if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
+                 # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
+                 path_str = call.arguments.get("file_path", "")
++                if not path_str:
++                    result = ToolResult(call.id, "error: missing required argument 'file_path'", is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
+                 try:
+                     path = resolve_in_cwd(ctx.cwd, path_str)
+                 except (ValueError, OSError) as exc:
+                     result = ToolResult(call.id, f"error: {exc}", is_error=True)
+                     emit(f"observation: {result.content}")
+@@ directory guard @@
+                     )
+                     continue
++                if path.is_dir():
++                    result = ToolResult(call.id, f"error: path is a directory: {path_str}", is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
+ 
+                 old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+@@ post tool hook @@
+             result = tools.run(call, ctx)
+             emit(f"observation: {result.content}")
++            # Day 7：PostToolUse hooks — 在工具执行成功后跑，失败不阻断
++            if not result.is_error:
++                post_hooks = run_hooks(
++                    "PostToolUse", call.name, call.arguments, ctx.cwd,
++                    tool_result=result.content,
++                )
++                for h in post_hooks:
++                    status = "ok" if h["success"] else f"warning: {h['output']}"
++                    console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
+             tool_result_blocks.append(
+                 {
+                     "type": "tool_result",
+                     "tool_use_id": result.tool_call_id,

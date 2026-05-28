@@ -1,0 +1,511 @@
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+/* Fumadocs preset.css 里大量 @apply bg-fd-* 工具类需要 --color-fd-* token 在 @theme 注册，
+   而 neutral.css → default-colors.css 才负责这件事；不引就会编译报
+   `Cannot apply unknown utility class bg-fd-diff-remove`。
+   neutral.css 默认的中性色会被后面 :root / .dark 里的 Notion 覆盖。 */
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+@import "@xyflow/react/dist/style.css";
+
+/* =========================================================================
+   Notion-style design tokens
+   亮色为主，仅 hero band 是深 navy；CTA 永远是 Notion 紫色矩形按钮。
+   命名空间 --ntn-* 与之前 --ql-* 解耦，迁移时一刀切替换。
+   ========================================================================= */
+:root {
+  /* Brand & Primary —— 紫色矩形 CTA 专用 */
+  --ntn-primary: #6F6CFF;
+  --ntn-primary-pressed: #5856E5;
+  --ntn-primary-deep: #4845D2;
+  --ntn-on-primary: #FFFFFF;
+
+  /* Hero band navy 阶梯 */
+  --ntn-brand-navy: #19191C;
+  --ntn-brand-navy-deep: #0F0F12;
+  --ntn-brand-navy-mid: #25252B;
+
+  /* 内联文本链接蓝（不要和 primary 混用） */
+  --ntn-link-blue: #2383E2;
+  --ntn-link-blue-pressed: #1F6BBE;
+
+  /* Brand 色谱（呼应产品里的 database property tag） */
+  --ntn-brand-pink: #E255A1;
+  --ntn-brand-pink-deep: #B33A82;
+  --ntn-brand-orange: #E58413;
+  --ntn-brand-orange-deep: #C75B12;
+  --ntn-brand-teal: #0BA5A4;
+  --ntn-brand-green: #2D8C5B;
+  --ntn-brand-yellow: #F2C94C;
+  --ntn-brand-brown: #8B6B4A;
+  --ntn-brand-purple: #6F6CFF;
+  --ntn-brand-purple-300: #C7C5FF;
+  --ntn-brand-purple-800: #3F3DB0;
+
+  /* Pastel card tint —— 教学卡片底色 */
+  --ntn-tint-peach: #FBEAE0;
+  --ntn-tint-rose: #FAE3E7;
+  --ntn-tint-mint: #E1F1E6;
+  --ntn-tint-lavender: #ECEAFE;
+  --ntn-tint-sky: #DDECFB;
+  --ntn-tint-yellow: #FAF1D2;
+  --ntn-tint-yellow-bold: #F6D87C;
+  --ntn-tint-cream: #F7F3EA;
+  --ntn-tint-gray: #F3F2F0;
+
+  /* Surface */
+  --ntn-canvas: #FFFFFF;
+  --ntn-surface: #F7F6F3;
+  --ntn-surface-soft: #FAFAF8;
+  --ntn-hairline: rgba(15, 15, 15, 0.08);
+  --ntn-hairline-soft: rgba(15, 15, 15, 0.05);
+  --ntn-hairline-strong: rgba(15, 15, 15, 0.16);
+
+  /* Text 阶梯 */
+  --ntn-ink-deep: #0F0F12;
+  --ntn-ink: #1F1F23;
+  --ntn-charcoal: #2F2F33;
+  --ntn-slate: #57575C;
+  --ntn-steel: #76767B;
+  --ntn-stone: #9A9A9F;
+  --ntn-muted: #B5B5B9;
+  --ntn-on-dark: #FFFFFF;
+  --ntn-on-dark-muted: rgba(255, 255, 255, 0.72);
+
+  /* Logo 方块的底/字。亮色：黑底白 N；暗色：白底黑 N。整站使用统一变量，避免 dark 模式下白底白字。 */
+  --ntn-logo-bg: var(--ntn-ink-deep);
+  --ntn-logo-fg: var(--ntn-on-dark);
+
+  /* 代码面板专用底/默认字色。
+     和 ink-deep 不同：在亮/暗两种模式都保持深底（Notion 风的代码块/终端永远是深色面板）。
+     Shiki 配的是 github-dark theme，token 是亮色 —— 这俩配合才看得清。 */
+  --ntn-code-bg: #0D1117;
+  --ntn-code-fg: #E6EDF3;
+
+  /* Semantic */
+  --ntn-success: #2D8C5B;
+  --ntn-warning: #E58413;
+  --ntn-error: #D93C3C;
+
+  /* Border radius —— Notion 是矩形 8px 按钮 + 12px 卡 */
+  --ntn-rounded-xs: 4px;
+  --ntn-rounded-sm: 6px;
+  --ntn-rounded-md: 8px;
+  --ntn-rounded-lg: 12px;
+  --ntn-rounded-xl: 16px;
+  --ntn-rounded-xxl: 20px;
+  --ntn-rounded-xxxl: 24px;
+
+  /* Shadow elevation */
+  --ntn-shadow-1: 0 1px 2px 0 rgba(15, 15, 15, 0.04);
+  --ntn-shadow-2: 0 4px 12px 0 rgba(15, 15, 15, 0.08);
+  --ntn-shadow-3: 0 24px 48px -8px rgba(15, 15, 15, 0.22);
+  --ntn-shadow-4: 0 16px 48px -8px rgba(15, 15, 15, 0.16);
+
+  /* Focus ring：浅色用浅紫光晕 + 1px primary 描边；保证 outline-offset 不被裁。
+     用 box-shadow 而不是 outline 避免与 border-radius 冲突；所有交互元素都套这个 token。 */
+  --ntn-focus-ring: 0 0 0 2px var(--ntn-canvas), 0 0 0 4px rgba(111, 108, 255, 0.45);
+
+  /* Typography —— Geist 由 next/font 注入到 --font-geist */
+  --ntn-font-sans: var(--font-geist), -apple-system, system-ui,
+    'PingFang SC', 'Hiragino Sans GB', 'Segoe UI', Helvetica, sans-serif;
+  --ntn-font-mono: ui-monospace, 'JetBrains Mono', 'SFMono-Regular',
+    Menlo, Consolas, monospace;
+}
+
+/* =========================================================================
+   Dark mode 覆盖
+   策略：保持 token 名字与亮色一致，只翻转值。
+   - canvas / surface / surface-soft 反转为深灰阶；hero brand-navy 仍比 canvas 更深
+   - text 阶梯整体反转（ink-deep 由黑变白，charcoal 由深变浅）
+   - pastel tint 改为对应品牌色的低 alpha 叠加，保留色相身份
+   - 「作为 tint 上的文字色」的语义 token（brand-purple-800 / orange-deep / success）
+     反向取浅色版本，保证在新的深 tint 底上仍可读
+   - hairline 由黑透明改为白透明，强度略提以保证暗底卡的边界可见
+   - 终端类 brand-navy-deep / brand-navy-mid 保持深色不变（终端永远是深色）
+   - logo 方块翻转：dark 模式下白底黑 N
+   ========================================================================= */
+.dark {
+  /* Brand & Primary —— 紫色按钮在亮暗都好看；pressed 改用偏亮版让悬停更可见 */
+  --ntn-primary: #6F6CFF;
+  --ntn-primary-pressed: #8784FF;
+  --ntn-primary-deep: #C7C5FF;
+  --ntn-on-primary: #FFFFFF;
+
+  /* Hero band：仍比 canvas 更深一档，保留「dark band」的视觉对比 */
+  --ntn-brand-navy: #050507;
+  --ntn-brand-navy-deep: #000003;
+  --ntn-brand-navy-mid: #15151A;
+
+  /* 链接蓝：dark 上需要更亮 */
+  --ntn-link-blue: #6CB1FF;
+  --ntn-link-blue-pressed: #4F9AE8;
+
+  /* Brand 色谱：bump 一档 saturation/luminance 给暗底可读性 */
+  --ntn-brand-pink: #F47BB7;
+  --ntn-brand-pink-deep: #E255A1;
+  --ntn-brand-orange: #F9A23B;
+  --ntn-brand-orange-deep: #F9A23B;
+  --ntn-brand-teal: #1FC1BF;
+  --ntn-brand-green: #4FB47A;
+  --ntn-brand-yellow: #F4D165;
+  --ntn-brand-brown: #B58A60;
+  --ntn-brand-purple: #8784FF;
+  --ntn-brand-purple-300: #C7C5FF;
+  /* 800 在亮色版是「深紫文字色」；dark 模式下要变成浅紫文字色才能读 */
+  --ntn-brand-purple-800: #C7C5FF;
+
+  /* Pastel tint：低 alpha 品牌色叠加在深灰底上。色相可识别但不抢眼 */
+  --ntn-tint-peach: rgba(229, 132, 19, 0.18);
+  --ntn-tint-rose: rgba(226, 85, 161, 0.16);
+  --ntn-tint-mint: rgba(45, 140, 91, 0.20);
+  --ntn-tint-lavender: rgba(111, 108, 255, 0.22);
+  --ntn-tint-sky: rgba(35, 131, 226, 0.18);
+  --ntn-tint-yellow: rgba(242, 201, 76, 0.14);
+  --ntn-tint-yellow-bold: #B8881E;
+  --ntn-tint-cream: rgba(139, 107, 74, 0.18);
+  --ntn-tint-gray: rgba(255, 255, 255, 0.05);
+
+  /* Surface —— 暗灰阶。
+     原来 surface(#25262C) 与 canvas(#1A1B1F) 只有 11 灰度差，sidebar / pill / hover 在暗底显得很平；
+     这里把 canvas 再往黑里压一档、surface 略提，扩大 delta 到 18+ 灰度，让卡 / 高亮 hover 浮起来。 */
+  --ntn-canvas: #131418;
+  --ntn-surface: #23252B;
+  --ntn-surface-soft: #1B1D22;
+  --ntn-hairline: rgba(255, 255, 255, 0.10);
+  --ntn-hairline-soft: rgba(255, 255, 255, 0.05);
+  --ntn-hairline-strong: rgba(255, 255, 255, 0.18);
+
+  /* Text —— 反转 */
+  --ntn-ink-deep: #FFFFFF;
+  --ntn-ink: #ECECEF;
+  --ntn-charcoal: #D5D5D9;
+  --ntn-slate: #ABABB0;
+  --ntn-steel: #898990;
+  --ntn-stone: #707075;
+  --ntn-muted: #55555B;
+  --ntn-on-dark: #FFFFFF;
+  --ntn-on-dark-muted: rgba(255, 255, 255, 0.72);
+
+  /* Logo 翻转：白底黑 N */
+  --ntn-logo-bg: #FFFFFF;
+  --ntn-logo-fg: #0F0F12;
+
+  /* Semantic（同样要做暗色版） */
+  --ntn-success: #4FB47A;
+  --ntn-warning: #F9A23B;
+  --ntn-error: #F26F6F;
+
+  /* 暗色 shadow —— 用更深的黑色提升可见度 */
+  --ntn-shadow-1: 0 1px 2px 0 rgba(0, 0, 0, 0.50);
+  --ntn-shadow-2: 0 4px 12px 0 rgba(0, 0, 0, 0.45);
+  --ntn-shadow-3: 0 24px 48px -8px rgba(0, 0, 0, 0.60);
+  --ntn-shadow-4: 0 16px 48px -8px rgba(0, 0, 0, 0.50);
+
+  /* 暗色 focus ring：第一圈用 canvas 抠出气隙，第二圈亮紫高亮。alpha 提高一档保证暗底可见。 */
+  --ntn-focus-ring: 0 0 0 2px var(--ntn-canvas), 0 0 0 4px rgba(135, 132, 255, 0.55);
+}
+
+/* 整站基底；中文字体走 var(--ntn-font-sans) fallback 链。
+   color-scheme 让原生控件（滚动条、表单等）也跟随主题。 */
+html,
+body {
+  background-color: var(--ntn-canvas);
+  color: var(--ntn-ink);
+  font-family: var(--ntn-font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+html { color-scheme: light; }
+html.dark { color-scheme: dark; }
+
+/* Fumadocs token 重映射成 Notion 颜色。
+   Tailwind v4 + Fumadocs 用 --color-fd-* （在 @theme 里注册），所以前缀必须带 --color-。
+   :root + .dark 同时覆盖：dark class 切换时，--ntn-* 已经先变了（见上文 .dark 块），
+   --color-fd-* 自动跟着翻转。 */
+:root,
+.dark {
+  --color-fd-background: var(--ntn-canvas);
+  --color-fd-foreground: var(--ntn-ink);
+  --color-fd-card: var(--ntn-canvas);
+  --color-fd-card-foreground: var(--ntn-ink);
+  --color-fd-popover: var(--ntn-canvas);
+  --color-fd-popover-foreground: var(--ntn-ink);
+  --color-fd-primary: var(--ntn-primary);
+  --color-fd-primary-foreground: var(--ntn-on-primary);
+  --color-fd-secondary: var(--ntn-surface);
+  --color-fd-secondary-foreground: var(--ntn-ink);
+  --color-fd-muted: var(--ntn-surface);
+  --color-fd-muted-foreground: var(--ntn-slate);
+  --color-fd-accent: var(--ntn-tint-lavender);
+  --color-fd-accent-foreground: var(--ntn-primary-deep);
+  --color-fd-border: var(--ntn-hairline);
+  --color-fd-ring: var(--ntn-primary);
+}
+
+/* 链接默认继承色，需要时由组件显式设 link-blue。避免 Fumadocs 默认蓝抢戏。 */
+a {
+  color: inherit;
+}
+
+/* 选区用浅紫，呼应 primary。 */
+::selection {
+  background: rgba(111, 108, 255, 0.22);
+  color: var(--ntn-ink-deep);
+}
+
+/* 全局 focus-visible 兜底：任何可聚焦但没显式套 focus 样式的元素都获得一个紫色光晕。
+   只在 keyboard focus 触发（focus-visible），鼠标点击不会出环。
+   组件层可以用 .ntn-focus utility 复用同样的 ring。 */
+*:focus-visible {
+  outline: none;
+  box-shadow: var(--ntn-focus-ring);
+  border-radius: var(--ntn-rounded-sm);
+}
+/* 链接 / 行内文本受 box-shadow 影响会被切角，单独把 a 的 focus 改成 outline */
+a:focus-visible {
+  box-shadow: none;
+  outline: 2px solid var(--ntn-primary);
+  outline-offset: 2px;
+  border-radius: var(--ntn-rounded-xs);
+}
+
+/* =========================================================================
+   公共 utility（Tailwind v4 @utility，可被 className 直接消费）
+   ========================================================================= */
+
+/* —— Card 基础形态 —— */
+@utility ntn-card {
+  background: var(--ntn-canvas);
+  border: 1px solid var(--ntn-hairline);
+  border-radius: var(--ntn-rounded-lg);
+}
+@utility ntn-card-soft {
+  background: var(--ntn-surface);
+  border: 1px solid var(--ntn-hairline);
+  border-radius: var(--ntn-rounded-lg);
+}
+
+/* —— Pastel 特性卡 tint —— */
+@utility ntn-tint-peach {
+  background: var(--ntn-tint-peach);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-rose {
+  background: var(--ntn-tint-rose);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-mint {
+  background: var(--ntn-tint-mint);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-lavender {
+  background: var(--ntn-tint-lavender);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-sky {
+  background: var(--ntn-tint-sky);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-yellow {
+  background: var(--ntn-tint-yellow);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-yellow-bold {
+  background: var(--ntn-tint-yellow-bold);
+  color: var(--ntn-ink-deep);
+}
+@utility ntn-tint-cream {
+  background: var(--ntn-tint-cream);
+  color: var(--ntn-charcoal);
+}
+@utility ntn-tint-gray {
+  background: var(--ntn-tint-gray);
+  color: var(--ntn-charcoal);
+}
+
+/* —— Shadow 等级 —— */
+@utility ntn-shadow-1 {
+  box-shadow: var(--ntn-shadow-1);
+}
+@utility ntn-shadow-2 {
+  box-shadow: var(--ntn-shadow-2);
+}
+@utility ntn-shadow-mockup {
+  /* Level 3 —— 用于 hero workspace mockup card；保证压在 navy 上能浮起来。 */
+  box-shadow: var(--ntn-shadow-3);
+}
+@utility ntn-shadow-4 {
+  box-shadow: var(--ntn-shadow-4);
+}
+
+/* —— Hero band 深 navy 段 —— */
+@utility ntn-hero-band {
+  background: var(--ntn-brand-navy);
+  color: var(--ntn-on-dark);
+}
+
+/* —— AgentFlowPlayer 节点三态：紫色 active / 浅绿 done / hairline idle —— */
+@utility ntn-node-idle {
+  border: 1px solid var(--ntn-hairline);
+  background: var(--ntn-canvas);
+}
+@utility ntn-node-active {
+  border: 2px solid var(--ntn-primary);
+  background: var(--ntn-tint-lavender);
+  box-shadow: 0 0 0 4px rgba(111, 108, 255, 0.12);
+}
+@utility ntn-node-done {
+  border: 1px solid var(--ntn-hairline);
+  background: var(--ntn-tint-mint);
+}
+
+/* —— 自定义滚动条 —— */
+@utility ntn-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ntn-hairline-strong) transparent;
+}
+
+/* =========================================================================
+   MDX 正文样式 —— Notion 文档调性，charcoal 17px / 1.6
+   ========================================================================= */
+.ntn-prose {
+  font-family: var(--ntn-font-sans);
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--ntn-charcoal);
+}
+.ntn-prose h1,
+.ntn-prose h2,
+.ntn-prose h3,
+.ntn-prose h4 {
+  color: var(--ntn-ink-deep);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.ntn-prose h1 { font-size: 48px; line-height: 1.15; letter-spacing: -0.5px; }
+.ntn-prose h2 { font-size: 36px; line-height: 1.20; margin-top: 2.4em; letter-spacing: -0.5px; }
+.ntn-prose h3 { font-size: 28px; line-height: 1.25; margin-top: 1.8em; }
+.ntn-prose h4 { font-size: 22px; line-height: 1.30; margin-top: 1.5em; }
+.ntn-prose p {
+  margin-top: 1em;
+  margin-bottom: 1em;
+}
+.ntn-prose strong {
+  color: var(--ntn-ink-deep);
+  font-weight: 600;
+}
+.ntn-prose a {
+  color: var(--ntn-link-blue);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+.ntn-prose a:hover { color: var(--ntn-link-blue-pressed); }
+.ntn-prose code {
+  font-family: var(--ntn-font-mono);
+  font-size: 0.92em;
+  background: var(--ntn-surface);
+  border: 1px solid var(--ntn-hairline);
+  padding: 0.05em 0.4em;
+  border-radius: 4px;
+  color: var(--ntn-charcoal);
+}
+.ntn-prose pre {
+  font-family: var(--ntn-font-mono);
+  background: var(--ntn-code-bg);
+  color: var(--ntn-code-fg);
+  border: 1px solid var(--ntn-hairline);
+  border-radius: var(--ntn-rounded-lg);
+  padding: 1em 1.2em;
+  overflow-x: auto;
+}
+.ntn-prose pre code {
+  background: transparent;
+  border: none;
+  color: inherit;
+  padding: 0;
+}
+.ntn-prose blockquote {
+  border-left: 3px solid var(--ntn-primary);
+  background: var(--ntn-tint-lavender);
+  padding: 0.8em 1.1em;
+  border-radius: 0 var(--ntn-rounded-md) var(--ntn-rounded-md) 0;
+  color: var(--ntn-charcoal);
+  margin: 1.2em 0;
+}
+.ntn-prose ul,
+.ntn-prose ol {
+  padding-left: 1.4em;
+  margin-top: 0.8em;
+  margin-bottom: 0.8em;
+}
+.ntn-prose li {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+}
+.ntn-prose hr {
+  border: 0;
+  border-top: 1px solid var(--ntn-hairline);
+  margin: 2.4em 0;
+}
+.ntn-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.4em 0;
+  font-size: 0.92em;
+}
+.ntn-prose th,
+.ntn-prose td {
+  text-align: left;
+  padding: 0.6em 0.9em;
+  border-bottom: 1px solid var(--ntn-hairline-soft);
+}
+.ntn-prose th {
+  color: var(--ntn-ink-deep);
+  font-weight: 600;
+  border-bottom: 1px solid var(--ntn-hairline);
+}
+
+/* Fumadocs 内置 fd-code-block：和 ntn-prose pre 保持一致深底 + 亮 token。
+   color 也强制成 code-fg，给 Shiki 没覆盖到的纯文本 fallback。 */
+.fd-code-block {
+  background: var(--ntn-code-bg) !important;
+  color: var(--ntn-code-fg) !important;
+  border-color: var(--ntn-hairline) !important;
+  border-radius: var(--ntn-rounded-lg) !important;
+}
+.fd-code-block pre,
+.fd-code-block code {
+  background: transparent !important;
+  color: inherit;
+}
+
+/* =========================================================================
+   动画
+   ========================================================================= */
+@keyframes ntn-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ntn-anim-in {
+  animation: ntn-fade-in 0.28s ease-out both;
+}
+
+/* prefers-reduced-motion 兜底：所有 ntn-* 动画一律不放。
+   这里也顺手对 transition: colors 之外的全局 transition 做安全降级，
+   避免任何「轻量动效但用户禁了」的边缘场景。 */
+@media (prefers-reduced-motion: reduce) {
+  .ntn-anim-in {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

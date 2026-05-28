@@ -1,0 +1,98 @@
+{
+  "title": "Day 3 · fs_safety 边界 + ReadFileState 钩子",
+  "task": "用 read_file 工具读 pyproject.toml 给我看项目名",
+  "lanes": {
+    "context": "Context",
+    "model": "Model",
+    "gate": "Harness Gate",
+    "world": "World"
+  },
+  "frames": [
+    {
+      "step": 1,
+      "focus": "context",
+      "card": { "kind": "user_input", "label": "用 read_file 读 pyproject.toml 给我看项目名" },
+      "ledger": { "delta": "messages += user('用 read_file 读 pyproject.toml 给我看项目名')" },
+      "caption": "CLI 解析 prompt 并把 cwd 装进 ToolContext。注意从今天起，cwd 不只是 header 里打印的一行字符串——它是模型所有文件工具的『边界圆』。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" }
+      ]
+    },
+    {
+      "step": 2,
+      "focus": "model",
+      "card": { "kind": "tool_use", "label": "tool_use: read_file(path='pyproject.toml')" },
+      "caption": "AnthropicProvider 把 ToolRegistry.list() 翻译成 input_schema 一起发去 Messages API。模型看完工具列表，决定调 read_file，参数只给相对路径。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 3,
+      "focus": "gate",
+      "gate": { "rule": "fs_safety: resolve_in_cwd + ensure_text_file + ensure_within_size", "state": "open", "target": "pyproject.toml" },
+      "caption": "Day 3 的 gate 比 Day 1/2 多了三道关：resolve_in_cwd 把相对路径锁回 cwd 子树，越界直接抛 ValueError；ensure_text_file 走白名单或 peek NUL 字节拒绝二进制；ensure_within_size 卡 256 KiB 单文件上限。三道关全过才允许读盘。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" }
+      ],
+      "modelResponse": {
+        "tool_calls": [{ "id": "toolu_01READ", "name": "read_file", "arguments": { "path": "pyproject.toml" } }],
+        "stop_reason": "tool_use"
+      }
+    },
+    {
+      "step": 4,
+      "focus": "world",
+      "card": { "kind": "tool_result", "label": "read_file(path='pyproject.toml') → [project] name=\"agent-code\"..." },
+      "caption": "Path.read_text 把 pyproject.toml 读进内存，过 truncate_output 截到 8000 chars。同时 ReadFileState.record(path, content) 把 (mtime_ns, char_count) 记下来——Day 4 read-before-edit 会读这份记录，判断模型读过文件之后磁盘是否又被改过。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" }
+      ]
+    },
+    {
+      "step": 5,
+      "focus": "context",
+      "ledger": { "delta": "messages += assistant(tool_use) + user([tool_result])" },
+      "caption": "Day 3 又改了一次 messages 形状：assistant 的 tool_use 整条 message 先 append；然后这一轮所有 tool_result 打包进同一条 user 消息的 content blocks 里——一轮一条，不再像 Day 2 那样一个 tool_use 配一条消息。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ]
+    },
+    {
+      "step": 6,
+      "focus": "model",
+      "card": { "kind": "final", "label": "final: 项目名是 agent-code。" },
+      "caption": "AnthropicProvider 第二次请求模型。模型读到 tool_result 里的 [project] 区段，确认项目名，返回纯文本，stop_reason=end_turn。for step in range(max_steps) 在这一帧退出。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "项目名是 agent-code。",
+        "stop_reason": "end_turn"
+      }
+    },
+    {
+      "step": 7,
+      "focus": "context",
+      "card": { "kind": "final", "label": "stdout ← 'final: 项目名是 agent-code。'" },
+      "caption": "CLI 把 trace 三段打到终端：tool_call、observation、final。整条对话和 ReadFileState 都还在内存里，Day 4 的 file_edit 就是从这一份 ctx.read_state 起步的。",
+      "messages": [
+        { "role": "user", "content": "用 read_file 读 pyproject.toml 给我看项目名" },
+        { "role": "assistant", "content": "[tool_use: read_file(id=toolu_01READ, path=pyproject.toml)]" },
+        { "role": "user", "content": "[tool_result(toolu_01READ): [project]\\nname = \"agent-code\"\\nversion = \"0.1.0\"\\n...]" }
+      ],
+      "modelResponse": {
+        "text": "项目名是 agent-code。",
+        "stop_reason": "end_turn"
+      }
+    }
+  ]
+}

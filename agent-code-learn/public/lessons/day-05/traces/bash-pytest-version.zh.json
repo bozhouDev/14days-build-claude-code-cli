@@ -1,0 +1,14 @@
+{
+  "command": "uv run agent-code \"用 bash 跑一下 pytest --version\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/xc/my/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n\r\n" },
+    { "time": 1400, "text": "\u001b[33mtool_call\u001b[0m: bash {'command': 'pytest --version', 'timeout': 30, 'background': False}\r\n" },
+    { "time": 2200, "text": "\r\n\u001b[1;33mCommand:\u001b[0m pytest --version\r\n" },
+    { "time": 2400, "text": "\u001b[2mtimeout: 30s  cwd: /Users/xc/my/agent-code\u001b[0m\r\n" },
+    { "time": 3400, "text": "Run this command? [y/N]: y\r\n" },
+    { "time": 4400, "text": "\u001b[36mobservation\u001b[0m: pytest 8.4.2\r\n" },
+    { "time": 5800, "text": "\u001b[32mfinal\u001b[0m: 当前环境中安装了 pytest 8.4.2。\r\n" }
+  ]
+}

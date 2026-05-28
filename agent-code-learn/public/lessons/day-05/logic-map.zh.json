@@ -1,0 +1,513 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 5 · Bash + Permission Engine",
+  "subtitle": "这张图只讲 Day 5 的核心 harness 边界：所有 tool_use 先变成 PermissionRequest，权限引擎决定 allow / ask / deny，bash、ask_user_question 和后台任务都沿用这道门。",
+  "diagrams": [
+    {
+      "id": "permission-gate",
+      "label": "Permission gate",
+      "title": "所有工具先过统一权限门",
+      "summary": "Day 5 把 Day 4 的 edit 专用拦截块升级成通用 permission gate：模型只提出 tool_use，agent.py 在 tools.run 前包装 PermissionRequest 并调用 decide_permission。",
+      "defaultActiveNodeId": "decide",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "bash / file_edit / web",
+          "detail": "模型只表达要调用哪个工具和参数。它不能直接执行 shell、写文件或访问外部网络。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "request",
+          "kind": "data",
+          "label": "PermissionRequest",
+          "eyebrow": "agent.py",
+          "body": "tool_name + args + mode",
+          "detail": "Agent Loop 把每次 tool_use 包成 PermissionRequest，连同当前 cwd 和 permission_mode 一起交给权限引擎。",
+          "position": { "x": 280, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "decide",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "harness gate",
+          "body": "triage before tools.run",
+          "detail": "这是 Day 5 的核心边界：只读工具、危险 bash、ask 工具和三种 permission mode 都在这里统一分流。",
+          "position": { "x": 560, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "decision",
+          "kind": "data",
+          "label": "PermissionDecision",
+          "eyebrow": "allow / ask / deny",
+          "body": "behavior + optional reason",
+          "detail": "权限引擎只返回决策，不执行工具。真正执行、弹确认或返回错误 observation 都在 Agent Loop 里完成。",
+          "position": { "x": 840, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "prompt-ui",
+          "kind": "runtime",
+          "label": "prompt_ui",
+          "eyebrow": "ask",
+          "body": "preview + y/N",
+          "detail": "这个通用 ask 分支渲染命令预览、diff 或网络访问确认。ask_user_question 走单独菜单分支，不进入 tools.run。",
+          "position": { "x": 560, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "allow",
+          "body": "execute approved tool",
+          "detail": "只有 allow 分支，或 ask 分支得到用户确认后，harness 才会调用真实工具函数。",
+          "position": { "x": 840, "y": 330 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "error-result",
+          "kind": "response",
+          "label": "error ToolResult",
+          "eyebrow": "deny / rejected",
+          "body": "structured observation",
+          "detail": "危险命令、plan 模式写操作、用户拒绝确认都会变成 is_error=True 的 observation 回到模型。",
+          "position": { "x": 280, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "stdout or tool output",
+          "detail": "工具结果会追加回 messages，模型下一轮只能基于 observation 继续推理。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-request", "source": "tool-use", "target": "request", "label": "wrap", "mobileLabel": "" },
+        { "id": "request-decide", "source": "request", "target": "decide", "label": "check", "mobileLabel": "" },
+        { "id": "decide-decision", "source": "decide", "target": "decision", "label": "returns", "mobileLabel": "" },
+        { "id": "decision-run", "source": "decision", "target": "tools-run", "label": "allow", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "decision-prompt", "source": "decision", "target": "prompt-ui", "label": "ask", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "decision-error", "source": "decision", "target": "error-result", "label": "deny", "mobileLabel": "", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "prompt-run", "source": "prompt-ui", "target": "tools-run", "label": "confirmed", "mobileLabel": "", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "prompt-error", "source": "prompt-ui", "target": "error-result", "label": "rejected", "mobileLabel": "", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "run-result", "source": "tools-run", "target": "result", "label": "ToolResult", "mobileLabel": "", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "bash-safety",
+      "label": "Bash safety",
+      "title": "bash 命令如何从预览到执行",
+      "summary": "bash 是高风险工具：危险命令先被 regex 拦住；普通命令必须展示 Command 预览并拿到 y，才会进入 bash_runner.run_sync。",
+      "defaultActiveNodeId": "patterns",
+      "nodes": [
+        {
+          "id": "bash-call",
+          "kind": "response",
+          "label": "bash tool_use",
+          "eyebrow": "model",
+          "body": "command + timeout + background",
+          "detail": "模型只提出 shell 字符串和参数。background=True 只改变执行方式，不绕过权限检查。",
+          "position": { "x": 0, "y": 100 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "patterns",
+          "kind": "data",
+          "label": "_DANGEROUS_PATTERNS",
+          "eyebrow": "deny list",
+          "body": "rm -rf / sudo / git push ...",
+          "detail": "权限引擎在确认 UI 前先跑危险命令匹配。命中后直接 deny，不给用户误按 y 的机会。",
+          "position": { "x": 300, "y": 100 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "denied",
+          "kind": "response",
+          "label": "deny ToolResult",
+          "eyebrow": "blocked",
+          "body": "Dangerous command blocked",
+          "detail": "例如 git push --force origin main 会 short-circuit 到 error observation，不会展示 Command 预览。",
+          "position": { "x": 600, "y": 0 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "confirm_command",
+          "eyebrow": "ask",
+          "body": "show command preview",
+          "detail": "普通 bash 在 default / acceptEdits 下仍然要用户确认。acceptEdits 只影响文件编辑，不自动放行 shell。",
+          "position": { "x": 600, "y": 200 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "runner",
+          "kind": "tool",
+          "label": "bash_runner.run_sync",
+          "eyebrow": "tool runtime",
+          "body": "subprocess.run(cwd=ctx.cwd)",
+          "detail": "真正执行 shell 的是 harness 工具函数。它使用最小 env、cwd 锁项目目录、timeout 和输出截断。",
+          "position": { "x": 900, "y": 200 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "process",
+          "kind": "output",
+          "label": "child process",
+          "eyebrow": "world",
+          "body": "stdout / stderr / exit code",
+          "detail": "命令运行结果被收集成字符串；非零退出码会带 exit code，长输出会被 truncate_output 截断。",
+          "position": { "x": 900, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "command output",
+          "detail": "模型看到的是 observation，不是直接控制终端。下一步分析测试失败或继续运行命令都基于这份结果。",
+          "position": { "x": 600, "y": 420 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "bash-patterns", "source": "bash-call", "target": "patterns", "label": "inspect" },
+        { "id": "patterns-denied", "source": "patterns", "target": "denied", "label": "match", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "patterns-confirm", "source": "patterns", "target": "confirm", "label": "safe enough", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-runner", "source": "confirm", "target": "runner", "label": "y", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "runner-process", "source": "runner", "target": "process", "label": "spawn", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "process-result", "source": "process", "target": "result", "label": "capture", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-reject", "source": "confirm", "target": "result", "label": "n -> error", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "permission-modes",
+      "label": "Permission modes",
+      "title": "--permission-mode 如何改变决策",
+      "summary": "Day 5 的模式不是 prompt 提示，而是硬约束：_ASK_TOOLS 先走 ask；default 默认询问写操作；acceptEdits 只跳过文件编辑确认；plan 拒绝写入和本地执行。",
+      "defaultActiveNodeId": "plan",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "--permission-mode",
+          "detail": "CLI 把 default / acceptEdits / plan 传给 run_agent，再进入每次 PermissionRequest。",
+          "position": { "x": 0, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "decide",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "mode triage",
+          "body": "readonly / ask / write policy",
+          "detail": "权限模式在这里生效。注意代码先检查 _ASK_TOOLS，再进入 plan 分支，所以 ask_user_question 在 plan 里仍可提问。",
+          "position": { "x": 300, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "ask-tools",
+          "kind": "data",
+          "label": "_ASK_TOOLS",
+          "eyebrow": "ask first",
+          "body": "ask_user_question / web_*",
+          "detail": "_ASK_TOOLS 在 plan 检查之前返回 ask。ask_user_question 弹菜单，web_fetch / web_search 让用户知道 Agent 要访问外部网络。",
+          "position": { "x": 600, "y": 0 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "ask-ui",
+          "kind": "runtime",
+          "label": "prompt_ui",
+          "eyebrow": "ask",
+          "body": "menu or confirmation",
+          "detail": "这条分支不等于写权限。ask_user_question 会直接构造 ToolResult，web 工具则在用户确认后再执行。",
+          "position": { "x": 900, "y": 0 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "readonly",
+          "kind": "data",
+          "label": "_READONLY_TOOLS",
+          "eyebrow": "always allow",
+          "body": "read_file / grep / git_status",
+          "detail": "只读白名单在三种模式里都可以直接 allow。它和 _ASK_TOOLS 分开，避免把外部网络访问伪装成本地只读。",
+          "position": { "x": 600, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "default",
+          "kind": "data",
+          "label": "default",
+          "eyebrow": "ask writes",
+          "body": "write / bash ask",
+          "detail": "默认模式下，非只读、非危险的写入或本地执行走 ask。用户确认后才可能进入 tools.run。",
+          "position": { "x": 600, "y": 280 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "accept",
+          "kind": "data",
+          "label": "acceptEdits",
+          "eyebrow": "edit fast path",
+          "body": "file_write / file_edit allow",
+          "detail": "acceptEdits 只跳过文件编辑确认 UI。read-before-edit、mtime 冲突、字符串替换唯一性这些 Day 4 校验仍然保留。",
+          "position": { "x": 600, "y": 420 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        },
+        {
+          "id": "plan",
+          "kind": "data",
+          "label": "plan",
+          "eyebrow": "deny writes",
+          "body": "deny writes + local exec",
+          "detail": "plan 模式拒绝写入和本地执行，包括 file_write、file_edit、bash 和本地写入类工具；但 _ASK_TOOLS 已在前面走 ask。",
+          "position": { "x": 300, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 540 }
+        },
+        {
+          "id": "run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "allowed",
+          "body": "execute after policy",
+          "detail": "readonly allow、acceptEdits 的编辑 allow、default ask 后确认，最终都会落到真实工具函数。",
+          "position": { "x": 900, "y": 220 },
+          "mobilePosition": { "x": 0, "y": 720 }
+        },
+        {
+          "id": "blocked",
+          "kind": "response",
+          "label": "error ToolResult",
+          "eyebrow": "blocked",
+          "body": "mode policy denied",
+          "detail": "plan 模式下的写请求会作为错误 observation 返回，让模型改成只读分析或请求用户切模式。",
+          "position": { "x": 900, "y": 420 },
+          "mobilePosition": { "x": 220, "y": 720 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-decide", "source": "cli", "target": "decide", "label": "mode" },
+        { "id": "decide-ask-tools", "source": "decide", "target": "ask-tools", "label": "ask tools", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "ask-tools-ui", "source": "ask-tools", "target": "ask-ui", "label": "ask", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-readonly", "source": "decide", "target": "readonly", "label": "read-only", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-default", "source": "decide", "target": "default", "label": "default", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-accept", "source": "decide", "target": "accept", "label": "acceptEdits", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "decide-plan", "source": "decide", "target": "plan", "label": "plan", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "readonly-run", "source": "readonly", "target": "run", "label": "allow", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "default-run", "source": "default", "target": "run", "label": "ask + y", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "accept-run", "source": "accept", "target": "run", "label": "allow edit", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "plan-blocked", "source": "plan", "target": "blocked", "label": "deny", "sourceHandle": "source-right", "targetHandle": "target-left" }
+      ]
+    },
+    {
+      "id": "human-background",
+      "label": "Human + background",
+      "title": "问用户和后台 bash 都是 harness 分支",
+      "summary": "ask_user_question 由 harness 弹菜单并直接构造 ToolResult；bash(background=True) 由 bg_manager 启动子进程并把输出落到 .bg 文件，后续由模型主动查询。",
+      "defaultActiveNodeId": "prompt-choice",
+      "nodes": [
+        {
+          "id": "ask-call",
+          "kind": "response",
+          "label": "ask_user_question",
+          "eyebrow": "tool_use",
+          "body": "prompt + options",
+          "detail": "模型需要用户拍板时提出 ask_user_question。它是一等工具，不是 slash command。",
+          "position": { "x": 0, "y": 60 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "ask-gate",
+          "kind": "runtime",
+          "label": "permission gate",
+          "eyebrow": "ask branch",
+          "body": "decision.behavior == ask",
+          "detail": "ask_user_question 不在只读白名单里，但它的 ask 分支不是 y/N，而是专门的选项菜单。",
+          "position": { "x": 300, "y": 60 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "prompt-choice",
+          "kind": "runtime",
+          "label": "prompt_single_choice",
+          "eyebrow": "human input",
+          "body": "numbered menu",
+          "detail": "harness 阻塞 Agent Loop，等待用户输入 1/2/3，再把选中的 label 作为工具结果回灌。",
+          "position": { "x": 600, "y": 60 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "ask-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "selected option",
+          "body": "choice label",
+          "detail": "ask_user_question 的全部工作就是拿答案，所以这里不会再调用 tools.run。",
+          "position": { "x": 900, "y": 60 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "bg-call",
+          "kind": "response",
+          "label": "bash background=True",
+          "eyebrow": "tool_use",
+          "body": "long-running command",
+          "detail": "后台 bash 仍然先过同一套权限引擎；background=True 不是权限豁免。",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "bg-gate",
+          "kind": "runtime",
+          "label": "permission gate",
+          "eyebrow": "same policy",
+          "body": "dangerous check + confirm",
+          "detail": "sleep、npm run build 这类长任务和同步 bash 一样，危险命令先 deny，普通命令要确认。",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "start",
+          "kind": "tool",
+          "label": "start_background",
+          "eyebrow": "bg_manager",
+          "body": "Popen + daemon thread",
+          "detail": "工具启动子进程后立即返回，不阻塞 Agent Loop。stdout 和 stderr 写到 .bg 目录。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "bg-files",
+          "kind": "data",
+          "label": ".bg/<id>.out/.err",
+          "eyebrow": "output files",
+          "body": "background_id + pid",
+          "detail": "observation 会告诉模型 background_id、pid 和输出文件路径；文件一开始可能为空。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        },
+        {
+          "id": "later-cat",
+          "kind": "tool",
+          "label": "later bash cat",
+          "eyebrow": "follow-up",
+          "body": "read .bg output",
+          "detail": "模型需要后续再调 bash(\"cat .bg/<id>.out\") 或 bash(\"kill <pid>\") 查询或停止后台任务。",
+          "position": { "x": 900, "y": 520 },
+          "mobilePosition": { "x": 0, "y": 760 }
+        }
+      ],
+      "edges": [
+        { "id": "ask-gate-edge", "source": "ask-call", "target": "ask-gate", "label": "wrap" },
+        { "id": "gate-choice", "source": "ask-gate", "target": "prompt-choice", "label": "menu" },
+        { "id": "choice-result", "source": "prompt-choice", "target": "ask-result", "label": "selected" },
+        { "id": "bg-gate-edge", "source": "bg-call", "target": "bg-gate", "label": "wrap" },
+        { "id": "bg-start", "source": "bg-gate", "target": "start", "label": "confirmed" },
+        { "id": "start-files", "source": "start", "target": "bg-files", "label": "write streams" },
+        { "id": "files-cat", "source": "bg-files", "target": "later-cat", "label": "query later", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "official-background-lifecycle",
+      "label": "Background lifecycle",
+      "title": "完整后台任务生命周期长什么样",
+      "summary": "正版的后台 bash 不是简单开一个线程，而是一条任务生命周期：同一个 Bash 工具进入后台模式，harness 注册 task，持续写输出，立刻返回 task id，后续读输出、取消和完成通知都围绕这个 id 展开。",
+      "defaultActiveNodeId": "local-task",
+      "nodes": [
+        {
+          "id": "background-call",
+          "kind": "response",
+          "label": "Bash tool_use",
+          "eyebrow": "model",
+          "body": "run_in_background: true",
+          "detail": "正版不是新增一个 bg 工具，而是在同一个 Bash 工具 input 里加后台字段。教学版对应的是 background=True。",
+          "position": { "x": 0, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission-gate",
+          "kind": "runtime",
+          "label": "Permission gate",
+          "eyebrow": "harness",
+          "body": "same bash policy",
+          "detail": "后台模式不绕过权限。危险命令仍先 deny，普通命令仍需要确认；只是在确认后不阻塞等待结束。",
+          "position": { "x": 260, "y": 140 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "local-task",
+          "kind": "runtime",
+          "label": "LocalShellTask",
+          "eyebrow": "task registry",
+          "body": "task id + process handle",
+          "detail": "完整生命周期需要注册一个任务对象：记住 task id、进程句柄、输出路径和运行状态。没有这个 registry，就很难做 status、cancel 和完成通知。",
+          "position": { "x": 520, "y": 140 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "output-file",
+          "kind": "data",
+          "label": "task output file",
+          "eyebrow": "disk output",
+          "body": "stream stdout/stderr",
+          "detail": "输出持续写到任务文件。模型不需要等命令结束，可以稍后用 Read 读取这份输出；教学版用 .bg/<id>.out 和 .bg/<id>.err 模拟这层。",
+          "position": { "x": 780, "y": 140 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "tool-result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "immediate return",
+          "body": "backgroundTaskId + path",
+          "detail": "后台启动成功后马上返回 task id 和输出路径，让模型知道后续该查哪个任务，而不是一直卡在当前 tool call。",
+          "position": { "x": 520, "y": 380 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "follow-up",
+          "kind": "tool",
+          "label": "read / cancel",
+          "eyebrow": "later actions",
+          "body": "read output or kill task",
+          "detail": "完整版本会围绕 task id 做后续操作：读输出、查状态、取消任务。官方没有单独 bg_read/bg_cancel 工具；教学版先让模型 cat 输出文件或 kill pid。",
+          "position": { "x": 780, "y": 380 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "notification",
+          "kind": "response",
+          "label": "completion notification",
+          "eyebrow": "task done",
+          "body": "message back to model",
+          "detail": "真正完整的生命周期还会在任务结束时把完成消息送回模型上下文。Day 5 不做 notification queue，只保留模型主动查询这条最小链路。",
+          "position": { "x": 260, "y": 380 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "bg-permission", "source": "background-call", "target": "permission-gate", "label": "check" },
+        { "id": "permission-task", "source": "permission-gate", "target": "local-task", "label": "confirmed" },
+        { "id": "task-output", "source": "local-task", "target": "output-file", "label": "stream output" },
+        { "id": "task-result", "source": "local-task", "target": "tool-result", "label": "return id", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "result-follow-up", "source": "tool-result", "target": "follow-up", "label": "later", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "output-follow-up", "source": "output-file", "target": "follow-up", "label": "read file", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "task-notification", "source": "local-task", "target": "notification", "label": "done", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "command": "uv run agent-code \"用 echo 工具说 hello\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/xc/my/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-flash\r\n" },
+    { "time": 700, "text": "session: a1b2c3d4e5f6\r\n\r\n" },
+    { "time": 1300, "text": "\u001b[33mtool_call\u001b[0m: echo {'text': 'hello'}\r\n" },
+    { "time": 2100, "text": "\u001b[36mobservation\u001b[0m: hello\r\n" },
+    { "time": 3100, "text": "\u001b[32mfinal\u001b[0m: 已经用 echo 工具说出了 \"hello\"。\r\n" },
+    { "time": 4200, "text": "\r\n$ uv run agent-code -c \"我们上次说了什么\"\r\n" },
+    { "time": 4500, "text": "Agent Code\r\ncwd: /Users/xc/my/agent-code\r\nprovider: anthropic  model: deepseek-v4-flash\r\nsession: a1b2c3d4e5f6 (resumed)\r\n\r\n" },
+    { "time": 5600, "text": "\u001b[32mfinal\u001b[0m: 我们上次用 echo 工具说了 \"hello\"。\r\n" }
+  ]
+}

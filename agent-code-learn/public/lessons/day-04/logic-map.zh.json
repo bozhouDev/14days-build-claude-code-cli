@@ -1,0 +1,292 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 4 · Safe Edit",
+  "subtitle": "这张图只放 Day 4 的核心控制流：写盘前先过 harness 闸门，read-before-edit 消费 Day 3 的记录，确认后再备份旧内容。",
+  "diagrams": [
+    {
+      "id": "write-gate",
+      "label": "Write gate",
+      "title": "写盘前的 harness 闸门",
+      "summary": "模型只能提出 file_write / file_edit 的 tool_use；agent.py intercept block 负责路径边界、读写状态、diff 预览和 y/N 确认。",
+      "defaultActiveNodeId": "intercept",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "response",
+          "label": "tool_use",
+          "eyebrow": "model",
+          "body": "file_write / file_edit",
+          "detail": "模型只表达编辑意图：要写哪个 file_path、content 或 old_string/new_string。它不能直接改磁盘文件。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "intercept",
+          "kind": "tool",
+          "label": "agent.py intercept block",
+          "eyebrow": "harness",
+          "body": "pre-checks before tools.run",
+          "detail": "这是 Day 4 的关键边界：所有写工具先被 agent.py 拦下，通过校验、diff 和确认后，才会落到 ToolRegistry.run。",
+          "position": { "x": 300, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "path",
+          "kind": "data",
+          "label": "resolve_in_cwd",
+          "eyebrow": "gate 1",
+          "body": "lock path inside cwd",
+          "detail": "写工具和读工具一样，先把模型给的相对路径解析进 cwd；逃出 cwd 直接变成 error ToolResult。",
+          "position": { "x": 600, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "read-state",
+          "kind": "data",
+          "label": "read-before-edit",
+          "eyebrow": "gate 2",
+          "body": "ensure + mtime check",
+          "detail": "已有文件的 file_write 和所有 file_edit 都必须先读过；读完后 mtime 变了也会被 check_mtime_conflict 拦住。",
+          "position": { "x": 900, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "replace",
+          "kind": "data",
+          "label": "apply_single_replace",
+          "eyebrow": "file_edit",
+          "body": "dry-run replacement",
+          "detail": "file_edit 在内存里先试跑替换：old_string 为空、找不到、重复匹配或 old==new 都会返回 error，不会展示 diff。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "diff",
+          "kind": "output",
+          "label": "render_diff",
+          "eyebrow": "human review",
+          "body": "unified diff preview",
+          "detail": "diff 是展示给人的，不进入 messages。模型只会看到最终的 ToolResult observation。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "typer.confirm",
+          "eyebrow": "y/N",
+          "body": "user accepts or rejects",
+          "detail": "默认 N。用户按 n 会产生 error: edit rejected by user；用户按 y 才进入真正的工具执行。",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "ToolRegistry.run",
+          "eyebrow": "execute",
+          "body": "write bytes after approval",
+          "detail": "只有所有 gate 通过且用户确认后，harness 才调用原本的 file_write / file_edit 工具函数。",
+          "position": { "x": 0, "y": 320 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "success or structured error",
+          "detail": "路径越界、没读过、mtime 冲突、替换失败、用户拒绝都会以 is_error=True 的 observation 回到模型。",
+          "position": { "x": 0, "y": 540 },
+          "mobilePosition": { "x": 0, "y": 840 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-intercept", "source": "tool-use", "target": "intercept", "label": "intercept" },
+        { "id": "intercept-path", "source": "intercept", "target": "path", "label": "path" },
+        { "id": "path-read-state", "source": "path", "target": "read-state", "label": "safe path" },
+        { "id": "read-state-diff", "source": "read-state", "target": "diff", "label": "file_write content", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "read-state-replace", "source": "read-state", "target": "replace", "label": "file_edit", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "replace-diff", "source": "replace", "target": "diff", "label": "file_edit new_content", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "diff-confirm", "source": "diff", "target": "confirm", "label": "show diff", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-run", "source": "confirm", "target": "tools-run", "label": "y", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "run-result", "source": "tools-run", "target": "result", "label": "ToolResult", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-reject", "source": "confirm", "target": "result", "label": "n -> error", "sourceHandle": "source-bottom", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "read-before-edit",
+      "label": "Read before edit",
+      "title": "ReadFileState 如何变成写前门禁",
+      "summary": "Day 3 的 read_file 只记录 ReadFileState；Day 4 的写工具在落盘前读取这份状态，证明模型见过目标文件且文件没有被外部改动。",
+      "defaultActiveNodeId": "state",
+      "nodes": [
+        {
+          "id": "read-file",
+          "kind": "tool",
+          "label": "read_file",
+          "eyebrow": "Day 3 hook",
+          "body": "read target file",
+          "detail": "模型通常先调用 read_file 看目标内容。Day 3 已经在工具尾部调用 ctx.read_state.record(path, content)。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "record",
+          "kind": "data",
+          "label": "record(path, content)",
+          "eyebrow": "state write",
+          "body": "mtime_ns + char_count",
+          "detail": "ReadFileState 只存 mtime_ns 和字符数。教学版不缓存完整内容，也不做 content-equals 兜底。",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "state",
+          "kind": "data",
+          "label": "ReadFileState.entries",
+          "eyebrow": "memory",
+          "body": "path -> (mtime, chars)",
+          "detail": "这份内存状态是 read-before-edit 的事实依据。每次 agent-code 调用都会重新创建 ToolContext，所以状态只属于本轮会话。",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "write-call",
+          "kind": "response",
+          "label": "write tool_use",
+          "eyebrow": "later",
+          "body": "existing file edit",
+          "detail": "当模型随后请求改已有文件，harness 不相信模型的记忆，而是检查 ReadFileState 里有没有这条 path。",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "ensure",
+          "kind": "data",
+          "label": "ensure_read_before_edit",
+          "eyebrow": "gate",
+          "body": "path in entries?",
+          "detail": "没读过就直接返回 error ToolResult，且不会渲染 diff、不会弹 y/N。",
+          "position": { "x": 300, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "mtime",
+          "kind": "data",
+          "label": "check_mtime_conflict",
+          "eyebrow": "gate",
+          "body": "disk mtime unchanged?",
+          "detail": "读完之后磁盘 mtime 变了就判冲突，引导模型重新 read_file。这个简化避免在旧内容上套新 patch。",
+          "position": { "x": 600, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "continue",
+          "kind": "runtime",
+          "label": "render_diff",
+          "eyebrow": "next",
+          "body": "only after state passes",
+          "detail": "只有 read-before-edit 和 mtime gate 都通过，harness 才计算 new_content 并展示 diff。",
+          "position": { "x": 900, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "read-record", "source": "read-file", "target": "record", "label": "record" },
+        { "id": "record-state", "source": "record", "target": "state", "label": "store" },
+        { "id": "write-ensure", "source": "write-call", "target": "ensure", "label": "before write" },
+        { "id": "state-ensure", "source": "state", "target": "ensure", "label": "lookup", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ensure-mtime", "source": "ensure", "target": "mtime", "label": "read" },
+        { "id": "mtime-continue", "source": "mtime", "target": "continue", "label": "unchanged" }
+      ]
+    },
+    {
+      "id": "backup-safety-net",
+      "label": "Backup safety net",
+      "title": "用户确认后，旧内容如何进入 .agent/history",
+      "summary": "备份发生在工具函数内部、真正 write_text 之前。它不是模型工具，失败也不阻塞用户已经确认的编辑。",
+      "defaultActiveNodeId": "backup",
+      "nodes": [
+        {
+          "id": "approved",
+          "kind": "runtime",
+          "label": "typer.confirm = y",
+          "eyebrow": "human",
+          "body": "edit accepted",
+          "detail": "用户看完 diff 后按 y，agent.py 才会让请求落到真实工具函数。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "write-tools",
+          "kind": "tool",
+          "label": "file_write / file_edit",
+          "eyebrow": "tool",
+          "body": "prepare to write",
+          "detail": "file_write 只在目标已存在时备份；file_edit 读到旧内容后立即备份。",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "backup",
+          "kind": "data",
+          "label": "file_history.backup",
+          "eyebrow": "harness",
+          "body": "snapshot old_content",
+          "detail": "backup 是 harness 的全局安全网，不注册进 ToolRegistry，模型不能调用、也不知道它存在。",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "history",
+          "kind": "output",
+          "label": ".agent/history/<rel>/<ts>",
+          "eyebrow": "disk",
+          "body": "timestamped snapshot",
+          "detail": "备份路径按相对文件路径和 UTC 毫秒时间戳组织，便于课后扩展 restore 或容量上限。",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "write-text",
+          "kind": "tool",
+          "label": "Path.write_text",
+          "eyebrow": "world",
+          "body": "write new_content",
+          "detail": "备份失败会被吞掉，不阻塞已经确认的编辑；真正写盘仍由工具函数完成。",
+          "position": { "x": 600, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "refresh",
+          "kind": "data",
+          "label": "read_state.record",
+          "eyebrow": "refresh",
+          "body": "new mtime + chars",
+          "detail": "写盘成功后刷新 read_state，让同一轮后续编辑基于最新版本继续通过 read-before-edit。",
+          "position": { "x": 300, "y": 340 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "ToolResult",
+          "eyebrow": "observation",
+          "body": "Wrote / Edited",
+          "detail": "模型看到的仍然只是普通工具结果，例如 Wrote 18 chars 或 Edited hello.txt；备份细节不进入 observation。",
+          "position": { "x": 0, "y": 340 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "approved-tools", "source": "approved", "target": "write-tools", "label": "run" },
+        { "id": "tools-backup", "source": "write-tools", "target": "backup", "label": "old_content" },
+        { "id": "backup-history", "source": "backup", "target": "history", "label": "snapshot" },
+        { "id": "backup-write", "source": "backup", "target": "write-text", "label": "then write", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "write-refresh", "source": "write-text", "target": "refresh", "label": "record", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "refresh-result", "source": "refresh", "target": "result", "label": "return", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    }
+  ]
+}

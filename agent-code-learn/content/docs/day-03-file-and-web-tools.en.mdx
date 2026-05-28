@@ -1,0 +1,720 @@
+---
+title: "Day 3 — File Tools + Web Tools"
+description: "Day 2 hooked up a real model, but the Agent is still blind. Today it gets eyes: read_file / list_files / glob / grep / project_tree to see code, plus web_fetch / web_search to see the world — every tool living inside a strict cwd boundary."
+---
+
+Day 2 wired up a real model and tool calling, but the Agent is still blind — it can't see project code, and it can't reach the outside world. Today we give it eyes.
+
+Local first: `read_file` reads files, `list_files` lists a directory, `glob` finds files by name, `grep` searches by content, `project_tree` paints a single panoramic structure. Then the outside: `web_fetch` pulls a webpage, `web_search` runs a query.
+
+By the end, ask it "where is this project's entry point?" — it'll `list_files` → `read_file pyproject.toml` → answer. Ask "what are the 4 most important rules in PEP 8?" — it'll `web_fetch` the page → answer. About 600 lines total, ~400 new.
+
+---
+
+### Day 3 main visual — File + Web tool harness boundaries
+
+Start with the `fs_safety gate` diagram: from Day 3 on, the <Concept name="Harness">harness</Concept> runs `resolve_in_cwd` → `ensure_text_file` → `ensure_within_size` before any file tool touches the disk; the tool implementations stop repeating these checks. `ReadFileState.record()` is the hook planted for Day 4's read-before-edit; `Web boundary` shows how outside information becomes a bounded `ToolResult`.
+
+<AgentLogicMap mapPath="/lessons/day-03/logic-map.json" />
+
+---
+
+Today we keep editing Day 2's `agent-code` project. `packages/day-*` snapshots are reference answers, not directories you create each day.
+
+## Setup — today's starting point
+
+Day 2 gave us `AnthropicProvider`, the multi-step Agent Loop, and tools `echo` and `system_date`. Today we add four things around that skeleton:
+
+- A new module `fs_safety.py` that centralizes the "filesystem boundary".
+- Seven new tools: `read_file`, `list_files`, `glob`, `grep`, `project_tree`, `web_fetch`, `web_search`.
+- Tool signatures gain a `ctx: ToolContext` argument so tools can see `cwd`, skip rules, and `ReadFileState` — the **runtime context**.
+- Two new dependencies: `pathspec` (for `.gitignore`) and `html2text` (HTML → markdown). `httpx` was already added on Day 2.
+
+Install:
+
+```bash
+uv add pathspec html2text
+```
+
+Heads-up: v1 will extend `Tool.run`'s signature to `Callable[[dict, ToolContext], str]`. That means Day 2's `echo` and `system_date` need a `ctx` parameter added. The logic stays — only the signature lines up.
+
+---
+
+## v1 — `read_file` + `list_files`
+
+Give the Agent the ability to read one file, and list one directory. This pass lays out the whole `fs_safety.py` skeleton in one go: cwd boundary, text detection, single-file size cap, output truncation, skip rules, `ReadFileState`. Skip rules must be there from the start — otherwise `list_files` on a project root pumps `.venv/`, `__pycache__/`, `.git/` straight into context.
+
+### 1.1 Create `agent_code/fs_safety.py`
+
+This is today's first new file. Its responsibility is narrow: **every tool that touches files asks for a safe `Path`, or a truncated string, from here.**
+
+```python
+# Text-file suffix allowlist: pass through, no need to peek headers.
+TEXT_SUFFIXES = {
+    ".py", ".pyi", ".md", ".rst", ".txt", ".toml", ".yaml", ".yml", ".json",
+    ".cfg", ".ini", ".env", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx",
+    ".jsx", ".html", ".css", ".sql", ".lock", ".gitignore",
+}
+
+MAX_READ_BYTES = 256 * 1024     # Single-file cap, aligned with Claude Code.
+DEFAULT_MAX_CHARS = 8000        # Single-observation cap.
+DEFAULT_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "dist", "build",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+```
+
+Four key functions:
+
+```python
+def resolve_in_cwd(cwd: Path, user_path: str) -> Path:
+    # Resolve the relative path the model gave us into an absolute path, locked into cwd.
+    candidate = (cwd / user_path).resolve()
+    cwd_resolved = cwd.resolve()
+    try:
+        candidate.relative_to(cwd_resolved)
+    except ValueError as exc:
+        raise ValueError(f"path escapes cwd: {user_path}") from exc
+    return candidate
+
+
+def ensure_text_file(path: Path) -> None:
+    # Allowlisted suffix passes; otherwise peek 1 KB — a NUL byte means binary.
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return
+    with path.open("rb") as f:
+        if b"\x00" in f.read(1024):
+            raise ValueError(f"binary file: {path.name}")
+
+
+def truncate_output(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n[truncated {len(text) - max_chars} chars]"
+```
+
+`ReadFileState` is today's only stateful object, but it only exposes `record()`:
+
+```python
+@dataclass
+class ReadFileState:
+    # path -> (mtime_ns, char_count). Day 4's read-before-edit will diff this against disk mtime.
+    entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
+
+    def record(self, path: Path, content: str) -> None:
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return
+        self.entries[path] = (mtime_ns, len(content))
+```
+
+`SkipPolicy`, `should_skip()`, and `ensure_within_size()` finish the v1 skeleton. Full version in the DiffCard below.
+
+### 1.2 Edit `tools.py` — introduce `ToolContext`
+
+Tools now need to know the current cwd, skip rules, and `ReadFileState`. We don't make each tool poke globals — we wrap a `ToolContext` dataclass that the Agent Loop passes in explicitly:
+
+```python
+@dataclass
+class ToolContext:
+    # Runtime context. Day 3 carries cwd, skip rules, ReadFileState; later days will pack more.
+    cwd: Path
+    skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
+    read_state: ReadFileState = field(default_factory=ReadFileState)
+
+
+ToolFunc = Callable[[dict[str, Any], ToolContext], str]
+```
+
+> Order matters: `class ToolContext` first, `ToolFunc = Callable[..., ToolContext, ...]` second. The second line is plain assignment — Python resolves `ToolContext` at definition time, so it must already exist.
+
+Day 2's `echo` and `system_date` get the `ctx` parameter (logic unchanged). After `system_date`, add `read_file` and `list_files`:
+
+```python
+def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
+    path_str = args.get("path", "")
+    if not path_str:
+        return "error: missing required argument 'path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+        ensure_text_file(path)
+        ensure_within_size(path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, IsADirectoryError, ValueError) as exc:
+        return f"error: {exc}"
+    # Record what the model saw — Day 4's read-before-edit needs this.
+    ctx.read_state.record(path, text)
+    return truncate_output(text)
+
+
+def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
+    path_str = args.get("path", ".")
+    try:
+        base = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not base.is_dir():
+        return f"error: not a directory: {path_str}"
+    entries: list[str] = []
+    for child in sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
+        rel = child.relative_to(ctx.cwd)
+        if should_skip(rel, ctx.skip_policy):
+            continue
+        entries.append(f"{child.name}/" if child.is_dir() else child.name)
+    return truncate_output("\n".join(entries) or "(empty)")
+```
+
+`ToolRegistry.run()` takes a `ctx` parameter and threads it into `tool.run()`:
+
+```python
+def run(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
+    tool = self._tools.get(call.name)
+    if tool is None:
+        return ToolResult(tool_call_id=call.id, content=f"unknown tool: {call.name}", is_error=True)
+    return ToolResult(tool_call_id=call.id, content=tool.run(call.arguments, ctx))
+```
+
+`default_tools()` appends `read_file` and `list_files` schemas after `system_date` — full version in the DiffCard.
+
+### 1.3 Edit `agent.py` — thread `cwd` through the Agent Loop
+
+`run_agent` takes one more parameter (`cwd`), builds a `ToolContext`, and passes it into `tools.run`:
+
+```python
+def run_agent(
+    prompt: str,
+    provider: ModelProvider,
+    tools: ToolRegistry,
+    max_steps: int = 8,
+    cwd: Path | None = None,
+) -> AgentResult:
+    # Single construction point for ToolContext. All tools get cwd and later runtime state via ctx.
+    ctx = ToolContext(cwd=cwd or Path.cwd())
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    # ...inside the for-loop, change tools.run(call) to tools.run(call, ctx)...
+```
+
+The `_assistant_message` and `_tool_result_message` helpers don't change.
+
+### 1.4 Edit `cli.py`
+
+In `run_once()`, add `, cwd=cwd` to the `run_agent` call:
+
+```python
+result = run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd)
+```
+
+The REPL branch already threads provider/model/base_url/max_steps from Day 2's finishing touches — nothing to change.
+
+### 1.5 Run it
+
+```bash
+$ uv run agent-code "Use read_file on pyproject.toml; tell me the project name"
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-flash
+
+tool_call: read_file {'path': 'pyproject.toml'}
+observation: [project]
+name = "agent-code"
+...
+final: The project name is agent-code.
+```
+
+```bash
+$ uv run agent-code "Use list_files on the project root"
+...
+tool_call: list_files {'path': '.'}
+observation: agent_code/
+tests/
+README.md
+pyproject.toml
+uv.lock
+final: The top-level directory has agent_code/, tests/, README.md, pyproject.toml, uv.lock.
+```
+
+Note the second `observation` has **no** `.venv/`, `__pycache__/`, or `.git/` — those exist on your machine but `SkipPolicy` filtered them out.
+
+<DiffCard 
+  diffPath="/lessons/day-03/diffs/v1-read-list.diff" 
+  title="v1 — fs_safety skeleton + ToolContext + read_file / list_files" 
+  description="Create fs_safety.py to centralize the filesystem boundary; tools.py introduces ToolContext and extends ToolFunc to (dict, ToolContext) → str; agent.py builds ctx at one point; cli.py threads cwd into run_agent." 
+/>
+
+v1 can read files and list directories. But ask "which files contain TODO?" and the model is stuck — it can't search by filename pattern or content. v2 fixes that.
+
+---
+
+## v2 — `glob` + `grep` + `.gitignore` filtering
+
+Three things this pass:
+
+- Wire `.gitignore` into `SkipPolicy` so skip rules aren't just a hardcoded list.
+- Add `glob` (search by filename) and `grep` (search by content). `grep` prefers `ripgrep`, falling back to pure Python.
+- Fix a protocol pitfall v1 left open: from v2 on the model may parallel-call multiple tools per round, and all `tool_result` blocks must batch into **one** user message.
+
+### 2.1 Edit `fs_safety.py` — `load_gitignore` + extended `SkipPolicy`
+
+Add `import pathspec` up top. `SkipPolicy` gains a `gitignore` field:
+
+```python
+@dataclass
+class SkipPolicy:
+    skip_dirs: frozenset[str] = DEFAULT_SKIP_DIRS
+    gitignore: pathspec.PathSpec | None = None
+
+    @classmethod
+    def default(cls, gitignore: pathspec.PathSpec | None = None) -> "SkipPolicy":
+        return cls(gitignore=gitignore)
+```
+
+`should_skip` adds a gitignore check. At the end of the file, add `load_gitignore`:
+
+```python
+def load_gitignore(cwd: Path) -> pathspec.PathSpec | None:
+    # Only reads cwd's root .gitignore; nested gitignores are a stretch challenge.
+    gitignore = cwd / ".gitignore"
+    if not gitignore.exists():
+        return None
+    lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
+    return pathspec.PathSpec.from_lines("gitwildmatch", lines)
+```
+
+### 2.2 Edit `tools.py` — add `glob` and `grep`
+
+Add `re` / `shutil` / `subprocess` imports. `glob` walks `ctx.cwd.rglob(pattern)`, passes everything through `should_skip`, sorts by mtime desc, and caps at 200:
+
+```python
+def glob(args: dict[str, Any], ctx: ToolContext) -> str:
+    pattern = args.get("pattern", "")
+    if not pattern:
+        return "error: missing required argument 'pattern'"
+    matches: list[Path] = []
+    for path in ctx.cwd.rglob(pattern):
+        rel = path.relative_to(ctx.cwd)
+        if should_skip(rel, ctx.skip_policy):
+            continue
+        matches.append(path)
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    matches = matches[:200]
+    lines = [str(p.relative_to(ctx.cwd)) for p in matches]
+    return truncate_output("\n".join(lines) or "(no matches)")
+```
+
+`grep` prefers `ripgrep`, falls back to pure Python:
+
+```python
+def grep(args: dict[str, Any], ctx: ToolContext) -> str:
+    pattern = args.get("pattern", "")
+    if not pattern:
+        return "error: missing required argument 'pattern'"
+    path_arg = args.get("path", ".")
+    glob_arg = args.get("glob")
+    ignore_case = bool(args.get("ignore_case", False))
+    try:
+        base = resolve_in_cwd(ctx.cwd, path_arg)
+    except ValueError as exc:
+        return f"error: {exc}"
+    # ripgrep is an order of magnitude faster if available.
+    if shutil.which("rg"):
+        return _grep_ripgrep(pattern, base, glob_arg, ignore_case, ctx)
+    return _grep_python(pattern, base, glob_arg, ignore_case, ctx)
+```
+
+`_grep_ripgrep` translates our custom skip set into `--glob '!pattern/**'` and slices absolute prefixes off the output for the model. `_grep_python` uses `re.compile` + `Path.rglob` as a fallback. Both keep the output format identical: `path:line:content`.
+
+### 2.3 Edit `agent.py` — wire `.gitignore`, batch round-tool_result into one message
+
+Add `from .fs_safety import SkipPolicy, load_gitignore`. Replace v1's single-line ctx construction with three:
+
+```python
+resolved_cwd = cwd or Path.cwd()
+ctx = ToolContext(
+    cwd=resolved_cwd,
+    skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
+)
+```
+
+The second change is the bigger one. v1's inner loop ("`append` a user message per tool call") breaks as soon as `grep` ships. Run `uv run agent-code "use grep to find every TODO and summarize"` and you'll see:
+
+```txt
+BadRequestError: 400 - messages.1:`tool_use` ids were found without
+`tool_result` blocks immediately after: call_01_... Each `tool_use` block
+must have a corresponding `tool_result` block in the next message.
+```
+
+The Anthropic Messages API requires: every <Concept name="Tool Call">tool_use</Concept> in one assistant message must have its matching <Concept name="Tool Result">tool_result</Concept> in **the very next** user message. Once `grep` ships the model often parallel-calls several tools per round (DeepSeek's `/anthropic` gateway translates the underlying OpenAI `tool_calls: [...]` and is naturally parallel-leaning), and a one-result-per-message approach gets rejected.
+
+The fix decouples "how many tools were called" from "how many messages were sent". The model decides how many tools, but the harness only adds **one** user message per assistant round, with all `tool_result` content blocks batched in. Replace v1's inner loop with:
+
+```python
+tool_result_blocks: list[dict[str, Any]] = []
+for call in response.tool_calls:
+    trace.append(f"tool_call: {call.name} {call.arguments}")
+    result = tools.run(call, ctx)
+    trace.append(f"observation: {result.content}")
+    tool_result_blocks.append(
+        {
+            "type": "tool_result",
+            "tool_use_id": result.tool_call_id,
+            "content": result.content,
+            "is_error": result.is_error,
+        }
+    )
+messages.append({"role": "user", "content": tool_result_blocks})
+```
+
+Day 2's `_tool_result_message` was built around "one result per message", so from this point on the Agent Loop stops calling it. Keep or delete it — both fine.
+
+### 2.4 Two acceptance runs
+
+```bash
+$ uv run agent-code "Use grep to find every TODO and summarize"
+...
+tool_call: grep {'pattern': 'TODO'}
+observation: agent_code/cli.py:42:    # TODO: introduce slash command registry
+final: There's one TODO: cli.py line 42 plans a slash command registry.
+```
+
+```bash
+$ uv run agent-code "Use glob to find every Python file; count them"
+...
+tool_call: glob {'pattern': '**/*.py'}
+observation: agent_code/cli.py
+agent_code/tools.py
+agent_code/agent.py
+agent_code/model.py
+agent_code/fs_safety.py
+agent_code/__init__.py
+tests/test_smoke.py
+final: 7 Python files total.
+```
+
+Exact hits and counts vary by project. With `ripgrep` installed it runs as a subprocess; without it falls back to pure Python. Output format stays identical — easy for the model to parse.
+
+### 2.5 Negative check — cwd escape is rejected
+
+Try a deliberately escaping path to verify `resolve_in_cwd`:
+
+```bash
+$ uv run agent-code "Please read_file ../../../etc/passwd"
+...
+tool_call: read_file {'path': '../../../etc/passwd'}
+observation: error: path escapes cwd: ../../../etc/passwd
+final: That path is outside the working directory; the tool refused to read it.
+```
+
+<DiffCard 
+  diffPath="/lessons/day-03/diffs/v1-to-v2.diff" 
+  title="v2 — gitignore + glob + grep + batched tool_result" 
+  description="fs_safety.py wires in pathspec for .gitignore; tools.py adds glob / grep (ripgrep-preferred, Python fallback); agent.py rewrites the inner loop into one user message per round, fixing the Anthropic 400 error." 
+/>
+
+Local tools can now read, list, search by name, and search by content — all under cwd boundary and `.gitignore`. v3 adds one more convenience: the whole project layout in one shot.
+
+---
+
+## v3 — `project_tree`
+
+`list_files` only sees one layer. To explore the whole project the model calls it repeatedly, burning tokens. `project_tree` is a "high-density panorama" tool: one call, a depth-capped directory tree.
+
+### 3.1 Edit `tools.py` — add `project_tree`
+
+After `grep`, add:
+
+```python
+def project_tree(args: dict[str, Any], ctx: ToolContext) -> str:
+    max_depth = int(args.get("max_depth", 3))
+    max_nodes = 200
+    lines: list[str] = [f"{ctx.cwd.name}/"]
+    nodes = 0
+
+    def walk(directory: Path, depth: int) -> None:
+        nonlocal nodes
+        if depth > max_depth:
+            return
+        children = sorted(
+            (
+                c for c in directory.iterdir()
+                if not should_skip(c.relative_to(ctx.cwd), ctx.skip_policy)
+            ),
+            key=lambda p: (not p.is_dir(), p.name),
+        )
+        for child in children:
+            if nodes >= max_nodes:
+                if nodes == max_nodes:
+                    lines.append("  " * depth + "...[truncated]")
+                    nodes += 1
+                return
+            suffix = "/" if child.is_dir() else ""
+            lines.append("  " * depth + child.name + suffix)
+            nodes += 1
+            if child.is_dir():
+                walk(child, depth + 1)
+
+    walk(ctx.cwd, 1)
+    return truncate_output("\n".join(lines))
+```
+
+`default_tools()` appends `project_tree` (schema's `max_depth` defaults to 3).
+
+### 3.2 Run it
+
+```bash
+$ uv run agent-code "Use project_tree to sketch the structure, max_depth=2"
+...
+tool_call: project_tree {'max_depth': 2}
+observation: your-project/
+  agent_code/
+    __init__.py
+    agent.py
+    cli.py
+    fs_safety.py
+    model.py
+    tools.py
+  README.md
+  pyproject.toml
+  uv.lock
+final: ...
+```
+
+200 node cap, depth-3 default, then `truncate_output` on top. Even a 100k-file repo won't blow the context.
+
+<DiffCard 
+  diffPath="/lessons/day-03/diffs/v2-to-v3.diff" 
+  title="v3 — project_tree panorama" 
+  description="Only touches tools.py: add project_tree (double-capped on max_depth and max_nodes, dir-first sort), and register a Tool with a max_depth schema in default_tools." 
+/>
+
+Local capabilities are complete: read, list, name-search, content-search, draw the whole tree. Next, give the Agent the ability to go online.
+
+---
+
+## v4 — `web_fetch` + `web_search`
+
+The Agent so far only sees code inside cwd. To fetch information from the outside world we need two pieces:
+
+- `web_fetch`: take a URL, pull the page body, convert to markdown for the model.
+- `web_search`: take a query, return top N results (title + URL).
+
+Neither tool lets the model touch the network directly. The model only says "I want this URL" or "I want this query"; the actual URL validation, timeouts, content-type routing, and result cleanup all live inside the harness tools.
+
+### 4.1 Edit `tools.py` — add `web_fetch`
+
+Add `from urllib.parse import parse_qs, unquote, urlparse` / `import html2text` / `import httpx` imports. After `project_tree`, add the web constants and helpers:
+
+```python
+# Hard constraints for web tools live here, like fs_safety constants — never leak to callers.
+WEB_USER_AGENT = "agent-code/0.1 (+https://example.com/agent-code)"
+WEB_FETCH_MAX_BYTES = 10 * 1024 * 1024
+WEB_FETCH_MAX_CHARS = 20_000
+WEB_URL_MAX_LENGTH = 2000
+WEB_FETCH_TIMEOUT_S = 30.0
+WEB_SEARCH_TIMEOUT_S = 15.0
+
+
+def _validate_url(url: str) -> None:
+    # URL validation is web_fetch's first gate; every failure happens before httpx fires.
+    if len(url) > WEB_URL_MAX_LENGTH:
+        raise ValueError(f"url too long: {len(url)} > {WEB_URL_MAX_LENGTH}")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported scheme: {parsed.scheme or '(none)'}")
+    if parsed.username or parsed.password:
+        raise ValueError("url with credentials is not allowed")
+    if not parsed.hostname or "." not in parsed.hostname:
+        raise ValueError(f"invalid hostname: {parsed.hostname}")
+```
+
+`_validate_url` does four things before `httpx.get(...)`: length cap, scheme check, no credentials, sane hostname. These belong inside the tool — never expect the model to "just send a valid URL", because models hallucinate.
+
+`web_fetch` body:
+
+```python
+def web_fetch(args: dict[str, Any], ctx: ToolContext) -> str:
+    url = args.get("url", "")
+    if not url:
+        return "error: missing required argument 'url'"
+    try:
+        _validate_url(url)
+    except ValueError as exc:
+        return f"error: {exc}"
+    headers = {"User-Agent": WEB_USER_AGENT, "Accept": "text/html,text/*;q=0.9,*/*;q=0.5"}
+    try:
+        with httpx.Client(timeout=WEB_FETCH_TIMEOUT_S, follow_redirects=True) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return f"error: {exc}"
+    if len(resp.content) > WEB_FETCH_MAX_BYTES:
+        return f"error: response too large: {len(resp.content)} > {WEB_FETCH_MAX_BYTES}"
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/html" in content_type or "application/xhtml" in content_type:
+        body = _html_to_markdown(resp.text)
+    elif content_type.startswith("text/") or "json" in content_type or "xml" in content_type:
+        body = resp.text
+    else:
+        return f"error: unsupported content-type: {content_type or '(none)'}"
+    return truncate_output(body, max_chars=WEB_FETCH_MAX_CHARS)
+```
+
+HTML goes through `html2text` to markdown; plain text / JSON / XML passes through; anything else gets rejected. `_html_to_markdown` disables `body_width` hard-wrapping so paragraphs stay long — friendlier for the model's context.
+
+### 4.2 Edit `tools.py` — add `web_search`
+
+`web_search` isn't a search engine. The teaching version does one thing: pull titles and real URLs out of DuckDuckGo HTML results into a list the model can read.
+
+Two small gotchas worth surfacing:
+
+- DuckDuckGo result links are often not the destination URL — they're redirector links like `/l/?uddg=ENCODED_URL&rut=...`. `_unwrap_ddg_url()` parses `uddg` out.
+- The HTML endpoint has no stable API schema; we regex-grab `result__a` anchors. Good enough for teaching, but production should switch to Tavily / Serper / Brave or another real search API.
+
+```python
+def _unwrap_ddg_url(href: str) -> str:
+    # DuckDuckGo HTML endpoint hrefs look like /l/?uddg=ENCODED_URL&rut=...
+    if "/l/" not in href:
+        return href
+    parsed = urlparse(href if href.startswith("http") else f"https:{href}")
+    params = parse_qs(parsed.query)
+    if "uddg" in params:
+        return unquote(params["uddg"][0])
+    return href
+```
+
+`_duckduckgo_search` uses one regex to harvest all `result__a` hrefs + titles, and `web_search` wraps them into `- title\n  URL` lines — full version in the DiffCard.
+
+### 4.3 Two acceptance runs
+
+Fetch a page:
+
+```bash
+$ uv run agent-code "Use web_fetch on https://peps.python.org/pep-0008/ and tell me the 4 most important rules"
+...
+tool_call: web_fetch {'url': 'https://peps.python.org/pep-0008/'}
+observation: # PEP 8 – Style Guide for Python Code
+  * Author: Guido van Rossum ...
+...
+final: The top 4 rules roughly are:
+1. 4 spaces per indent, never mix tabs and spaces.
+2. 79 chars per line, 72 for docstrings/comments.
+3. Two blank lines between top-level defs; one between class methods.
+4. Lowercase_with_underscores for modules; CapWords for classes; UPPER_SNAKE for constants.
+```
+
+Search for something:
+
+```bash
+$ uv run agent-code "Use web_search for 'uv python package manager release notes'; give me top 3"
+...
+tool_call: web_search {'query': 'uv python package manager release notes', 'max_results': 3}
+observation: - astral-sh/uv: An extremely fast Python package and project manager...
+  https://github.com/astral-sh/uv
+- Releases · astral-sh/uv · GitHub
+  https://github.com/astral-sh/uv/releases
+- Changelog | uv - Astral
+  https://docs.astral.sh/uv/reference/changelog/
+final: The canonical entrypoint for uv release notes is the GitHub Releases page https://github.com/astral-sh/uv/releases.
+```
+
+Search results drift by time and region; the DuckDuckGo HTML endpoint occasionally fights bots. As long as you see one `tool_call: web_search` line and `- title\n  URL` formatted observations, the tool chain works.
+
+<DiffCard 
+  diffPath="/lessons/day-03/diffs/v3-to-final.diff" 
+  title="v4 — web_fetch + web_search" 
+  description="Only tools.py: six web constants + _validate_url / _html_to_markdown / web_fetch / _unwrap_ddg_url / _duckduckgo_search / web_search, plus two more registrations in default_tools." 
+/>
+
+---
+
+### Terminal replay
+
+Here's `agent-code "Use read_file on pyproject.toml..."` end-to-end:
+
+<TerminalReplay tracePath="/lessons/day-03/traces/read-pyproject.json" />
+
+---
+
+## What you have today
+
+- **`fs_safety` boundary**: cwd locking, binary rejection, single-file 256 KiB cap, output truncation, skip rules — all in one file. Tool implementations never repeat these checks.
+- **`read_file` + `ReadFileState`**: the Agent reads project content for the first time, and every read is captured by the harness — ready for Day 4's read-before-edit.
+- **`list_files` / `project_tree`**: the Agent "sees" the project structure for the first time, with `.venv/` / `__pycache__/` noise kept out of context by default.
+- **`glob` / `grep`**: search by name and content, both respecting cwd and `.gitignore`; `grep` prefers ripgrep with a pure-Python fallback.
+- **`web_fetch` / `web_search`**: the Agent reaches outside for the first time; URL validation, timeouts, size limits, HTML→markdown, result truncation are all inside the tool.
+- **`ToolContext`**: tool signatures now carry "runtime context" as an abstraction. Day 3 ships `cwd / skip_policy / read_state`; later days stuff permission modes and session info in without touching every tool's signature.
+
+---
+
+## FAQ
+
+**`ModuleNotFoundError: No module named 'pathspec'` or `'html2text'`**
+
+Two new dependencies today. One-time fix:
+
+```bash
+uv add pathspec html2text
+```
+
+**`web_fetch` raises `httpx.ConnectError`**
+
+Usually a proxy issue. Day 2 installed `httpx[socks]`; `httpx` picks up `ALL_PROXY` / `HTTPS_PROXY` automatically. In the shell, `export ALL_PROXY=socks5://127.0.0.1:1080` (adapt to your proxy) and retry.
+
+**`web_search` returns `(no results)` or keeps 502-ing**
+
+The DuckDuckGo HTML endpoint has no official API and isn't long-term stable. The teaching version uses it as a fallback. If it rate-limits, retry later, or swap to a real search API (Tavily / Serper / Brave — see challenges).
+
+**`web_fetch` keeps getting truncated**
+
+`WEB_FETCH_MAX_CHARS = 20_000` is an intentional cap — model context isn't free. Raise the constant or fetch in chunks (challenges).
+
+**`.gitignore` in a parent or subdirectory doesn't apply**
+
+Day 3's `load_gitignore(cwd)` only reads the `.gitignore` at the cwd root — kept simple for teaching. Nested gitignores (one per subdirectory) are a challenge.
+
+To pick up a parent's `.gitignore`, the easiest workaround is `agent-code --cwd /that/parent ...`.
+
+**Hitting a binary file gives `binary file: foo.bin`**
+
+`ensure_text_file` is rejecting it: allowlisted suffixes pass; other files get a 1 KB peek and a NUL byte means binary.
+
+If you know the file is text (e.g. a custom suffix-less script), the quickest fix is renaming with `.txt` or the proper code suffix.
+
+**Large file rejected with `file too large: ... > 262144`**
+
+`ensure_within_size` is gating it. Intentional: a single file over 256 KiB read whole would blow the context. Use `grep` for specific lines, or have the model tell the harness which slice it wants and call `read_file` with `offset` / `limit` (the challenge).
+
+---
+
+## Challenges
+
+- [ ] **Challenge 1**: add `offset` and `limit` parameters to `read_file`; truncate by line, not by total bytes; when a file exceeds `MAX_READ_BYTES`, nudge the model toward offset/limit.
+- [ ] **Challenge 2**: add `output_mode` (`content` / `files_with_matches` / `count`) and `head_limit` to `grep`, taming output on huge repos; compare against the official `GrepTool` shape.
+- [ ] **Challenge 3**: support nested `.gitignore` — walk up from the matched file's directory, merging each level's matcher.
+- [ ] **Challenge 4**: add a `hex_preview` tool that gives a first-N-byte hex dump for files `ensure_text_file` rejected.
+- [ ] **Challenge 5**: give `web_fetch` a 15-minute in-memory LRU cache; on hit, return cached markdown to save tokens on repeat fetches.
+- [ ] **Challenge 6**: swap `html2text` for `readability-lxml` or `trafilatura` and compare body extraction quality on the same PEP page.
+- [ ] **Challenge 7**: extract `web_search` into a provider interface; add a real-API provider using `TAVILY_API_KEY` or `SERPER_API_KEY` and pick by availability in `ctx`.
+- [ ] **Challenge 8**: add allow / deny domain lists (env-driven) to `web_fetch`; deny hits get rejected — a dry run for Day 5's permission system.
+
+---
+
+## Thinking questions
+
+A few open-ended questions. Try to answer each in one sentence before reading on.
+
+1. **Why centralize every "filesystem boundary" — cwd locking, binary detection, single-file size, output truncation, skip rules — into one `fs_safety.py`?** What goes wrong if `read_file`, `list_files`, and `grep` each handle their own version?
+
+2. **What role does `ToolContext` play in the harness?** Why not let each tool call `Path.cwd()` or read an `AGENT_CWD` env var directly?
+
+3. **`read_file` records `(mtime_ns, char_count)` into `ReadFileState`, but no Day 3 code reads it back. Is this overengineering?**
+
+4. **What checks does `web_fetch` run before the actual `httpx.get(...)`?** Why must they live inside the tool — can't the model "just send a valid URL"?
+
+---
+
+## Tomorrow
+
+Today the Agent can "see" code and "see" the outside world: read files, list directories, find by name, search by content, fetch pages, run searches.
+
+Tomorrow we let it "change" code — but **not by giving the model raw write access**. The model will call `file_edit(file_path, old_string, new_string)` or `file_write(file_path, content)`; before the bytes hit disk, the harness checks whether the model has actually read the target (using today's `ReadFileState`), renders a diff, and prompts you y/n. Today's `read_file` is tomorrow's basis for read-before-edit, and `fs_safety` remains the final boundary before any write.

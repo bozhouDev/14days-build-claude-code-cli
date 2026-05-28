@@ -1,0 +1,306 @@
+--- /dev/null
++++ agent_code/permissions.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from pathlib import Path
++
++
++@dataclass
++class PermissionRequest:
++    """一次工具调用的权限请求。工具只描述意图，是否执行交给 harness 决定。"""
++    tool_name: str
++    args: dict
++    mode: str
++    cwd: Path
++
++
++@dataclass
++class PermissionDecision:
++    """权限引擎的决策结果。behavior 是 allow / ask / deny 之一。"""
++    behavior: str  # "allow" | "ask" | "deny"
++    message: str | None = None  # deny 或 ask 时的说明文字
++
++
++# 教学版危险命令列表——对应生产级 bashSecurity 2600 行的一个最小子集
++_DANGEROUS_PATTERNS: list[tuple[str, str]] = [
++    (r"rm\s+-rf", "rm -rf is destructive"),
++    (r"rm\s+-fr", "rm -fr is destructive"),
++    (r"\bsudo\b", "sudo grants root access"),
++    (r"chmod\s+-R", "chmod -R is recursive permission change"),
++    (r"(curl|wget).*\|.*(sh|bash|zsh)\b", "downloaded script execution may execute untrusted code"),
++    (r"git\s+push\s+.*--force", "git push --force overwrites remote history"),
++    (r"git\s+push\s+-f", "git push -f overwrites remote history"),
++    (r"\bgit\s+push\b", "git push publishes local changes to a remote"),
++    (r"git\s+reset\s+--hard", "git reset --hard discards uncommitted changes"),
++]
++
++
++def _is_dangerous(command: str) -> str | None:
++    """检查命令是否匹配危险模式。返回 None 表示安全，返回字符串表示危险原因。"""
++    for pattern, reason in _DANGEROUS_PATTERNS:
++        if re.search(pattern, command, re.IGNORECASE):
++            return reason
++    return None
++
++
++# 只读工具白名单——这些工具默认 allow，不走 ask 弹窗
++_READONLY_TOOLS = frozenset({
++    "read_file", "list_files", "glob", "grep", "project_tree",
++    "git_status", "git_diff",
++    "system_date", "echo",
++})
++
++# 交互和网络都不是写入，但仍需要用户知道 Agent 正在停下来问人或访问外部资源。
++_ASK_TOOLS = frozenset({"ask_user_question", "web_fetch", "web_search"})
++
++
++def decide_permission(request: PermissionRequest) -> PermissionDecision:
++    """权限引擎入口：根据工具名、参数和当前模式决定 allow / ask / deny。"""
++    tool_name = request.tool_name
++    args = request.args
++    mode = request.mode
++
++    if tool_name in _ASK_TOOLS:
++        return PermissionDecision("ask")
++
++    # plan 模式：只允许只读工具。写类工具一律 deny。
++    if mode == "plan":
++        if tool_name in _READONLY_TOOLS:
++            return PermissionDecision("allow")
++        return PermissionDecision(
++            "deny",
++            f"plan mode: {tool_name} is not allowed. Only read-only tools can run in plan mode.",
++        )
++
++    # 只读工具在所有模式下默认允许
++    if tool_name in _READONLY_TOOLS:
++        return PermissionDecision("allow")
++
++    # bash 工具的危险命令检测——不管什么模式，危险命令先拦截
++    if tool_name == "bash":
++        command = args.get("command", "")
++        danger_reason = _is_dangerous(command)
++        if danger_reason:
++            return PermissionDecision("deny", f"Dangerous command blocked: {danger_reason}")
++
++    # acceptEdits 模式：文件编辑跳过确认 UI，但安全校验仍在 agent.py 做
++    if mode == "acceptEdits":
++        if tool_name in ("file_write", "file_edit"):
++            return PermissionDecision("allow")
++
++    # 默认模式：写文件和 bash 需要确认
++    return PermissionDecision("ask")
++
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ 顶部 import：v1 还在用 diff_ui re-export；v2 把所有 UI 函数集中到 prompt_ui 这一路 @@
+-from .diff_ui import confirm_edit, render_diff
+-from .prompt_ui import confirm_command
++from .permissions import PermissionRequest, decide_permission
++from .prompt_ui import confirm_command, confirm_edit, confirm_tool_use, render_diff
+
+@@ run_agent 签名增加 permission_mode 参数 @@
+ def run_agent(
+     prompt: str,
+     provider: ModelProvider,
+     tools: ToolRegistry,
+     max_steps: int = 8,
+     cwd: Path | None = None,
++    permission_mode: str = "default",  # 新增：default | acceptEdits | plan
+ ) -> AgentResult:
+
+@@ for call in response.tool_calls 整块：删掉 Day 4 的 if file_write/file_edit 拦截块 + v1-bash 加的 elif call.name == "bash" 分支（约 70 行），整段替换为下面的 PermissionRequest → decide_permission → deny/ask/allow 三分支 @@
+         tool_result_blocks: list[dict[str, Any]] = []
+         for call in response.tool_calls:
+             emit(f"tool_call: {call.name} {call.arguments}")
+
++            # 权限引擎统一入口：所有工具调用先包装成 PermissionRequest
++            request = PermissionRequest(
++                tool_name=call.name,
++                args=call.arguments,
++                mode=permission_mode,
++                cwd=ctx.cwd,
++            )
++            decision = decide_permission(request)
++
++            edit_preview: tuple[str, str, str] | None = None
++            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
++                # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
++                path_str = call.arguments.get("file_path", "")
++                try:
++                    path = resolve_in_cwd(ctx.cwd, path_str)
++                except (ValueError, OSError) as exc:
++                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
++                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
++
++                validation_error: str | None = None
++                if call.name == "file_write":
++                    if path.exists():
++                        validation_error = (
++                            ensure_read_before_edit(ctx.read_state, path)
++                            or check_mtime_conflict(ctx.read_state, path)
++                        )
++                    new_content = call.arguments.get("content", "")
++                else:  # file_edit
++                    new_content = ""
++                    if not path.exists():
++                        validation_error = f"error: file does not exist: {path_str}"
++                    else:
++                        validation_error = (
++                            ensure_read_before_edit(ctx.read_state, path)
++                            or check_mtime_conflict(ctx.read_state, path)
++                        )
++                    if validation_error is None:
++                        new_content, replace_err = apply_single_replace(
++                            old_content,
++                            call.arguments.get("old_string", ""),
++                            call.arguments.get("new_string", ""),
++                            bool(call.arguments.get("replace_all", False)),
++                        )
++                        if replace_err is not None:
++                            validation_error = replace_err
++
++                if validation_error is not None:
++                    result = ToolResult(call.id, validation_error, is_error=True)
++                    emit(f"observation: {result.content}")
++                    tool_result_blocks.append(
++                        {
++                            "type": "tool_result",
++                            "tool_use_id": result.tool_call_id,
++                            "content": result.content,
++                            "is_error": True,
++                        }
++                    )
++                    continue
++
++                edit_preview = (path_str, old_content, new_content)
++
++            if decision.behavior == "deny":
++                # deny 路径：直接返回 error observation，不弹 UI
++                result = ToolResult(call.id, f"error: {decision.message}", is_error=True)
++                emit(f"observation: {result.content}")
++                tool_result_blocks.append(
++                    {
++                        "type": "tool_result",
++                        "tool_use_id": result.tool_call_id,
++                        "content": result.content,
++                        "is_error": True,
++                    }
++                )
++                continue
++
++            elif decision.behavior == "ask":
++                # ask 路径：按工具类型分发不同的预览和确认 UI
++                if call.name in ("file_write", "file_edit"):
++                    # --- 文件编辑：安全校验已经做过；ask 模式只负责 diff + confirm ---
++                    if edit_preview is not None:
++                        path_str, old_content, new_content = edit_preview
++                        diff_text = render_diff(old_content, new_content, path_str)
++                        console.print(f"\n[bold]Diff for {path_str}:[/bold]")
++                        console.print(diff_text)
++                        if not confirm_edit(path_str):
++                            result = ToolResult(call.id, "error: edit rejected by user", is_error=True)
++                            emit(f"observation: {result.content}")
++                            tool_result_blocks.append(
++                                {
++                                    "type": "tool_result",
++                                    "tool_use_id": result.tool_call_id,
++                                    "content": result.content,
++                                    "is_error": True,
++                                }
++                            )
++                            continue
++
++                elif call.name == "bash":
++                    # --- bash：命令预览 + confirm ---
++                    command = call.arguments.get("command", "")
++                    timeout = call.arguments.get("timeout", 30)
++                    console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
++                    console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
++                    if not confirm_command(command):
++                        result = ToolResult(call.id, "error: command rejected by user", is_error=True)
++                        emit(f"observation: {result.content}")
++                        tool_result_blocks.append(
++                            {
++                                "type": "tool_result",
++                                "tool_use_id": result.tool_call_id,
++                                "content": result.content,
++                                "is_error": True,
++                            }
++                        )
++                        continue
++
++                elif call.name in ("web_fetch", "web_search"):
++                    # --- 网络工具：不写本地文件，但要让用户确认是否访问外部资源 ---
++                    detail = call.arguments.get("url") or call.arguments.get("query") or str(call.arguments)
++                    if not confirm_tool_use(call.name, detail):
++                        result = ToolResult(call.id, "error: tool use rejected by user", is_error=True)
++                        emit(f"observation: {result.content}")
++                        tool_result_blocks.append(
++                            {
++                                "type": "tool_result",
++                                "tool_use_id": result.tool_call_id,
++                                "content": result.content,
++                                "is_error": True,
++                            }
++                        )
++                        continue
++
++                elif call.name == "ask_user_question":
++                    # v3 接上
++                    pass
+
++            # allow 路径 + ask 通过：执行工具
+             result = tools.run(call, ctx)
+             emit(f"observation: {result.content}")
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ main_command 签名追加 --permission-mode @@
+ def main_command(
+     prompt: str = typer.Argument("", help="Prompt to send to the agent."),
+     cwd: Path = typer.Option(Path.cwd(), "--cwd", "-C"),
+     provider: str = typer.Option("anthropic", "--provider"),
+     model: str = typer.Option("deepseek-v4-flash", "--model"),
+     base_url: str | None = typer.Option(None, "--base-url"),
+     max_steps: int = typer.Option(8, "--max-steps"),
++    permission_mode: str = typer.Option("default", "--permission-mode", help="Permission mode: default, acceptEdits, plan"),
+ ) -> None:
+
+@@ run_once 签名 + 传参 @@
+ def run_once(
+     prompt: str,
+     cwd: Path,
+     provider_name: str,
+     model: str,
+     base_url: str | None,
+     max_steps: int,
++    permission_mode: str,
+ ) -> None:
+     render_header(cwd, provider_name, model, base_url)
+     provider = create_provider(provider_name, model, base_url)
+-    run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd)
++    run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd, permission_mode=permission_mode)
+
+@@ 两处 run_once 调用：直接 run + REPL 循环 @@
+-        run_once(text, resolved_cwd, provider, model, base_url, max_steps)
++        run_once(text, resolved_cwd, provider, model, base_url, max_steps, permission_mode)
+         return
+     ...
+-        run_once(line, resolved_cwd, provider, model, base_url, max_steps)
++        run_once(line, resolved_cwd, provider, model, base_url, max_steps, permission_mode)

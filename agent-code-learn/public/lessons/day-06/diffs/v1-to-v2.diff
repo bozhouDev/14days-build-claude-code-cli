@@ -1,0 +1,117 @@
+--- /dev/null
++++ agent_code/project_memory.py
+@@ -0,0 +1,24 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++# AGENT.md 大小上限：超过就截断保护，避免一份超长规则文件挤掉别的上下文
++_MAX_AGENT_MD_BYTES = 50 * 1024
++
++
++def load_agent_md(cwd: Path) -> str | None:
++    """读取 cwd 下的 AGENT.md，包装成 <project-rules> 块。
++    文件不存在返回 None——不是错误，只是没配置。"""
++    agent_md = cwd / "AGENT.md"
++    if not agent_md.exists():
++        return None
++    content = agent_md.read_text(encoding="utf-8", errors="replace").strip()
++    if not content:
++        return None
++    # 超过 50KB 就截到字节边界 + 一行提示，避免规则文件意外巨大爆 system prompt
++    if len(content.encode("utf-8")) > _MAX_AGENT_MD_BYTES:
++        truncated = content.encode("utf-8")[:_MAX_AGENT_MD_BYTES].decode("utf-8", errors="replace")
++        content = truncated + "\n\n[... AGENT.md truncated at 50 KB ...]"
++    # 用 XML 标签和核心 system prompt 隔开，让模型识别这是项目规则
++    return f"<project-rules>\n{content}\n</project-rules>"
+
+--- agent_code/model.py
++++ agent_code/model.py
+@@ system prompt @@
++class ModelProvider(Protocol):
++    def complete(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[Any] | None = None,
++        system: str | None = None,  # Day 6：system prompt 注入入口
++    ) -> ModelResponse:
++        ...
++
++    def complete(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[Any] | None = None,
++        system: str | None = None,  # Day 6：通过 Anthropic 的 system= 参数注入
++    ) -> ModelResponse:
++        # system prompt 独立于 messages——Anthropic API 把它放在请求顶层
++        if system:
++            kwargs["system"] = system
++
++class MockProvider:
++    def complete(
++        self,
++        messages: list[dict[str, Any]],
++        tools: list[Any] | None = None,
++        system: str | None = None,  # Mock 不读 system，但签名要对齐协议
++    ) -> ModelResponse:
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ build system prompt @@
++from .project_memory import load_agent_md  # Day 6：AGENT.md 项目记忆
++
++# Day 6：核心 system prompt——Agent 的行为指南
++_SYSTEM_CORE = (
++    "You are an AI coding agent running inside a CLI harness. "
++    "You have access to tools for reading/writing files, running shell commands, "
++    "searching the web, and asking the user questions. "
++    "Use tools when needed; respond directly when you can."
++)
++
++
++def build_system_prompt(cwd: Path) -> str:
++    """组装 system prompt：核心指南 + AGENT.md 项目规则。
++    cli.py 在 cold start 时调一次，结果传给 run_agent——避免每条 prompt 重读 AGENT.md。"""
++    parts: list[str] = [_SYSTEM_CORE]
++    agent_md = load_agent_md(cwd)
++    if agent_md:
++        parts.append(agent_md)
++    return "\n\n".join(parts)
++
++def run_agent(
++    prompt: str,
++    provider: ModelProvider,
++    tools: ToolRegistry,
++    max_steps: int = 8,
++    cwd: Path | None = None,
++    permission_mode: str = "default",
++    session: Session | None = None,
++    system_prompt: str | None = None,  # Day 6 v2：cli.py 冷启动时拼好传进来
++) -> AgentResult:
++        response = provider.complete(
++            messages, tools=tools.list(), system=system_prompt
++        )
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ cold start system prompt @@
++from .agent import build_system_prompt  # Day 6 v2：cold start 拼项目规则
++
++    system_prompt: str | None = None,  # Day 6 v2：由 main_command 拼好传入
++
++    run_agent(
++        prompt, provider, default_tools(),
++        max_steps=max_steps, cwd=cwd,
++        permission_mode=permission_mode,
++        session=session,
++        system_prompt=system_prompt,
++    )
++
++    # Day 6 v2：cold start 时把 AGENT.md 读一次，整轮 CLI 共享同一份 system prompt
++    system_prompt = build_system_prompt(resolved_cwd)
++
++        run_once(text, resolved_cwd, provider, model, base_url, max_steps,
++                 permission_mode, session=session, system_prompt=system_prompt)
++
++        run_once(line, resolved_cwd, provider, model, base_url, max_steps,
++                 permission_mode, session=session, system_prompt=system_prompt)

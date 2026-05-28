@@ -1,0 +1,284 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 7 · Slash + Hooks + Cron",
+  "subtitle": "这张图只讲 Day 7 的三个扩展面：slash 注册表接管 CLI 控制命令，hook gate 插进工具生命周期，cron scheduler 让 REPL 到点自唤醒。",
+  "diagrams": [
+    {
+      "id": "slash-registry",
+      "label": "Slash registry",
+      "title": "Slash command 如何离开 cli.py 的 if/elif",
+      "summary": "CLI 把每一行输入先交给 dispatch_slash；命中注册表就返回 SlashResult，本地打印或展开成 prompt，未命中才进入 Agent Loop。",
+      "defaultActiveNodeId": "dispatch",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "REPL line / one-shot text",
+          "detail": "一次性模式和 REPL 都调用同一个 run_user_input。这样普通用户输入、slash 输入、后面 cron 排队的 pending prompt 都走同一条入口。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "ctx",
+          "kind": "data",
+          "label": "SlashContext",
+          "eyebrow": "snapshot",
+          "body": "cwd / mode / model / session",
+          "detail": "Slash handler 拿到的是运行时状态快照，不是 provider 或 session 的可变对象。它能读当前状态，但不会意外改掉 CLI 主循环。",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "dispatch",
+          "kind": "runtime",
+          "label": "dispatch_slash",
+          "eyebrow": "parser",
+          "body": "shlex split / lookup",
+          "detail": "dispatch_slash 只做三件事：确认 / 前缀，用 shlex 拆命令名和参数，按 name 查 _registry。未知命令返回 handled=True 的本地错误。",
+          "position": { "x": 300, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 180 }
+        },
+        {
+          "id": "registry",
+          "kind": "data",
+          "label": "SlashRegistry",
+          "eyebrow": "commands",
+          "body": "/help /context /plan",
+          "detail": "内置命令通过 register(name, description, handler) 注册。新增命令改 slash.py 的注册表，不再往 cli.py 主逻辑里堆 if/elif。",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 180 }
+        },
+        {
+          "id": "result",
+          "kind": "response",
+          "label": "SlashResult",
+          "eyebrow": "decision",
+          "body": "handled / should_query",
+          "detail": "handled=True 表示 CLI 不再把这行当普通 prompt。should_query=True 是桥：handler 可以把 slash 展开成 prompt 再交回 Agent Loop。",
+          "position": { "x": 600, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 360 }
+        },
+        {
+          "id": "runner",
+          "kind": "runtime",
+          "label": "run_user_input",
+          "eyebrow": "router",
+          "body": "print or run_once",
+          "detail": "本地命令只打印 message；should_query 命令和普通 prompt 才会创建 Session 并调用 run_once。",
+          "position": { "x": 900, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 360 }
+        },
+        {
+          "id": "agent-loop",
+          "kind": "model",
+          "label": "Agent Loop",
+          "eyebrow": "fallback",
+          "body": "normal prompt",
+          "detail": "slash 是 CLI 控制面，不是模型工具。只有未命中 slash 或 SlashResult.should_query=True 时，输入才会进入模型回合。",
+          "position": { "x": 900, "y": 520 },
+          "mobilePosition": { "x": 0, "y": 540 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-dispatch", "source": "cli", "target": "dispatch", "label": "line" },
+        { "id": "cli-ctx", "source": "cli", "target": "ctx", "label": "snapshot", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "ctx-dispatch", "source": "ctx", "target": "dispatch", "label": "ctx", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "dispatch-registry", "source": "dispatch", "target": "registry", "label": "lookup" },
+        { "id": "registry-result", "source": "registry", "target": "result", "label": "handler", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "dispatch-result", "source": "dispatch", "target": "result", "label": "unknown / parse error", "sourceHandle": "source-bottom", "targetHandle": "target-left" },
+        { "id": "result-runner", "source": "result", "target": "runner", "label": "handled" },
+        { "id": "runner-loop", "source": "runner", "target": "agent-loop", "label": "handled=false or should_query", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "hook-gate",
+      "label": "Hook gate",
+      "title": "Hooks 插在 permission 和 tools.run 之间",
+      "summary": "模型只提出 tool_use；harness 先做 permission 决策，再让 PreToolUse 有机会阻断，工具成功后 PostToolUse 只告警不阻断。",
+      "defaultActiveNodeId": "pre",
+      "nodes": [
+        {
+          "id": "tool-use",
+          "kind": "model",
+          "label": "Model tool_use",
+          "eyebrow": "proposal",
+          "body": "file_edit / bash / cron_create",
+          "detail": "模型仍然只提出工具调用。它不知道 hooks.json 里具体命令，也不能直接执行本地脚本。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "request",
+          "kind": "data",
+          "label": "PermissionRequest",
+          "eyebrow": "policy input",
+          "body": "tool + args + mode + cwd",
+          "detail": "Day 5 的权限引擎仍是第一道安全边界。hook 不能绕过 plan 模式或 deny 决策。",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "runtime",
+          "label": "decide_permission",
+          "eyebrow": "gate",
+          "body": "allow / ask / deny",
+          "detail": "先计算 permission，再决定是否跑 PreToolUse。已经 deny 的工具不会再执行本地 hook，避免 hook 自己带来副作用。",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "pre",
+          "kind": "tool",
+          "label": "PreToolUse",
+          "eyebrow": "hook",
+          "body": "can block",
+          "detail": "PreToolUse 匹配工具名后用 subprocess 跑 command。非 0 退出码会变成 tool blocked observation；通过后，ask 分支仍要走确认 UI，不能直接执行工具。",
+          "position": { "x": 600, "y": 320 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "tools-run",
+          "kind": "tool",
+          "label": "tools.run",
+          "eyebrow": "tool runtime",
+          "body": "real world effect",
+          "detail": "只有 permission 没 deny、PreToolUse 没阻断，并且 ask 分支已经被用户确认后，harness 才真正执行工具。文件写入、bash、cron 写 JSON 都发生在这里。",
+          "position": { "x": 900, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "post",
+          "kind": "tool",
+          "label": "PostToolUse",
+          "eyebrow": "hook",
+          "body": "warn only",
+          "detail": "PostToolUse 在工具成功后运行。主线只把 hook 状态打印到终端，不把 hook 输出注入模型上下文，也不阻断已完成的工具结果。",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "observation",
+          "kind": "response",
+          "label": "Observation",
+          "eyebrow": "tool_result",
+          "body": "success or error",
+          "detail": "无论工具成功还是 PreToolUse 阻断，模型看到的都是 harness 生成的 Observation。hooks 不会让模型直接获得本地执行权。",
+          "position": { "x": 300, "y": 320 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "tool-request", "source": "tool-use", "target": "request", "label": "wrap" },
+        { "id": "request-permission", "source": "request", "target": "permission", "label": "decide" },
+        { "id": "permission-pre", "source": "permission", "target": "pre", "label": "allow / ask", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "permission-observation", "source": "permission", "target": "observation", "label": "deny", "sourceHandle": "source-left", "targetHandle": "target-top" },
+        { "id": "pre-tools", "source": "pre", "target": "tools-run", "label": "allow or confirmed ask" },
+        { "id": "pre-observation", "source": "pre", "target": "observation", "label": "blocked", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "tools-post", "source": "tools-run", "target": "post", "label": "success", "sourceHandle": "source-top", "targetHandle": "target-bottom" },
+        { "id": "tools-observation", "source": "tools-run", "target": "observation", "label": "tool_result", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "cron-wakeup",
+      "label": "Cron wakeup",
+      "title": "Cron 到点只 enqueue，不重入 Agent Loop",
+      "summary": "人类的 /loop add 和模型的 cron_create 共用 CronScheduler；后台线程只把 slash/prompt 放进 pending queue，REPL 主线程 drain 后顺序调用 run_user_input。",
+      "defaultActiveNodeId": "pending",
+      "nodes": [
+        {
+          "id": "loop",
+          "kind": "runtime",
+          "label": "/loop add",
+          "eyebrow": "human",
+          "body": "/context --every 120",
+          "detail": "/loop 是本地 slash command，直接调用 cron_create 的函数逻辑，不绕模型。它适合人类在 REPL 里管理定时任务。",
+          "position": { "x": 0, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "cron-tool",
+          "kind": "tool",
+          "label": "cron_create",
+          "eyebrow": "model tool",
+          "body": "same scheduler API",
+          "detail": "模型也能通过 cron_create / cron_list / cron_cancel 管理任务。权限上 cron_list 是只读，create/cancel 是低风险写，plan 模式仍 deny。",
+          "position": { "x": 0, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 0 }
+        },
+        {
+          "id": "scheduler",
+          "kind": "runtime",
+          "label": "CronScheduler",
+          "eyebrow": "repl runtime",
+          "body": "jobs + lock + daemon",
+          "detail": "REPL 启动时创建 scheduler 并注入 cron_tools。一次性模式可以读写 cron.json，但不会启动后台线程。",
+          "position": { "x": 300, "y": 180 },
+          "mobilePosition": { "x": 0, "y": 190 }
+        },
+        {
+          "id": "cron-json",
+          "kind": "data",
+          "label": ".agent/cron.json",
+          "eyebrow": "persist",
+          "body": "jobs list",
+          "detail": "add/cancel/到点更新时间都会重写这份 JSON。job 数量小，全量写比增量 patch 更适合教学版。",
+          "position": { "x": 600, "y": 70 },
+          "mobilePosition": { "x": 220, "y": 190 }
+        },
+        {
+          "id": "thread",
+          "kind": "runtime",
+          "label": "Background Thread",
+          "eyebrow": "tick",
+          "body": "wake every 1s",
+          "detail": "后台线程每秒检查 now - last_run_at 是否超过 every_seconds。它不调用 run_agent，只负责 enqueue。",
+          "position": { "x": 600, "y": 300 },
+          "mobilePosition": { "x": 0, "y": 380 }
+        },
+        {
+          "id": "pending",
+          "kind": "data",
+          "label": "Pending Queue",
+          "eyebrow": "handoff",
+          "body": "slash / prompt",
+          "detail": "pending queue 是并发边界。后台线程把字符串放进队列，主线程再取出来，避免两个 Agent Loop 同时读写同一个 cwd。",
+          "position": { "x": 900, "y": 300 },
+          "mobilePosition": { "x": 220, "y": 380 }
+        },
+        {
+          "id": "main-thread",
+          "kind": "runtime",
+          "label": "REPL Main Thread",
+          "eyebrow": "single loop",
+          "body": "drain_pending()",
+          "detail": "主线程每 0.5 秒醒一次，先 drain scheduled jobs，再处理用户输入。Agent Loop 仍然按顺序单线程执行。",
+          "position": { "x": 900, "y": 70 },
+          "mobilePosition": { "x": 0, "y": 570 }
+        },
+        {
+          "id": "runner",
+          "kind": "runtime",
+          "label": "run_user_input",
+          "eyebrow": "reuse",
+          "body": "slash dispatch again",
+          "detail": "到点的 /context 会重新进入 Day 7 的统一入口：先 slash dispatch，命中本地命令就打印状态，不经过模型。",
+          "position": { "x": 1180, "y": 180 },
+          "mobilePosition": { "x": 220, "y": 570 }
+        }
+      ],
+      "edges": [
+        { "id": "loop-scheduler", "source": "loop", "target": "scheduler", "label": "add_job" },
+        { "id": "tool-scheduler", "source": "cron-tool", "target": "scheduler", "label": "add/list/cancel" },
+        { "id": "scheduler-json", "source": "scheduler", "target": "cron-json", "label": "save/load" },
+        { "id": "scheduler-thread", "source": "scheduler", "target": "thread", "label": "start", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "thread-pending", "source": "thread", "target": "pending", "label": "enqueue" },
+        { "id": "pending-main", "source": "pending", "target": "main-thread", "label": "drain", "sourceHandle": "source-top", "targetHandle": "target-bottom" },
+        { "id": "main-runner", "source": "main-thread", "target": "runner", "label": "run" },
+        { "id": "runner-scheduler", "source": "runner", "target": "scheduler", "label": "loop commands", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    }
+  ]
+}

@@ -149,7 +149,6 @@ docs/                          14 天教程文档
 packages/day-*/                每一天独立可运行的教学快照
 demo/                          当前综合 demo 项目
 agent-code-learn/              网页版教程
-reference/claude-code-official/ Claude Code 源码快照，架构参考用（需要自己 clone）
 ```
 
 注意：教程读者不是每天新建一个 `packages/day-*`。这些目录是参考答案快照。真正学习时，我们是在自己的 `agent-code` 项目里从 Day 1 持续改到 Day 14。

@@ -149,7 +149,6 @@ docs/                          14-day tutorials
 packages/day-*/                runnable teaching snapshots for each day
 demo/                          current integrated demo project
 agent-code-learn/              web version of the tutorial
-reference/claude-code-official/ Claude Code source snapshot for architecture reference (clone it yourself)
 ```
 
 One important note: learners are not supposed to create a new `packages/day-*` directory every day. Those directories are reference snapshots. The learning flow is to keep evolving your own `agent-code` project from Day 1 to Day 14.

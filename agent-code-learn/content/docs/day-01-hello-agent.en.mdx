@@ -242,6 +242,16 @@ model -> tool_call -> tool -> observation -> model -> final
 
 v1's CLI could only echo. v2's "model" could only speak. v3 is the first time the model actually does something.
 
+### Summary — what exactly is a tool, and what is a function call
+
+Now that it runs, let's pin down these two terms — you'll use them every day for the next 7 days.
+
+**A <Concept name="Tool">tool</Concept> is just a Python function you hand to the model.** The model itself only emits text — it can't read files, run commands, or query a database. So on the harness side we prepare functions, give each a name and description (our `Tool` is the trio `name` + `description` + `run`), and drop them into `ToolRegistry`. Registering one tells the model: "you can dispatch me to do these things." Today there's only `echo`; from Day 3 on, `read_file` and `bash` show up here.
+
+**A <Concept name="Function Call">function call</Concept> is the model *placing an order*, not *executing* it.** This is the key: the model never runs the function itself. All it does is emit a structured slip — "call `echo` with arguments `{"text": "hi"}`", i.e. our `ToolCall(name=..., arguments=...)`. The harness does the actual work: `ToolRegistry.run()` looks up the Python function by name, runs it, and hands the <Concept name="Observation">observation</Concept> back to the model. Model orders, harness executes, result flows back — that's exactly why the chain reads `tool_call → observation → final`.
+
+One naming trap worth calling out: **function call, tool call, and tool use are basically the same thing**, just different vendor names. OpenAI's early term was function calling; Anthropic calls it tool use; our code uses `ToolCall` / `tool_calls` throughout. Tomorrow when you wire real Claude, you'll see `tool_use` / `tool_result` in the API — and you'll know it's just today's idea wearing a different shell.
+
 ---
 
 ## Finishing touches — REPL, slash commands, --cwd

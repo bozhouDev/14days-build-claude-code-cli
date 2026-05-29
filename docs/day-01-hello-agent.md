@@ -364,6 +364,16 @@ model -> tool_call -> tool -> observation -> model -> final
 
 回头看一眼——v1 的 CLI 只能回声，v2 的"模型"只会动嘴，到 v3 模型才第一次真正动了手。
 
+### 小结：到底什么是 tool，什么是 function call
+
+跑通了再回头把这两个名词说清楚，接下来你天天都会用到。
+
+**Tool（工具）就是一个你交给模型差遣的 Python 函数。** 模型本体只会吐字——它没法读文件、跑命令、查数据库。所以我们在 harness 这边备好一个个函数，给每个配上名字和说明（我们的 `Tool` 就是 `name` + `description` + `run` 三件套），再塞进 `ToolRegistry`。这一注册，就等于告诉模型："这些活你可以差我去干。"今天只有一个 `echo`，Day 3 之后这里会冒出 `read_file`、`bash`。
+
+**Function call（函数调用）是模型"下单"的那个动作，不是"执行"。** 关键就在这：模型永远不会自己运行那个函数。它能做的只是输出一张结构化的单子——"我要调 `echo`，参数 `{"text": "hi"}`"，也就是我们的 `ToolCall(name=..., arguments=...)`。真正动手的是 harness：`ToolRegistry.run()` 按名字找到 Python 函数、跑出结果，再把这条 observation 交回模型。模型下单、harness 执行、结果回流——这正是前面那条链为什么是 `tool_call → observation → final`。
+
+最后点破一个名词坑：**function call、tool call、tool use 基本是同一件事**，只是各家叫法不同。OpenAI 早期叫 function calling，Anthropic 叫 tool use，我们代码里统一用 `ToolCall` / `tool_calls`。下一天接真实 Claude，你会在 API 里看到 `tool_use` / `tool_result`，心里清楚它就是今天这套东西换了层壳，就不慌了。
+
 ## 收尾：REPL、slash 命令和 --cwd
 
 v3 有个小遗憾：只能一次性跑。`agent-code "..."` 跑一次就退出。公开的 Claude Code 还可以直接敲 `claude` 进 REPL，里面用 `/help`、`/exit` 这类 slash 命令。我们也加上这层。同时把 `--cwd` 工作目录参数补上，Day 3 的文件工具会用到。

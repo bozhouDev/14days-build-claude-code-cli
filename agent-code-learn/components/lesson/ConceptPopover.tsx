@@ -35,6 +35,16 @@ const GLOSSARY: Record<string, Record<'zh' | 'en', GlossaryEntry>> = {
       location: 'cli.py · agent.py',
     },
   },
+  Tool: {
+    zh: {
+      definition: '交给模型差遣的一个 Python 函数，配上名字和说明后注册进 ToolRegistry。模型只能请求它，真正执行的是 harness。',
+      location: 'tools.py (Tool)',
+    },
+    en: {
+      definition: 'A Python function you expose to the model. With a name and description it is registered in ToolRegistry. The model can only request it; the harness runs it.',
+      location: 'tools.py (Tool)',
+    },
+  },
   'Tool Call': {
     zh: {
       definition: '模型发给 Harness 的执行意图，包含工具名（如 echo）和参数。',
@@ -42,6 +52,16 @@ const GLOSSARY: Record<string, Record<'zh' | 'en', GlossaryEntry>> = {
     },
     en: {
       definition: 'An execution intent emitted by the model, containing a tool name (e.g. echo) and arguments.',
+      location: 'model.py (ToolCall)',
+    },
+  },
+  'Function Call': {
+    zh: {
+      definition: '模型“下单”调用工具的动作；function call / tool call / tool use 是同一件事，只是各家叫法不同。模型只输出请求，不自己执行。',
+      location: 'model.py (ToolCall)',
+    },
+    en: {
+      definition: 'The model placing an order to call a tool; function call / tool call / tool use are the same thing under different vendor names. The model only emits the request — it never runs the function itself.',
       location: 'model.py (ToolCall)',
     },
   },

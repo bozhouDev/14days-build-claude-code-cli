@@ -36,9 +36,12 @@ mkdir agent-code && cd agent-code
 uv init --package
 uv add typer rich
 uv add --dev pytest
+rm -rf src
 mkdir -p agent_code tests
 touch agent_code/__init__.py
 ```
+
+Recent `uv init --package` versions create `src/agent_code/` by default. This tutorial and the reference snapshots use the root-level `agent_code/` directory instead, so remove `src/` first. From here on, every `agent_code/xxx.py` path means `agent-code/agent_code/xxx.py`.
 
 Edit the key fields of `pyproject.toml` (leave everything else `uv init` generated):
 
@@ -54,9 +57,12 @@ dependencies = [
 
 [project.scripts]
 agent-code = "agent_code.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_code"]
 ```
 
-`[project.scripts]` is what lets `uv run agent-code` know that the entry is `main()` in `agent_code/cli.py`.
+`[project.scripts]` is what lets `uv run agent-code` know that the entry is `main()` in `agent_code/cli.py`. `[tool.hatch.build.targets.wheel]` tells the build backend to install the root-level `agent_code/` package, not the `src/agent_code/` directory we just removed.
 
 > [!NOTE]
 > Reference snapshot lives in `packages/day-01-hello-agent/`. That's the answer key — **not** a directory you create every day. For the next 7 days you keep editing the same `agent-code` project.
@@ -67,7 +73,7 @@ agent-code = "agent_code.cli:main"
 
 Simplest possible version: the CLI takes a string and echoes it.
 
-Create `agent_code/cli.py`:
+Create `cli.py` under the root-level `agent_code/` directory. The full path is `agent-code/agent_code/cli.py`:
 
 ```python
 from __future__ import annotations
@@ -304,6 +310,28 @@ Then use `uv run agent-code`, not `agent-code` directly.
 **My dict output uses single quotes**
 
 Python `dict` may print with single quotes. As long as you see `tool_call`, `observation`, `final` in order, it's correct.
+
+**`ModuleNotFoundError: No module named 'agent_code.cli'`**
+
+The most common cause is having two package directories at once: `src/agent_code/` and `agent_code/`. `uv init --package` creates the first one by default, but this tutorial writes `cli.py` into the second one, so packaging cannot find `agent_code.cli`.
+
+First remove the generated `src/` directory:
+
+```bash
+rm -rf src
+```
+
+Then make sure `pyproject.toml` has both blocks:
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_code"]
+```
+
+Finally confirm the file lives at `agent-code/agent_code/cli.py`, and keep running it with `uv run agent-code "hi"`.
 
 ---
 

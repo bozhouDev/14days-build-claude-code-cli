@@ -15,9 +15,12 @@ mkdir agent-code && cd agent-code
 uv init --package
 uv add typer rich
 uv add --dev pytest
+rm -rf src
 mkdir -p agent_code tests
 touch agent_code/__init__.py
 ```
+
+这里容易踩一个坑：新版 `uv init --package` 默认会生成 `src/agent_code/`。这套教程和仓库里的参考快照统一使用项目根目录下的 `agent_code/`，所以我们先删掉 `src/`，后面所有 `agent_code/xxx.py` 都指的是 `agent-code/agent_code/xxx.py`。
 
 把 `pyproject.toml` 的关键部分改成下面这样（其它字段保留 `uv init` 生成的就行）：
 
@@ -33,9 +36,12 @@ dependencies = [
 
 [project.scripts]
 agent-code = "agent_code.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_code"]
 ```
 
-`[project.scripts]` 这一行很关键：它让 `uv run agent-code` 知道入口是 `agent_code/cli.py` 里的 `main()`。
+`[project.scripts]` 这一行很关键：它让 `uv run agent-code` 知道入口是 `agent_code/cli.py` 里的 `main()`。`[tool.hatch.build.targets.wheel]` 则告诉打包工具：我们要安装的是项目根目录下的 `agent_code/`，不是刚才删掉的 `src/agent_code/`。
 
 仓库里的完成版我会放在 `packages/day-01-hello-agent/`。那是参考答案快照，**不是**让你每天新建一个目录。后面 7 天你都在同一个 `agent-code` 项目里继续改。
 
@@ -43,7 +49,7 @@ agent-code = "agent_code.cli:main"
 
 先写一个最笨的版本：CLI 接收一段文字，原样回声。
 
-新建 `agent_code/cli.py`：
+在项目根目录的 `agent_code/` 下新建 `cli.py`，完整路径是 `agent-code/agent_code/cli.py`：
 
 ```python
 from __future__ import annotations
@@ -523,9 +529,36 @@ agent-code = "agent_code.cli:main"
 
 Python 打印 dict 可能使用单引号。只要看到 `tool_call`、`observation`、`final` 这三段就对了。
 
-### `ModuleNotFoundError: No module named 'agent_code'`
+### `ModuleNotFoundError: No module named 'agent_code.cli'`
 
-这个错一般是你在项目目录外面、或者用 `python agent_code/cli.py` 直接跑的。记住一律用 `uv run agent-code`，它会自动处理好 Python path。
+这个错最常见的原因是项目里同时有两个包目录：`src/agent_code/` 和 `agent_code/`。`uv init --package` 默认生成了前者，但我们把 `cli.py` 写到了后者，打包时就会找不到 `agent_code.cli`。
+
+按这三步统一一下：
+
+```bash
+rm -rf src
+```
+
+确认 `pyproject.toml` 里有：
+
+```toml
+[project.scripts]
+agent-code = "agent_code.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_code"]
+```
+
+然后确认文件在这里：
+
+```txt
+agent-code/
+  agent_code/
+    __init__.py
+    cli.py
+```
+
+最后仍然用 `uv run agent-code "hi"` 跑，不要直接运行 `python agent_code/cli.py`。
 
 ## 课后挑战
 

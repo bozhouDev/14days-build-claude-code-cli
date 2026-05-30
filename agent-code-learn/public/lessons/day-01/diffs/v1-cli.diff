@@ -1,3 +1,20 @@
++++ pyproject.toml
+@@ -0,0 +1,15 @@
++[project]
++name = "agent-code"
++version = "0.1.0"
++requires-python = ">=3.10"
++dependencies = [
++  "rich>=13.7.0",
++  "typer>=0.12.0",
++]
++
++[project.scripts]
++agent-code = "agent_code.cli:main"
++
++[tool.hatch.build.targets.wheel]
++packages = ["agent_code"]
++
 +++ agent_code/cli.py
 @@ -0,0 +1,15 @@
 +from __future__ import annotations

@@ -1,0 +1,155 @@
+--- agent_code/runtime.py
++++ agent_code/runtime.py
+@@ before RuntimeState
++@dataclass
++class TodoItem:
++    content: str
++    status: str
++    active_form: str
++
+@@ RuntimeState
+     abort_event: threading.Event = field(default_factory=threading.Event)
+     input_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
++    todo_store: list[TodoItem] = field(default_factory=list)
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ imports
+-from .runtime import RuntimeState
++from .runtime import RuntimeState, TodoItem
+@@ todo tools
++def _render_todos(items: list[TodoItem]) -> str:
++    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
++    return "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
++
++
++def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
++    """整表覆盖待办板。每次调用传来的 todos 就是新列表的全部。"""
++    state = ctx.runtime_state
++    if state is None:
++        return "error: no runtime state"
++    items = [
++        TodoItem(
++            content=t.get("content", ""),
++            status=t.get("status", "pending"),
++            active_form=t.get("activeForm", ""),
++        )
++        for t in args.get("todos", [])
++    ]
++    state.todo_store = items
++
++    lines = [_render_todos(items), "", "Todos updated."]
++    completed = sum(1 for t in items if t.status == "completed")
++    kws = ("test", "pytest", "verify", "lint", "check")
++    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
++    if completed >= 3 and not has_verify:
++        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
++    return "\n".join(lines)
++
++
++def todo_read(args: dict[str, Any], ctx: ToolContext) -> str:
++    state = ctx.runtime_state
++    return _render_todos(state.todo_store) if state else "(no todos)"
+@@ default_tools
++    registry.register(
++        Tool(
++            name="todo_write",
++            description=(
++                "Create and manage a structured task list. Use for multi-step tasks (3+ steps). "
++                "Keep exactly ONE item in_progress. Mark completed immediately when done. "
++                "The todos array is a FULL replacement—always send the entire list."
++            ),
++            run=todo_write,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "todos": {
++                        "type": "array",
++                        "items": {
++                            "type": "object",
++                            "properties": {
++                                "content": {"type": "string", "description": "Imperative task name."},
++                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
++                                "activeForm": {"type": "string", "description": "Present-continuous form."},
++                            },
++                            "required": ["content", "status", "activeForm"],
++                        },
++                    },
++                },
++                "required": ["todos"],
++            },
++            is_read_only=False,
++        )
++    )
++    registry.register(
++        Tool(
++            name="todo_read",
++            description="Read the current todo list.",
++            run=todo_read,
++            parameters={"type": "object", "properties": {}, "required": []},
++            is_read_only=True,
++        )
++    )
+
+--- agent_code/permissions.py
++++ agent_code/permissions.py
+@@ readonly and low-risk tools
+ _READONLY_TOOLS = frozenset({
+     "read_file", "list_files", "glob", "grep", "project_tree",
+     "git_status", "git_diff",
+     "system_date", "echo",
+     "memory_recall",
+-    "cron_list",
++    "cron_list", "todo_read",
+ })
+@@ low risk
+ _LOW_RISK_WRITES = frozenset({
+     "memory_write", "cron_create", "cron_cancel",
++    "todo_write",
+ })
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ todo command
++def _cmd_todo(_args: list[str], ctx: SlashContext) -> SlashResult:
++    items = ctx.state.todo_store if ctx.state else []
++    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
++    body = "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
++    return SlashResult(handled=True, message=body)
+@@ registry
++register("todo", "显示当前 todo 列表", _cmd_todo)
+
+--- agent_code/interactive.py
++++ agent_code/interactive.py
+@@ bottom_toolbar
+     mode = {"default": "default", "acceptEdits": "accept edits", "plan": "plan"}.get(
+         state.permission_mode, state.permission_mode
+     )
+-    return f" {mode} · {state.model} "
++    active = next((t.active_form for t in state.todo_store if t.status == "in_progress"), "")
++    todo = f" · {active}" if active else ""
++    return f" {mode} · {state.model}{todo} "
+
+--- tests/test_smoke.py
++++ tests/test_smoke.py
+@@ todo tests
++def test_todo_write_updates_runtime_state_and_toolbar() -> None:
++    registry = default_tools()
++    state = RuntimeState()
++    ctx = ToolContext(cwd=Path.cwd(), runtime_state=state)
++    result = registry.run(
++        ToolCall(
++            id="todo_1",
++            name="todo_write",
++            arguments={
++                "todos": [
++                    {"content": "读 cli.py", "status": "completed", "activeForm": "正在读 cli.py"},
++                    {"content": "跑测试", "status": "in_progress", "activeForm": "正在跑测试"},
++                ]
++            },
++        ),
++        ctx,
++    )
++    assert "Todos updated." in result.content
++    assert [item.content for item in state.todo_store] == ["读 cli.py", "跑测试"]
++    assert "正在跑测试" in bottom_toolbar(state)

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from agent_code.agent import run_agent
 from agent_code.model import MockProvider, ModelResponse, ToolCall
+from agent_code.runtime import RuntimeState
 from agent_code.tools import ToolContext, default_tools
 
 
@@ -63,7 +64,7 @@ def test_file_write_missing_path_returns_tool_error() -> None:
         MalformedWriteProvider({}),
         default_tools(),
         cwd=Path(__file__).resolve().parents[1],
-        permission_mode="acceptEdits",
+        state=RuntimeState(permission_mode="acceptEdits"),
     )
 
     assert "tool_call: file_write {}" in result.trace[0]

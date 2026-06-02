@@ -1,0 +1,596 @@
+---
+title: "Day 8 — Interactive Shell + Plan Mode"
+description: "The first seven days gave us a script-like REPL. Today we turn agent-code into a resident interactive shell: layered input/output, runtime mode switching, ESC interrupt, parallel tools, TodoWrite, and a real Plan Mode approval loop."
+---
+
+The first seven days built a usable single-Agent CLI from scratch: model access, file tools, safe edits, bash execution, permissions, three layers of memory, slash/hooks/cron.
+
+Those pieces already form a <Concept name="Harness">harness</Concept>, but the interaction model is still script-like: `console.print` writes straight to the terminal, `typer.prompt` blocks for input, and `permission_mode` / `model` are local variables fixed at startup.
+
+Today we lift `agent-code` into a resident interactive runtime. By the end, the bottom prompt stays alive while Agent trace scrolls above it; `shift+tab` switches modes; ESC interrupts at step boundaries; multiple read-only tools run in parallel; and Plan Mode only unlocks writes after you approve the plan.
+
+About 1200 lines total, ~600 new. This day deliberately has 6 runnable versions because the thread, queue, confirmation UI, and permission boundaries of an interactive shell need to be separated.
+
+---
+
+### Day 8 Main Visual: Four Runtime Lines
+
+Start with this Agent Logic Map. It does not replay every terminal line; it keeps the four boundaries that are easiest to get wrong today: main-thread input, turn lifecycle, parallel tool scheduling, and the Plan Mode approval gate.
+
+<AgentLogicMap mapPath="/lessons/day-08/logic-map.json" />
+
+---
+
+Today we keep editing the Day 7 `agent-code` project. `packages/day-*` snapshots are reference answers, not directories you create every day.
+
+## Setup — Today's Starting Point
+
+Day 7's REPL already has slash commands, hooks, and cron, but it still runs like this:
+
+```txt
+typer.prompt(">") -> input_queue -> run_agent(...) -> console.print trace
+```
+
+That causes three problems:
+
+- Agent output (`tool_call` / `observation` / `final`) mixes with the next input line.
+- While the Agent runs, typed input has no clear queue/interrupt story.
+- `/model` and `/plan` still cannot mutate shared runtime state.
+
+Add the dependency:
+
+```bash
+uv add prompt_toolkit
+```
+
+`prompt_toolkit` gives us a resident bottom prompt, key bindings, a status bar, and safe redraws across threads. Today adds `agent_code/interactive.py` and `agent_code/runtime.py`, then edits `cli.py`, `agent.py`, `tools.py`, `permissions.py`, `slash.py`, `prompt_ui.py`, `hooks.py`, and `fs_safety.py`.
+
+---
+
+## v1 — Interactive Shell Skeleton
+
+Day 7's thread direction is backwards: input lives in the worker thread, while the Agent Loop lives on the main thread. Today the prompt stays on the main thread, and the Agent Loop moves to a worker.
+
+The core shape:
+
+```txt
+main thread: PromptSession + key bindings + slash dispatch
+worker thread: run_agent + provider.complete + tools.run
+```
+
+First add shared runtime state:
+
+```python
+@dataclass
+class RuntimeState:
+    permission_mode: str = "default"
+    model: str = "deepseek-v4-pro"
+    provider: str = "anthropic"
+    abort_event: threading.Event = field(default_factory=threading.Event)
+    input_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
+```
+
+`permission_mode` and `model` are no longer local variables in `cli.py`. They become one shared state object read by the main thread and the worker.
+
+The shell's two important primitives are `patch_stdout()` and `run_in_terminal()`:
+
+```python
+async def _run() -> None:
+    loop = asyncio.get_running_loop()
+
+    def terminal_asker(func: Callable[[], Any]) -> Any:
+        async def ask_in_terminal() -> Any:
+            return await run_in_terminal(func)
+        return asyncio.run_coroutine_threadsafe(ask_in_terminal(), loop).result()
+
+    prompt_ui.set_terminal_asker(terminal_asker)
+
+    with patch_stdout():
+        while True:
+            text = (await session.prompt_async("> ")).strip()
+            if text.startswith("/"):
+                result = dispatch_slash(text, make_slash_context())
+                ...
+            job_queue.put(text)
+```
+
+Normal trace output goes through `patch_stdout`, so it appears above the prompt safely. When a worker needs to confirm an edit or approve a plan, it cannot grab `stdin`; `_ask` schedules that question back onto the main thread and `run_in_terminal` pauses the prompt first.
+
+Run it:
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-pro
+
+Type /help for commands, /exit to quit.
+> Read agent_code/cli.py and summarize what it does in one sentence
+tool_call: read_file {'path': 'agent_code/cli.py'}
+final: cli.py is the CLI entrypoint: it parses args, dispatches slash commands, and runs the Agent Loop.
+ default · deepseek-v4-pro
+>
+```
+
+Acceptance check: the prompt stays at the bottom and Agent trace appears above it; one-shot `uv run agent-code "/help"` still exits immediately without starting the interactive shell.
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v1-interactive-shell.diff"
+  title="v1 — PromptSession + RuntimeState + worker thread"
+  description="Adds the interactive shell and shared runtime state; run_agent reads RuntimeState; confirmation UI borrows the main thread through prompt_ui._ask."
+/>
+
+---
+
+## v2 — Key Bindings + Runtime Mode/Model Switching
+
+v1 gives us the shell, but mode and model are still just initial values. v2 adds two runtime controls: `shift+tab` cycles permission modes, and `/model` switches the model for the next turn.
+
+`RuntimeState` gains a mode cycle helper:
+
+```python
+def cycle_permission_mode(self) -> str:
+    """shift+tab cycles default → acceptEdits → plan → default. Main thread only."""
+    order = ["default", "acceptEdits", "plan"]
+    idx = order.index(self.permission_mode) if self.permission_mode in order else 0
+    self.permission_mode = order[(idx + 1) % len(order)]
+    return self.permission_mode
+```
+
+`interactive.py` binds `"s-tab"` to it:
+
+```python
+@kb.add("s-tab")
+def _(event: Any) -> None:
+    new_mode = state.cycle_permission_mode()
+    print(f"[mode → {new_mode}]")
+```
+
+`/model` no longer refuses runtime changes. It updates `state.model`, and the next `run_turn` rebuilds the <Concept name="Provider">Provider</Concept> with that value:
+
+```python
+def _cmd_model(args: list[str], ctx: SlashContext) -> SlashResult:
+    if not args:
+        return SlashResult(handled=True, message=f"provider: {ctx.provider}  model: {ctx.model}")
+    target = args[0]
+    if ctx.state is not None:
+        ctx.state.model = target
+    return SlashResult(handled=True, message=f"model → {target}（next turn only; current turn unchanged）")
+```
+
+Run:
+
+```bash
+$ uv run agent-code
+ default · deepseek-v4-pro
+> (press shift+tab)
+[mode → acceptEdits]
+ accept edits · deepseek-v4-pro
+> /model deepseek-chat
+model → deepseek-chat（next turn only; current turn unchanged）
+ accept edits · deepseek-chat
+```
+
+Acceptance check: the toolbar updates immediately, and the next prompt uses the new model. The current running turn is not affected because provider binding happens at the turn boundary.
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v1-to-v2-runtime-controls.diff"
+  title="v2 — shift+tab mode cycle and /model hot switch"
+  description="RuntimeState gains cycle_permission_mode; PromptSession binds s-tab; SlashContext carries state; /model updates shared runtime state."
+/>
+
+---
+
+## v3 — Turn Lifecycle Control
+
+The user can now type while the Agent is running, but two boundaries are missing: where does input typed during a run go, and when does ESC take effect?
+
+v3 adds a `busy` flag. The worker sets it while running a turn; the main thread checks it and sends new input into `RuntimeState.input_queue`:
+
+```python
+if busy.is_set():
+    state.input_queue.put(text)
+    print("[queued] will run after current turn")
+else:
+    job_queue.put(text)
+```
+
+At turn end, the worker drains that queue:
+
+```python
+finally:
+    busy.clear()
+while not state.input_queue.empty():
+    job_queue.put(state.input_queue.get())
+```
+
+ESC does not kill a thread. It only sets `abort_event`, and `run_agent` checks that flag after the model returns and before tools execute:
+
+```python
+if state.abort_event.is_set():
+    emit("interrupted by user")
+    if response.tool_calls:
+        blocks = [
+            {"type": "tool_result", "tool_use_id": c.id,
+             "content": "Interrupted by user", "is_error": True}
+            for c in response.tool_calls
+        ]
+        messages.append({"role": "user", "content": blocks})
+    return AgentResult(final="interrupted", trace=trace, messages=messages)
+```
+
+The key invariant: if the model emitted a <Concept name="Tool Call">tool_use</Concept>, the harness must return a matching <Concept name="Tool Result">tool_result</Concept>, even if it is an error. Otherwise the next Anthropic Messages API request can be rejected.
+
+v3 also adds the `Stop` hook. When the model is about to end with final text, a hook can force one more turn via non-zero exit plus output:
+
+```python
+if forced is not None:
+    continuation_count += 1
+    emit(f"continue: {forced}")
+    messages.append({"role": "user", "content": f"continue: {forced}"})
+    continue
+```
+
+Try type-ahead:
+
+```bash
+> Read every .py file under agent_code/ and summarize each one
+tool_call: read_file ...
+> Also count how many .py files there are
+[queued] will run after current turn
+... (previous turn ends, queued prompt runs automatically)
+```
+
+Try ESC:
+
+```bash
+> Read every file in agent_code and summarize them one by one
+tool_call: read_file {'path': 'agent_code/agent.py'}
+(press ESC)
+interrupted by user
+ default · deepseek-v4-pro
+>
+```
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v2-to-v3-turn-lifecycle.diff"
+  title="v3 — type-ahead, half-step ESC interrupt, Stop hook"
+  description="busy Event queues input typed during a run; abort_event is checked before tool execution and returns is_error tool_result blocks; Stop hook can force continuation."
+/>
+
+---
+
+## v4 — Parallel Tool Scheduling
+
+The model often returns several tool calls in one response, for example three file reads. Reads do not depend on each other, so serial execution wastes I/O. Writes mutate the world, so they cannot be blindly parallelized.
+
+Day 8 uses a small rule:
+
+```txt
+contiguous read-only tools -> parallel batch
+write / unknown tool -> single serial batch
+tool_result return order -> must match tool_use order
+```
+
+Add metadata to `Tool`:
+
+```python
+@dataclass
+class Tool:
+    name: str
+    description: str
+    run: ToolFunc
+    parameters: dict[str, Any] = field(...)
+    is_read_only: bool = False
+```
+
+Then let the harness partition calls:
+
+```python
+def partition_tool_calls(calls, tools) -> list[list]:
+    batches: list[list] = []
+    current: list = []
+    for call in calls:
+        tool = tools.get(call.name)
+        if tool is not None and tool.is_read_only:
+            current.append(call)
+        else:
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([call])
+    if current:
+        batches.append(current)
+    return batches
+```
+
+Read-only batches run through `ThreadPoolExecutor.map`:
+
+```python
+with ThreadPoolExecutor(max_workers=4) as ex:
+    results = list(
+        ex.map(lambda c: execute_one_tool_call(c, ctx, state, tools, emit), batch)
+    )
+tool_result_blocks.extend(results)
+```
+
+`map` returns in input order. That matters: execution may be parallel, but the <Concept name="Messages">messages list</Concept> sent back to the model must preserve the original `tool_use` order.
+
+Parallel reads can also write `ReadFileState.entries` at the same time, so `record()` gets a lock:
+
+```python
+with self._lock:
+    self.entries[path] = (mtime_ns, len(content))
+```
+
+Run:
+
+```bash
+> Read agent_code/agent.py, agent_code/cli.py, and agent_code/tools.py at the same time; summarize each one
+tool_call: read_file {'path': 'agent_code/cli.py'}
+tool_call: read_file {'path': 'agent_code/agent.py'}
+tool_call: read_file {'path': 'agent_code/tools.py'}
+final: agent.py runs the loop, cli.py is the entrypoint, tools.py is the registry.
+```
+
+Acceptance check: pure reads do not block each other; if a write is mixed in, it splits the batch and runs serially.
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v3-to-v4-parallel-tools.diff"
+  title="v4 — Tool.is_read_only + parallel read batches"
+  description="ToolRegistry gains get; Tool gains is_read_only; agent.py extracts single-tool execution and partition_tool_calls; read-only batches run with ThreadPoolExecutor.map."
+/>
+
+---
+
+## v5 — TodoWrite Board
+
+Long tasks span multiple turns: inspect code, locate the change, edit, verify. The model can lose track. v5 gives it a shared todo board it can read and write.
+
+The data structure is tiny:
+
+```python
+@dataclass
+class TodoItem:
+    content: str
+    status: str
+    active_form: str
+```
+
+`todo_write` is full replacement, not incremental append. To change one item, the model must send the whole list again:
+
+```python
+def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    items = [
+        TodoItem(
+            content=t.get("content", ""),
+            status=t.get("status", "pending"),
+            active_form=t.get("activeForm", ""),
+        )
+        for t in args.get("todos", [])
+    ]
+    state.todo_store = items
+
+    lines = [_render_todos(items), "", "Todos updated."]
+    completed = sum(1 for t in items if t.status == "completed")
+    kws = ("test", "pytest", "verify", "lint", "check")
+    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
+    if completed >= 3 and not has_verify:
+        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
+    return "\n".join(lines)
+```
+
+There is also a small nudge: if the model closes 3+ tasks and no todo mentions `test` / `pytest` / `verify` / `lint` / `check`, the tool result reminds it to verify before finishing.
+
+`/todo` reads the same `RuntimeState.todo_store`:
+
+```python
+def _cmd_todo(_args: list[str], ctx: SlashContext) -> SlashResult:
+    items = ctx.state.todo_store if ctx.state else []
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    body = "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
+    return SlashResult(handled=True, message=body)
+```
+
+The toolbar can also show the current `in_progress` item's `active_form`:
+
+```python
+active = next((t.active_form for t in state.todo_store if t.status == "in_progress"), "")
+todo = f" · {active}" if active else ""
+return f" {mode} · {state.model}{todo} "
+```
+
+Run:
+
+```bash
+> Use todo_write to plan and execute: 1 read cli.py 2 add a top comment 3 run git_status to verify
+tool_call: todo_write {...}
+  ◉ Read cli.py
+  ○ Add a top comment
+  ○ Run git_status to verify
+Todos updated.
+> /todo
+  ✓ Read cli.py
+  ✓ Add a top comment
+  ◉ Run git_status to verify
+```
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v4-to-v5-todo-write.diff"
+  title="v5 — todo_write / todo_read / toolbar progress"
+  description="RuntimeState gains todo_store; tools.py registers todo_write and todo_read; permissions allow todo tools; /todo and bottom_toolbar read the same shared state."
+/>
+
+---
+
+## v6 — Plan Mode Approval Loop
+
+Day 5 gave us the base of plan mode: write tools are denied. Day 7's `/plan` only told you to restart. v6 turns it into a real approval loop.
+
+Two tools enter and exit plan mode:
+
+```python
+def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    state.permission_mode = "plan"
+    return (
+        "Plan mode on. Write tools are denied. Draft a clear plan, then present it "
+        "(or call exit_plan_mode(plan_summary)). The harness will ask the user to "
+        "approve before writes unlock."
+    )
+
+
+def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    return "Plan approved. Write tools are now enabled."
+```
+
+The actual approval does not live in the tool function. It lives in the harness interception block in `agent.py`:
+
+```python
+if call.name == "exit_plan_mode":
+    plan_summary = call.arguments.get("plan_summary", "")
+    if not confirm_plan(plan_summary):
+        obs = "Plan not approved. Revise the plan and call exit_plan_mode again."
+        return {"type": "tool_result", "tool_use_id": call.id, "content": obs, "is_error": True}
+    state.permission_mode = "acceptEdits"
+```
+
+There is a practical compatibility path too: some models do not call `exit_plan_mode`; they return the plan as final text. Day 8 routes that through the same turn-boundary approval:
+
+```python
+if state.permission_mode == "plan" and final.strip():
+    if confirm_plan(final):
+        state.permission_mode = "acceptEdits"
+        messages.append({"role": "user", "content": "Plan approved. Implement it now."})
+    else:
+        messages.append({"role": "user", "content": "Plan not approved. Revise the plan and present it again."})
+    continue
+```
+
+`exit_plan_mode` is still a hard boundary. If the model submits a plan and sneaks `file_write` into the same turn, the harness only processes approval; the other tool calls get error `tool_result` blocks and do not execute.
+
+`confirm_plan` also bypasses `patch_stdout`, because the Plan panel must appear before the confirmation prompt:
+
+```python
+def confirm_plan(plan_summary: str) -> bool:
+    def _do() -> bool:
+        buffer = StringIO()
+        Console(file=buffer, no_color=True).print(
+            Panel(plan_summary or "(empty plan)", title="Plan", border_style="blue")
+        )
+        panel = buffer.getvalue()
+        if _terminal_asker is not None:
+            _write_real_terminal(panel)
+        else:
+            typer.echo(panel, nl=False)
+        return typer.confirm("Approve this plan and exit plan mode?", default=False)
+
+    return _ask(_do)
+```
+
+Run:
+
+```bash
+$ uv run agent-code --permission-mode plan
+ plan · deepseek-v4-pro
+> Create day8_demo.py with a fibonacci function and pytest tests
+tool_call: read_file {'path': 'pyproject.toml'}
+...
+╭─ Plan ─────────────────────────────────────╮
+│ 1. Create day8_demo.py                      │
+│ 2. Implement fibonacci                      │
+│ 3. Add pytest coverage                      │
+╰─────────────────────────────────────────────╯
+Approve this plan and exit plan mode? [y/N]: y
+ accept edits · deepseek-v4-pro
+tool_call: file_write {'file_path': 'day8_demo.py', ...}
+```
+
+Acceptance check: before the panel appears and you approve it, no file writes happen. After approval, mode flips to `acceptEdits`. If the plan needs `bash`, that command still asks separately.
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v5-to-final-plan-mode.diff"
+  title="v6 — enter_plan_mode / exit_plan_mode + confirm_plan approval gate"
+  description="Plan mode only allows read, todo, and plan tools; exit_plan_mode and turn-end final text both route to confirm_plan; approval flips the runtime state to acceptEdits."
+/>
+
+---
+
+### Terminal Replay Demo
+
+Here is the Plan Mode path as a terminal replay. It focuses on the approval boundary, not a full feature test: before any write hits disk, you must see the Plan panel and approve with `y`.
+
+<TerminalReplay tracePath="/lessons/day-08/traces/plan-mode.json" />
+
+---
+
+## What We Have Now
+
+- **Interactive shell**: `PromptSession` stays at the bottom, worker thread runs the Agent Loop, and `patch_stdout` prevents trace output from corrupting input.
+- **Runtime state**: `RuntimeState` carries `permission_mode`, `model`, `abort_event`, type-ahead queue, and todos.
+- **Key bindings + model switch**: `shift+tab` cycles three modes, and `/model <name>` changes the model for the next turn.
+- **Turn lifecycle**: input typed while busy is queued and drained at turn end; ESC stops at step boundaries while preserving `tool_use` / `tool_result` pairing.
+- **Parallel tool scheduling**: read-only tools are grouped by `is_read_only` and run in parallel; writes stay serial; result order still follows the protocol.
+- **TodoWrite board**: the model can maintain a full-replacement todo list, the toolbar shows active work, and `/todo` displays the board.
+- **Plan Mode loop**: plan mode denies writes, and `confirm_plan` must approve before `acceptEdits` unlocks file writes.
+
+---
+
+## FAQ
+
+**The interactive shell flashes, then seems stuck**
+
+First confirm `prompt_toolkit` is installed: run `uv add prompt_toolkit`, then `uv sync`. Some non-VT100 terminals also behave poorly; on Windows, use Windows Terminal or WSL.
+
+**`shift+tab` does nothing**
+
+Your terminal probably consumes the key. First make sure `PromptSession` does not use `multiline=True`. If it still fails, bind a fallback such as `@kb.add("escape", "m")` to the same handler.
+
+**I pressed ESC but the Agent kept running for a moment**
+
+That is the expected half-step interrupt. Blocking `provider.complete()` cannot cancel an in-flight HTTP request. ESC only takes effect after the current model/tool step returns and before the next step starts.
+
+**Plan approval or edit confirmation does not appear**
+
+Check three things: the interactive shell calls `prompt_ui.set_terminal_asker(terminal_asker)`; `confirm_edit` / `confirm_plan` wrap their prompts in `_ask`; and the Plan panel writes through `_write_real_terminal`, not ordinary `Console().print()`.
+
+---
+
+## Practice Challenges
+
+1. **Streaming provider + immediate interrupt**: Add `complete_stream()` to `ModelProvider`, then check `abort_event` inside the streaming loop.
+
+2. **Read-only bash detection**: Parse commands; if there is no redirect, delete, move, mkdir, or other mutation, allow read-only bash into a parallel batch.
+
+3. **Declarative keymap**: Turn `build_key_bindings` into an action-string-to-callable table and support `.agent/keybindings.json` overrides.
+
+4. **Persist todos**: The todo board is currently in memory. Store it in session JSONL or SQLite and restore it on `--resume`.
+
+5. **Per-tool plan approval**: Replace hard-deny in plan mode with per-tool ask, so the user can approve or reject each write.
+
+6. **Wire cron back into the interactive shell**: Day 7's `CronScheduler` is not connected to the new shell yet. Try having scheduled prompts go into `state.input_queue`.
+
+---
+
+## Thinking Questions
+
+1. **Why must the prompt live on the main thread while the Agent runs in a worker thread?** What breaks in `patch_stdout` and `prompt_toolkit` if you flip that?
+
+2. **When ESC interrupts pending `tool_use` blocks, why must the harness return `is_error` `tool_result` blocks?** What happens if the next request carries unpaired history?
+
+3. **Who decides read-only parallelism versus serial writes?** Why does the harness partition by `Tool.is_read_only` instead of trusting the model to say which calls can run together?
+
+4. **Why must Plan Mode wait for the user to approve `confirm_plan` before writes unlock?** If `exit_plan_mode` flipped `permission_mode` without approval, what would Plan Mode still protect?
+
+---
+
+## Next Day
+
+Today `agent-code` moved from a one-shot script into a resident interactive runtime. Input layering, mode switching, interrupt/queue behavior, parallel scheduling, todos, and plan approval all do the same broader job: runtime control belongs to the harness.
+
+Day 9 adds Skills: on-demand knowledge loaded from `.agent/skills/`, so domain guidance is available when needed without bloating the system prompt.

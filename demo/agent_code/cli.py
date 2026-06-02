@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import threading
 from pathlib import Path
-from queue import Empty, Queue
 
-from click.exceptions import Abort
 import typer
 from rich.console import Console
 
-from .agent import run_agent
-from .slash import SlashContext, dispatch_slash  # Day 7：slash 注册表
+from .agent import build_system_prompt, run_agent
 from .tools import default_tools
 from .model import create_provider
-from .session import Session  # Day 6：会话持久化
-from .agent import build_system_prompt  # Day 6 v2：cold start 拼项目规则
-from .scheduler import CronScheduler  # Day 7：cron 调度器
-from .cron_tools import set_scheduler  # Day 7：让 cron 工具访问同一个 scheduler
+from .session import Session
+from .slash import SlashContext, dispatch_slash
+from .runtime import RuntimeState
 
 console = Console()
 app = typer.Typer(add_completion=False)
@@ -38,21 +33,18 @@ def run_once(
     base_url: str | None,
     max_steps: int,
     permission_mode: str,
-    session: Session | None = None,  # Day 6：可选的 session
-    system_prompt: str | None = None,  # Day 6 v2：由 main_command 拼好传入
+    session: Session | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     render_header(cwd, provider_name, model, base_url)
     if session:
         suffix = " (resumed)" if session.resumed else ""
         console.print(f"[dim]session: {session.session_id}{suffix}[/dim]")
-    provider = create_provider(provider_name, model, base_url)  # TODO: 引入 slash 命令注册系统
-    run_agent(
-        prompt, provider, default_tools(),
-        max_steps=max_steps, cwd=cwd,
-        permission_mode=permission_mode,
-        session=session,
-        system_prompt=system_prompt,
-    )
+
+    provider = create_provider(provider_name, model, base_url)
+    state = RuntimeState(permission_mode=permission_mode, model=model, provider=provider_name)
+    run_agent(prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd,
+              state=state, session=session, system_prompt=system_prompt)
 
 
 @app.callback(invoke_without_command=True)
@@ -60,18 +52,14 @@ def main_command(
     prompt: str = typer.Argument("", help="Prompt to send to the agent."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", "-C"),
     provider: str = typer.Option("anthropic", "--provider"),
-    model: str = typer.Option("deepseek-v4-flash", "--model"),
+    model: str = typer.Option("deepseek-v4-pro", "--model"),
     base_url: str | None = typer.Option(None, "--base-url"),
     max_steps: int = typer.Option(8, "--max-steps"),
     permission_mode: str = typer.Option("default", "--permission-mode", help="Permission mode: default, acceptEdits, plan"),
-    # Day 6：会话持久化入口
     resume: str | None = typer.Option(None, "--resume", help="按 session id 恢复指定会话"),
     continue_: bool = typer.Option(False, "--continue", "-c", help="恢复 cwd 最近一次会话"),
 ) -> None:
     resolved_cwd = cwd.resolve()
-    text = prompt.strip()
-
-    # Day 6：按 flag 分支决定 session 来源；具体打印交给 run_once，
     # 避免新建路径打一次、恢复路径打两次
     session: Session | None = None
     if continue_:
@@ -84,8 +72,7 @@ def main_command(
         if session is None:
             console.print(f"[red]找不到 session: {resume}[/red]")
             raise typer.Exit(code=1)
-
-    # Day 6 v2：cold start 时把 AGENT.md 读一次，整轮 CLI 共享同一份 system prompt
+    text = prompt.strip()
     system_prompt = build_system_prompt(resolved_cwd)
 
     def run_user_input(line: str) -> None:
@@ -121,59 +108,41 @@ def main_command(
         )
 
     if text:
-        run_user_input(text.strip())
+        run_user_input(text)
         return
 
     # 注释1：REPL 分支——命令后面没跟 prompt，走下面交互循环
+    # Day 8 v1：交互式 shell（取代 Day 7 的 typer.prompt 输入线程循环）
+    from .interactive import run_interactive_shell
+
     render_header(resolved_cwd, provider, model, base_url)
-    # Day 6：REPL 整个周期共享一个 session（run_once 每轮自己打印 session 头）
     if session is None:
         session = Session.create(resolved_cwd)
 
-    # Day 7：REPL 模式启动 cron scheduler；一次性模式不启动
-    scheduler = CronScheduler(resolved_cwd)
-    set_scheduler(scheduler)
-    scheduler.start()
+    state = RuntimeState(permission_mode=permission_mode, model=model, provider=provider)
+    tools = default_tools()
+
+    def run_turn(line: str) -> None:
+        # slash 已在主线程处理过；这里只跑 agent。
+        # provider 每轮按 state.model 重建——所以 /model 切换下一轮才生效（v2）。
+        turn_provider = create_provider(state.provider, state.model, base_url)
+        run_agent(
+            line, turn_provider, tools, max_steps=max_steps, cwd=resolved_cwd,
+            state=state, session=session, system_prompt=system_prompt,
+        )
+
+    def make_slash_context() -> SlashContext:
+        return SlashContext(
+            cwd=resolved_cwd,
+            permission_mode=state.permission_mode,
+            model=state.model,
+            provider=state.provider,
+            session_id=session.session_id if session else None,
+            state=state,                    # v2 新增
+        )
 
     console.print("输入 /help 查看命令，输入 /exit 退出。")
-    input_queue: Queue[str | None] = Queue()
-    stop_repl = threading.Event()
-
-    def _read_input() -> None:
-        while not stop_repl.is_set():
-            try:
-                line = typer.prompt(">").strip()
-            except (KeyboardInterrupt, EOFError, Abort):
-                input_queue.put(None)
-                return
-            input_queue.put(line)
-
-    input_thread = threading.Thread(target=_read_input, daemon=True)
-    input_thread.start()
-
-    try:
-        while True:
-            # 即使用户没有敲下一行，主线程也会定期检查 cron pending queue。
-            for pp in scheduler.drain_pending():
-                console.print(f"[dim]cron: running scheduled job → {pp}[/dim]")
-                run_user_input(pp)
-
-            try:
-                line = input_queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            if line is None:
-                break
-            if not line:
-                continue
-            if line == "/exit":
-                console.print("Bye.")
-                break
-            run_user_input(line)
-    finally:
-        stop_repl.set()
-        scheduler.stop()
+    run_interactive_shell(state, run_turn, make_slash_context)
 
 
 def main() -> None:

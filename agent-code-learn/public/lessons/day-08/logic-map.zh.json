@@ -1,0 +1,406 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 8 · 交互式 Shell + Plan Mode",
+  "subtitle": "这张图只放 Day 8 的四条主线：输入和 Agent 分线程、turn 生命周期、只读工具并发、Plan Mode 审批闭环。",
+  "diagrams": [
+    {
+      "id": "runtime-split",
+      "label": "Runtime split",
+      "title": "输入框为什么要留在主线程",
+      "summary": "PromptSession 留在主线程持有终端输入；worker thread 跑 run_agent；普通 trace 通过 patch_stdout 排到输入框上方，需要确认时再用 run_in_terminal 借回终端。",
+      "defaultActiveNodeId": "prompt-session",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "uv run agent-code",
+          "detail": "REPL 分支不再起 typer.prompt 输入线程，而是初始化 RuntimeState、ToolRegistry，然后进入 run_interactive_shell。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "prompt-session",
+          "kind": "runtime",
+          "label": "PromptSession",
+          "eyebrow": "main thread",
+          "body": "input + key bindings",
+          "detail": "主线程拥有 prompt_toolkit 输入框、ESC / shift+tab 键位和 bottom_toolbar。这样 Agent 输出不会抢走 stdin。",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "slash",
+          "kind": "tool",
+          "label": "Slash dispatch",
+          "eyebrow": "control plane",
+          "body": "/model /plan /todo",
+          "detail": "slash command 是 harness 控制面。主线程直接 dispatch，不把 /model 或 /plan 这种控制命令交给模型。",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "queue",
+          "kind": "data",
+          "label": "job_queue",
+          "eyebrow": "handoff",
+          "body": "normal prompt",
+          "detail": "普通用户输入进入 job_queue，由 worker thread 串行消费。运行中输入会在 v3 分流到 RuntimeState.input_queue。",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "worker",
+          "kind": "runtime",
+          "label": "worker thread",
+          "eyebrow": "agent side",
+          "body": "run_turn(text)",
+          "detail": "worker thread 阻塞跑 provider.complete 和工具执行。每个 turn 开头清掉 abort_event，避免上一轮 ESC 泄漏。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "agent",
+          "kind": "model",
+          "label": "run_agent",
+          "eyebrow": "Agent Loop",
+          "body": "model + tools",
+          "detail": "run_agent 接收 RuntimeState，不再接启动时固定的 permission_mode。权限、todo、plan 都从同一份运行态读取。",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "patch_stdout",
+          "eyebrow": "trace output",
+          "body": "tool_call / final above prompt",
+          "detail": "worker 线程里的 console.print 会被 patch_stdout 接管，安全排到输入框上方，不冲掉正在编辑的 prompt。",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "terminal",
+          "kind": "runtime",
+          "label": "run_in_terminal",
+          "eyebrow": "ask user",
+          "body": "confirm_edit / confirm_plan",
+          "detail": "确认 UI 不能在 worker 里直接读 stdin。prompt_ui._ask 把提问调度回主线程事件循环，run_in_terminal 暂停输入框后再问。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-session", "source": "cli", "target": "prompt-session", "label": "start" },
+        { "id": "session-slash", "source": "prompt-session", "target": "slash", "label": "slash" },
+        { "id": "slash-queue", "source": "slash", "target": "queue", "label": "should_query", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "session-queue", "source": "prompt-session", "target": "queue", "label": "prompt" },
+        { "id": "queue-worker", "source": "queue", "target": "worker", "label": "get", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "worker-agent", "source": "worker", "target": "agent", "label": "run_turn", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "agent-stdout", "source": "agent", "target": "stdout", "label": "print trace", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "agent-terminal", "source": "agent", "target": "terminal", "label": "ask", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "terminal-session", "source": "terminal", "target": "prompt-session", "label": "resume prompt", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    },
+    {
+      "id": "turn-lifecycle",
+      "label": "Turn lifecycle",
+      "title": "运行中输入和 ESC 怎么收束",
+      "summary": "busy Event 把运行中输入放进 RuntimeState.input_queue；ESC 只置 abort_event，Agent Loop 在步间检查；模型自认结束后 Stop hook 还能最多推两轮。",
+      "defaultActiveNodeId": "abort",
+      "nodes": [
+        {
+          "id": "input",
+          "kind": "runtime",
+          "label": "user input",
+          "eyebrow": "main thread",
+          "body": "prompt_async",
+          "detail": "用户随时可以输入。关键问题是 worker 是否正在跑 turn。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "busy",
+          "kind": "data",
+          "label": "busy Event",
+          "eyebrow": "state",
+          "body": "is turn running?",
+          "detail": "worker 跑 turn 前 busy.set()，finally 里 busy.clear()。主线程据此决定新输入直接提交还是排队。",
+          "position": { "x": 260, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "typeahead",
+          "kind": "data",
+          "label": "RuntimeState.input_queue",
+          "eyebrow": "type-ahead",
+          "body": "[queued]",
+          "detail": "运行中输入先进 type-ahead 队列。当前 turn 结束后，worker 把它 drain 回 job_queue 自动接着跑。",
+          "position": { "x": 520, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "step",
+          "kind": "model",
+          "label": "run_agent step",
+          "eyebrow": "model/tool boundary",
+          "body": "provider.complete",
+          "detail": "provider.complete 是阻塞调用。Day 8 没做 token 级取消，只能等当前 model/tool 步自然返回。",
+          "position": { "x": 780, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "abort",
+          "kind": "data",
+          "label": "abort_event",
+          "eyebrow": "ESC",
+          "body": "checked before tools",
+          "detail": "ESC handler 只 set 标志。run_agent 在 assistant message append 之后、执行工具之前检查它。",
+          "position": { "x": 780, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "paired-result",
+          "kind": "response",
+          "label": "is_error tool_result",
+          "eyebrow": "protocol invariant",
+          "body": "Interrupted by user",
+          "detail": "如果模型已经给了 tool_use，但用户按 ESC 不想执行，harness 仍要给每个 tool_use 补 is_error tool_result，保持 Anthropic 消息配对。",
+          "position": { "x": 520, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stop-hook",
+          "kind": "tool",
+          "label": "Stop hook",
+          "eyebrow": "lifecycle hook",
+          "body": "continue: ...",
+          "detail": "模型没有 tool_use、准备 final 时，run_hooks_raw('Stop') 可以用非 0 + stdout/stderr 推它再跑一轮；Day 8 封顶 2 次。",
+          "position": { "x": 260, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "drain",
+          "kind": "runtime",
+          "label": "drain queue",
+          "eyebrow": "turn end",
+          "body": "next prompt",
+          "detail": "当前 turn 正常结束、中断结束或 hook 续跑耗尽后，worker drain type-ahead 队列，把排队输入送回 job_queue。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "input-busy", "source": "input", "target": "busy", "label": "submit" },
+        { "id": "busy-typeahead", "source": "busy", "target": "typeahead", "label": "busy" },
+        { "id": "busy-step", "source": "busy", "target": "step", "label": "idle -> run" },
+        { "id": "step-abort", "source": "step", "target": "abort", "label": "step returns", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "abort-result", "source": "abort", "target": "paired-result", "label": "if ESC", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "step-stop", "source": "step", "target": "stop-hook", "label": "final", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "stop-step", "source": "stop-hook", "target": "step", "label": "forced", "sourceHandle": "source-top", "targetHandle": "target-left" },
+        { "id": "result-drain", "source": "paired-result", "target": "drain", "label": "return", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "stop-drain", "source": "stop-hook", "target": "drain", "label": "done", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "typeahead-drain", "source": "typeahead", "target": "drain", "label": "queued prompts", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "parallel-tools",
+      "label": "Parallel tools",
+      "title": "只读并行，写操作串行",
+      "summary": "模型可以一轮返回多个 tool_use，但能否并行由 harness 看 Tool.is_read_only。连续只读工具并行跑，写工具截断并自成一组，tool_result 仍按原顺序回填。",
+      "defaultActiveNodeId": "partition",
+      "nodes": [
+        {
+          "id": "calls",
+          "kind": "response",
+          "label": "ModelResponse.tool_calls",
+          "eyebrow": "tool_use list",
+          "body": "read + read + write",
+          "detail": "模型一轮可能同时请求多个工具。列表顺序是后续 tool_result 回填必须遵守的协议顺序。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "metadata",
+          "kind": "data",
+          "label": "Tool.is_read_only",
+          "eyebrow": "tool metadata",
+          "body": "True / False",
+          "detail": "Day 8 给 Tool dataclass 增加 is_read_only。read_file、grep、git_status 等标 True；file_write、file_edit、bash 保持 False。",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "partition",
+          "kind": "tool",
+          "label": "partition_tool_calls",
+          "eyebrow": "harness scheduler",
+          "body": "[read group] [write] [read group]",
+          "detail": "连续只读工具合成并行组；遇到写/未知工具就先收掉前面的读组，写工具自己单独一组。未知工具 fail-closed 当串行。",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "parallel",
+          "kind": "runtime",
+          "label": "ThreadPoolExecutor.map",
+          "eyebrow": "read batch",
+          "body": "max_workers=4",
+          "detail": "只读组并行执行。map 按输入顺序返回结果，所以即使工具完成顺序不同，tool_result blocks 仍能按 tool_use 顺序排列。",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "read-state",
+          "kind": "data",
+          "label": "ReadFileState lock",
+          "eyebrow": "shared state",
+          "body": "record() with Lock",
+          "detail": "并行 read_file 会同时写 ctx.read_state.entries，所以 ReadFileState.record() 用 threading.Lock 包住写入。",
+          "position": { "x": 900, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "serial",
+          "kind": "tool",
+          "label": "serial write batch",
+          "eyebrow": "world mutation",
+          "body": "file_edit / bash",
+          "detail": "写工具可能改变文件系统或外部状态，必须串行。写之后的读应该看到新状态，所以写工具会截断并行组。",
+          "position": { "x": 600, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "results",
+          "kind": "response",
+          "label": "tool_result blocks",
+          "eyebrow": "messages",
+          "body": "same order as tool_use",
+          "detail": "无论内部怎么并行，回给模型的 user message 仍是一组按原 tool_use 顺序排列的 tool_result blocks。",
+          "position": { "x": 300, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "append user(content=blocks)",
+          "detail": "assistant tool_use message 和紧接着的 user tool_result message 一起进入上下文，下一轮 complete 才能继续。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "calls-metadata", "source": "calls", "target": "metadata", "label": "lookup" },
+        { "id": "metadata-partition", "source": "metadata", "target": "partition", "label": "is_read_only" },
+        { "id": "partition-parallel", "source": "partition", "target": "parallel", "label": "read group" },
+        { "id": "parallel-lock", "source": "parallel", "target": "read-state", "label": "record", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "partition-serial", "source": "partition", "target": "serial", "label": "write group", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "parallel-results", "source": "parallel", "target": "results", "label": "ordered results", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "serial-results", "source": "serial", "target": "results", "label": "single result", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "results-messages", "source": "results", "target": "messages", "label": "append", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "plan-approval",
+      "label": "Plan approval",
+      "title": "Plan Mode 的唯一写解锁路径",
+      "summary": "plan 模式下只读、todo、plan 工具可用，其余写工具 deny。模型提交计划或在 turn 末给出计划文本后，只有 confirm_plan 被用户批准，permission_mode 才会翻到 acceptEdits。",
+      "defaultActiveNodeId": "confirm",
+      "nodes": [
+        {
+          "id": "plan",
+          "kind": "data",
+          "label": "permission_mode=plan",
+          "eyebrow": "runtime state",
+          "body": "/plan / shift+tab / enter_plan_mode",
+          "detail": "三条入口改的都是 RuntimeState.permission_mode，没有第二份状态。",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "tool",
+          "label": "decide_permission",
+          "eyebrow": "permission gate",
+          "body": "allow reads, deny writes",
+          "detail": "plan 模式允许只读工具、todo_read/todo_write、enter_plan_mode、exit_plan_mode；file_write/file_edit/bash 等写类工具直接 deny。",
+          "position": { "x": 290, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "draft",
+          "kind": "model",
+          "label": "draft plan",
+          "eyebrow": "model",
+          "body": "read + todo + propose",
+          "detail": "模型可以读取代码、写 todo、整理计划，但不能在批准前改文件。",
+          "position": { "x": 580, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "boundary",
+          "kind": "response",
+          "label": "exit_plan_mode or final text",
+          "eyebrow": "turn boundary",
+          "body": "plan_summary",
+          "detail": "有些模型会调用 exit_plan_mode(plan_summary)，也有些直接把计划当 final 文本交出来。Day 8 把两条路都收束到 turn 边界审批。",
+          "position": { "x": 870, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "confirm_plan",
+          "eyebrow": "approval gate",
+          "body": "Approve? y/N",
+          "detail": "confirm_plan 用 run_in_terminal 暂停输入框，先渲染 Plan 面板，再让用户确认。这里是唯一写解锁点。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "skip",
+          "kind": "response",
+          "label": "same-turn writes skipped",
+          "eyebrow": "protocol safety",
+          "body": "is_error tool_result",
+          "detail": "如果同一轮里模型一边提交计划一边夹带 file_write，harness 只处理审批门，其余工具补错误 tool_result，不执行。",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "accept",
+          "kind": "data",
+          "label": "acceptEdits",
+          "eyebrow": "approved state",
+          "body": "write tools unlock",
+          "detail": "用户批准后，RuntimeState.permission_mode 翻到 acceptEdits。文件写工具不再逐条确认，但 bash 仍会走命令确认。",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "write",
+          "kind": "tool",
+          "label": "write tools",
+          "eyebrow": "world mutation",
+          "body": "file_write / file_edit",
+          "detail": "批准后的下一轮，模型重新发执行工具，才真正落盘。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "plan-permission", "source": "plan", "target": "permission", "label": "mode" },
+        { "id": "permission-draft", "source": "permission", "target": "draft", "label": "read/todo only" },
+        { "id": "draft-boundary", "source": "draft", "target": "boundary", "label": "plan ready" },
+        { "id": "boundary-confirm", "source": "boundary", "target": "confirm", "label": "review", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "boundary-skip", "source": "boundary", "target": "skip", "label": "same turn", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-accept", "source": "confirm", "target": "accept", "label": "approved", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "accept-write", "source": "accept", "target": "write", "label": "next turn", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-draft", "source": "confirm", "target": "draft", "label": "rejected -> revise", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    }
+  ]
+}

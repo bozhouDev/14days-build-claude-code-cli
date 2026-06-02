@@ -21,7 +21,7 @@ class PermissionDecision:
     message: str | None = None  # deny 或 ask 时的说明文字
 
 
-# 教学版危险命令列表——对应生产级 bashSecurity 2600 行的一个最小子集
+# 教学版危险命令列表。正则只是兜底，不是完整 shell sandbox。
 _DANGEROUS_PATTERNS: list[tuple[str, str]] = [
     (r"rm\s+-rf", "rm -rf is destructive"),
     (r"rm\s+-fr", "rm -fr is destructive"),
@@ -33,7 +33,6 @@ _DANGEROUS_PATTERNS: list[tuple[str, str]] = [
     (r"\bgit\s+push\b", "git push publishes local changes to a remote"),
     (r"git\s+reset\s+--hard", "git reset --hard discards uncommitted changes"),
 ]
-
 
 def _is_dangerous(command: str) -> str | None:
     """检查命令是否匹配危险模式。返回 None 表示安全，返回字符串表示危险原因。"""
@@ -48,17 +47,14 @@ _READONLY_TOOLS = frozenset({
     "read_file", "list_files", "glob", "grep", "project_tree",
     "git_status", "git_diff",
     "system_date", "echo",
-    "memory_recall",  # Day 6：memdir 召回是纯读，进 readonly 没问题
-    "cron_list",  # Day 7：列出 cron job 是纯读
+    "memory_recall",
+    "cron_list",
+    "todo_read",          # 新增 todo_read
 })
 
-# Day 6/7：写入范围被锁定的"低风险写"工具。
-# default / acceptEdits 直接放行；plan 模式仍然 deny——plan 的硬约束就是只读。
-_LOW_RISK_WRITES = frozenset({
-    "memory_write",
-    "cron_create",
-    "cron_cancel",
-})
+# 写入范围被锁在 .agent/ 下的"低风险写"工具。
+# default / acceptEdits 直接放行；plan 模式仍然 deny。
+_LOW_RISK_WRITES = frozenset({"memory_write", "cron_create", "cron_cancel", "todo_write"})  # 新增 todo_write
 
 # 交互和网络都不是写入，但仍需要用户知道 Agent 正在停下来问人或访问外部资源。
 _ASK_TOOLS = frozenset({"ask_user_question", "web_fetch", "web_search"})
@@ -73,21 +69,24 @@ def decide_permission(request: PermissionRequest) -> PermissionDecision:
     if tool_name in _ASK_TOOLS:
         return PermissionDecision("ask")
 
-    # plan 模式：只允许只读工具。写类工具一律 deny。
+    # plan 模式：只允许只读工具；ask_user_question / web_* 仍会走 ask。
+    # 写类工具一律 deny。
     if mode == "plan":
         if tool_name in _READONLY_TOOLS:
             return PermissionDecision("allow")
+        # 新增：plan 工具和 todo 在 plan 里也放行
+        if tool_name in ("enter_plan_mode", "exit_plan_mode", "todo_write", "todo_read"):
+            return PermissionDecision("allow")
         return PermissionDecision(
             "deny",
-            f"plan mode: {tool_name} is not allowed. Only read-only tools can run in plan mode.",
+            f"plan mode: {tool_name} is denied. Submit a plan via exit_plan_mode; "
+            f"writes unlock after you approve.",
         )
 
     # 只读工具在所有模式下默认允许
     if tool_name in _READONLY_TOOLS:
         return PermissionDecision("allow")
 
-    # Day 6：低风险写工具（memory_write）在 default / acceptEdits 自动放行；
-    # plan 模式上面那段已经 deny 掉，不会走到这里
     if tool_name in _LOW_RISK_WRITES:
         return PermissionDecision("allow")
 

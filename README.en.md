@@ -55,7 +55,7 @@ The first 7 days build a useful single-agent CLI. The next 7 days upgrade it int
 | 5 | Bash + Permission | shell execution, permission requests, background tasks |
 | 6 | Session + Memory | session JSONL, project memory, memdir |
 | 7 | Slash + Hooks | slash commands, hooks, cron `/loop` |
-| 8 | TodoWrite + Plan Mode | planning mode, todo state, execution constraints |
+| 8 | Interactive Shell + Plan Mode | interactive shell, TodoWrite, Plan Mode approval loop |
 | 9 | Skills | on-demand knowledge and workflows |
 | 10 | Subagents | subagent dispatch and result handoff |
 | 11 | Context Compact | long-context compaction and cost tracking |
@@ -63,7 +63,7 @@ The first 7 days build a useful single-agent CLI. The next 7 days upgrade it int
 | 13 | Worktree + Final Demo | worktree isolation and end-to-end coding tasks |
 | 14 | MCP + ToolSearch | MCP client, tool discovery, tool authoring |
 
-The repository currently includes the first 7 days of tutorials and runnable snapshots. Days 8-14 will continue on the same route.
+The repository currently includes the first 8 days of tutorials and runnable snapshots. Later days will continue on the same route.
 
 ## Getting Started
 
@@ -122,26 +122,6 @@ flowchart TD
   Permission --> Workspace
 ```
 
-## Claude Code Source Architecture Reference
-
-`reference/claude-code-official/` is a local research copy of a publicly visible Claude Code source snapshot. We use it to understand architectural boundaries. We do not copy the official TypeScript source, prompts, or internal protocol text into the tutorial.
-
-```mermaid
-flowchart TD
-  Main["src/main.tsx<br/>CLI entry"] --> Commands["src/commands/*<br/>Slash Commands"]
-  Main --> UI["React + Ink<br/>Terminal UI"]
-  Main --> Query["QueryEngine<br/>model calls and tool loop"]
-
-  Query --> Tools["src/tools/*<br/>Bash / Read / Edit / MCP / Agent / Skill"]
-  Query --> Context["context / state / memdir<br/>context and memory"]
-  Tools --> Permission["hooks/toolPermission<br/>permission checks"]
-  Tools --> Services["services/*<br/>API / MCP / Compact / LSP / Analytics"]
-
-  Main --> Bridge["bridge / remote / server<br/>IDE and remote sessions"]
-  Main --> Plugins["plugins / skills<br/>extension system"]
-  Query --> Coordinator["coordinator / tasks<br/>multi-agent and task system"]
-```
-
 ## Repository Structure
 
 ```txt
@@ -149,6 +129,7 @@ docs/                          14-day tutorials
 packages/day-*/                runnable teaching snapshots for each day
 demo/                          current integrated demo project
 agent-code-learn/              web version of the tutorial
+
 ```
 
 One important note: learners are not supposed to create a new `packages/day-*` directory every day. Those directories are reference snapshots. The learning flow is to keep evolving your own `agent-code` project from Day 1 to Day 14.
@@ -168,7 +149,7 @@ If you are also studying Agent Harness engineering, please bring your questions,
 
 ## Disclaimer
 
-This is an educational implementation. We reference the public Claude Code source snapshot under `reference/claude-code-official/` to understand its architecture, but rewrite everything in Python with teaching-friendly simplifications. It is not affiliated with Anthropic.
+This is an educational implementation. We reference the publicly visible Claude Code source snapshot to understand its architecture, but rewrite everything in Python with teaching-friendly simplifications. It is not affiliated with Anthropic.
 
 ## License
 

@@ -6,15 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .runtime import RuntimeState   # 顶部 import 区新增
+
 
 @dataclass
 class SlashContext:
     """slash handler 接收的运行时上下文。"""
+
     cwd: Path
     permission_mode: str
     model: str
     provider: str
     session_id: str | None
+    state: RuntimeState | None = None   # Day 8 v2：slash 改运行时状态的入口
 
 
 class SlashResult:
@@ -39,6 +43,7 @@ SlashHandler = Callable[[list[str], SlashContext], SlashResult]
 @dataclass
 class SlashCommand:
     """一条 slash command 的注册信息。name 不加 /。"""
+
     name: str
     description: str
     handler: SlashHandler
@@ -78,14 +83,11 @@ def _cmd_help(_args: list[str], ctx: SlashContext) -> SlashResult:
 
 def _cmd_model(args: list[str], ctx: SlashContext) -> SlashResult:
     if not args:
-        return SlashResult(
-            handled=True,
-            message=f"provider: {ctx.provider}  model: {ctx.model}",
-        )
-    return SlashResult(
-        handled=True,
-        message=f"Cannot change model at runtime. Current: {ctx.provider}/{ctx.model}",
-    )
+        return SlashResult(handled=True, message=f"provider: {ctx.provider}  model: {ctx.model}")
+    target = args[0]
+    if ctx.state is not None:
+        ctx.state.model = target            # 下一轮 run_turn 按 state.model 重建 provider
+    return SlashResult(handled=True, message=f"model → {target}（下一轮生效，当前轮不变）")
 
 
 def _cmd_context(_args: list[str], ctx: SlashContext) -> SlashResult:
@@ -120,20 +122,22 @@ def _cmd_permissions(args: list[str], ctx: SlashContext) -> SlashResult:
 
 
 def _cmd_plan(args: list[str], ctx: SlashContext) -> SlashResult:
+    if ctx.state is None:
+        return SlashResult(handled=True, message="plan 模式需要交互 shell")
     if args and args[0] == "off":
-        return SlashResult(handled=True, message="当前版本不在 REPL 内热切换权限模式。请重新用 --permission-mode default 启动。")
-    if ctx.permission_mode == "plan":
-        return SlashResult(handled=True, message="当前已经是 plan 模式。完整审批闭环会在 Day 8 实现。")
-    return SlashResult(handled=True, message="要进入 plan 模式，请重新用 --permission-mode plan 启动。完整审批闭环会在 Day 8 实现。")
+        ctx.state.permission_mode = "default"
+        return SlashResult(handled=True, message="exited plan mode")
+    ctx.state.permission_mode = "plan"
+    return SlashResult(handled=True, message="entered plan mode（写工具被禁，用 exit_plan_mode 提交计划）")
 
 
 def _cmd_loop_add(args: list[str], ctx: SlashContext) -> SlashResult:
-    """本地 /loop add：直接调 cron_create 的函数逻辑，不用绕模型。"""
     from .cron_tools import cron_create
     from .tools import ToolContext
 
     if not args:
         return SlashResult(handled=True, message="用法: /loop add <slash或prompt> --every <60s|5m|2h> --label <标签>")
+
     slash_parts: list[str] = []
     every_seconds: int | None = None
     label = ""
@@ -158,11 +162,13 @@ def _cmd_loop_add(args: list[str], ctx: SlashContext) -> SlashResult:
         else:
             slash_parts.append(args[i])
             i += 1
+
     slash = " ".join(slash_parts)
     if not slash:
         return SlashResult(handled=True, message="用法: /loop add <slash或prompt> --every <60s|5m|2h>")
     if every_seconds is None:
         return SlashResult(handled=True, message="缺少 --every。用法: /loop add <slash或prompt> --every <60s|5m|2h>")
+
     tool_ctx = ToolContext(cwd=ctx.cwd)
     msg = cron_create({"slash": slash, "every_seconds": every_seconds, "label": label}, tool_ctx)
     return SlashResult(handled=True, message=msg)
@@ -189,7 +195,6 @@ def _cmd_loop_cancel(args: list[str], ctx: SlashContext) -> SlashResult:
 
 
 def _cmd_loop(args: list[str], ctx: SlashContext) -> SlashResult:
-    """管理 cron 定时任务：/loop add/list/cancel。"""
     if not args:
         return SlashResult(
             handled=True,
@@ -206,6 +211,13 @@ def _cmd_loop(args: list[str], ctx: SlashContext) -> SlashResult:
     return SlashResult(handled=True, message=f"Unknown /loop subcommand: {subcommand}")
 
 
+def _cmd_todo(_args: list[str], ctx: SlashContext) -> SlashResult:
+    items = ctx.state.todo_store if ctx.state else []
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    body = "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
+    return SlashResult(handled=True, message=body)
+
+
 register("help", "显示所有可用 slash command", _cmd_help)
 register("model", "显示当前模型/provider", _cmd_model)
 register("context", "显示当前 session、cwd、权限模式", _cmd_context)
@@ -213,3 +225,4 @@ register("compact", "显示 compact 状态", _cmd_compact)
 register("permissions", "显示权限模式 (default/acceptEdits/plan)", _cmd_permissions)
 register("plan", "显示 plan 模式提示", _cmd_plan)
 register("loop", "管理 cron 定时任务: add/list/cancel", _cmd_loop)
+register("todo", "显示当前 todo 列表", _cmd_todo)

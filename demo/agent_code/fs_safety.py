@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pathspec
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,13 +42,15 @@ class ReadFileState:
     # path -> (mtime_ns, char_count)。Day 4 的 read-before-edit 要靠它判断
     # "模型读过这个文件之后，文件在磁盘上是不是又被改过"。今天先只做记录。
     entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)   # Day 8 v4：并行读保护 entries
 
     def record(self, path: Path, content: str) -> None:
         try:
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             return
-        self.entries[path] = (mtime_ns, len(content))
+        with self._lock:                      # 原来这行赋值直接裸写，现在包进锁
+            self.entries[path] = (mtime_ns, len(content))
 
 
 def resolve_in_cwd(cwd: Path, user_path: str) -> Path:

@@ -1,0 +1,406 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 8 · Interactive Shell + Plan Mode",
+  "subtitle": "This map keeps the four Day 8 lines that matter: splitting input from the Agent, turn lifecycle, parallel read-only tools, and the Plan Mode approval loop.",
+  "diagrams": [
+    {
+      "id": "runtime-split",
+      "label": "Runtime split",
+      "title": "Why the prompt stays on the main thread",
+      "summary": "PromptSession owns terminal input on the main thread; the worker thread runs run_agent; normal trace output goes through patch_stdout, while confirmation UI borrows the terminal with run_in_terminal.",
+      "defaultActiveNodeId": "prompt-session",
+      "nodes": [
+        {
+          "id": "cli",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "uv run agent-code",
+          "detail": "The REPL branch no longer starts a typer.prompt input thread. It creates RuntimeState, ToolRegistry, then enters run_interactive_shell.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "prompt-session",
+          "kind": "runtime",
+          "label": "PromptSession",
+          "eyebrow": "main thread",
+          "body": "input + key bindings",
+          "detail": "The main thread owns prompt_toolkit input, ESC / shift+tab bindings, and bottom_toolbar. Agent output no longer competes for stdin.",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "slash",
+          "kind": "tool",
+          "label": "Slash dispatch",
+          "eyebrow": "control plane",
+          "body": "/model /plan /todo",
+          "detail": "Slash commands are the harness control plane. The main thread dispatches them directly instead of sending /model or /plan to the model.",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "queue",
+          "kind": "data",
+          "label": "job_queue",
+          "eyebrow": "handoff",
+          "body": "normal prompt",
+          "detail": "Normal user prompts go into job_queue and are consumed serially by the worker thread. While busy, v3 redirects new input into RuntimeState.input_queue.",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "worker",
+          "kind": "runtime",
+          "label": "worker thread",
+          "eyebrow": "agent side",
+          "body": "run_turn(text)",
+          "detail": "The worker thread blocks on provider.complete and tool execution. Each turn clears abort_event at the start so a previous ESC does not leak.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "agent",
+          "kind": "model",
+          "label": "run_agent",
+          "eyebrow": "Agent Loop",
+          "body": "model + tools",
+          "detail": "run_agent now receives RuntimeState instead of a fixed startup permission_mode. Permission, todo, and plan state all read from one runtime object.",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stdout",
+          "kind": "output",
+          "label": "patch_stdout",
+          "eyebrow": "trace output",
+          "body": "tool_call / final above prompt",
+          "detail": "console.print from the worker is intercepted by patch_stdout and safely rendered above the input line without corrupting the prompt.",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "terminal",
+          "kind": "runtime",
+          "label": "run_in_terminal",
+          "eyebrow": "ask user",
+          "body": "confirm_edit / confirm_plan",
+          "detail": "Confirmation UI cannot read stdin directly from the worker. prompt_ui._ask schedules the question back onto the main event loop, and run_in_terminal pauses the prompt first.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "cli-session", "source": "cli", "target": "prompt-session", "label": "start" },
+        { "id": "session-slash", "source": "prompt-session", "target": "slash", "label": "slash" },
+        { "id": "slash-queue", "source": "slash", "target": "queue", "label": "should_query", "sourceHandle": "source-right", "targetHandle": "target-left" },
+        { "id": "session-queue", "source": "prompt-session", "target": "queue", "label": "prompt" },
+        { "id": "queue-worker", "source": "queue", "target": "worker", "label": "get", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "worker-agent", "source": "worker", "target": "agent", "label": "run_turn", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "agent-stdout", "source": "agent", "target": "stdout", "label": "print trace", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "agent-terminal", "source": "agent", "target": "terminal", "label": "ask", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "terminal-session", "source": "terminal", "target": "prompt-session", "label": "resume prompt", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    },
+    {
+      "id": "turn-lifecycle",
+      "label": "Turn lifecycle",
+      "title": "How queued input and ESC settle",
+      "summary": "busy Event sends input typed during a run into RuntimeState.input_queue; ESC only sets abort_event; Agent Loop checks it between steps; Stop hook can force up to two continuation turns.",
+      "defaultActiveNodeId": "abort",
+      "nodes": [
+        {
+          "id": "input",
+          "kind": "runtime",
+          "label": "user input",
+          "eyebrow": "main thread",
+          "body": "prompt_async",
+          "detail": "The user can type at any time. The key question is whether the worker is already running a turn.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "busy",
+          "kind": "data",
+          "label": "busy Event",
+          "eyebrow": "state",
+          "body": "is turn running?",
+          "detail": "The worker calls busy.set() before a turn and busy.clear() in finally. The main thread uses it to decide whether to submit or queue new input.",
+          "position": { "x": 260, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "typeahead",
+          "kind": "data",
+          "label": "RuntimeState.input_queue",
+          "eyebrow": "type-ahead",
+          "body": "[queued]",
+          "detail": "Input typed during a run goes into the type-ahead queue. When the current turn ends, the worker drains it back into job_queue.",
+          "position": { "x": 520, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "step",
+          "kind": "model",
+          "label": "run_agent step",
+          "eyebrow": "model/tool boundary",
+          "body": "provider.complete",
+          "detail": "provider.complete is blocking. Day 8 does not implement token-level cancellation; it can only stop after the current model/tool step returns.",
+          "position": { "x": 780, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "abort",
+          "kind": "data",
+          "label": "abort_event",
+          "eyebrow": "ESC",
+          "body": "checked before tools",
+          "detail": "The ESC handler only sets a flag. run_agent checks it after appending the assistant message and before executing tools.",
+          "position": { "x": 780, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "paired-result",
+          "kind": "response",
+          "label": "is_error tool_result",
+          "eyebrow": "protocol invariant",
+          "body": "Interrupted by user",
+          "detail": "If the model already emitted tool_use but the user pressed ESC, the harness still returns one is_error tool_result per tool_use to keep Anthropic messages paired.",
+          "position": { "x": 520, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "stop-hook",
+          "kind": "tool",
+          "label": "Stop hook",
+          "eyebrow": "lifecycle hook",
+          "body": "continue: ...",
+          "detail": "When the model is about to end with final text, run_hooks_raw('Stop') can push one more turn via non-zero exit plus output. Day 8 caps this at two continuations.",
+          "position": { "x": 260, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "drain",
+          "kind": "runtime",
+          "label": "drain queue",
+          "eyebrow": "turn end",
+          "body": "next prompt",
+          "detail": "After a normal end, interrupt, or exhausted Stop hook, the worker drains the type-ahead queue and schedules the queued prompt.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "input-busy", "source": "input", "target": "busy", "label": "submit" },
+        { "id": "busy-typeahead", "source": "busy", "target": "typeahead", "label": "busy" },
+        { "id": "busy-step", "source": "busy", "target": "step", "label": "idle -> run" },
+        { "id": "step-abort", "source": "step", "target": "abort", "label": "step returns", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "abort-result", "source": "abort", "target": "paired-result", "label": "if ESC", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "step-stop", "source": "step", "target": "stop-hook", "label": "final", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "stop-step", "source": "stop-hook", "target": "step", "label": "forced", "sourceHandle": "source-top", "targetHandle": "target-left" },
+        { "id": "result-drain", "source": "paired-result", "target": "drain", "label": "return", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "stop-drain", "source": "stop-hook", "target": "drain", "label": "done", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "typeahead-drain", "source": "typeahead", "target": "drain", "label": "queued prompts", "sourceHandle": "source-bottom", "targetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "parallel-tools",
+      "label": "Parallel tools",
+      "title": "Read-only tools in parallel, writes serial",
+      "summary": "A model can return multiple tool_use blocks in one turn, but the harness decides parallelism from Tool.is_read_only. Contiguous read-only tools run in parallel; writes split the batches; tool_result order still matches tool_use order.",
+      "defaultActiveNodeId": "partition",
+      "nodes": [
+        {
+          "id": "calls",
+          "kind": "response",
+          "label": "ModelResponse.tool_calls",
+          "eyebrow": "tool_use list",
+          "body": "read + read + write",
+          "detail": "The model may request several tools in one response. That list order is the protocol order tool_result blocks must preserve.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "metadata",
+          "kind": "data",
+          "label": "Tool.is_read_only",
+          "eyebrow": "tool metadata",
+          "body": "True / False",
+          "detail": "Day 8 adds is_read_only to Tool. read_file, grep, git_status and similar tools are True; file_write, file_edit, and bash remain False.",
+          "position": { "x": 300, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "partition",
+          "kind": "tool",
+          "label": "partition_tool_calls",
+          "eyebrow": "harness scheduler",
+          "body": "[read group] [write] [read group]",
+          "detail": "Contiguous read-only tools become one parallel batch. A write or unknown tool closes the current read batch and becomes its own serial batch. Unknown tools fail closed as serial.",
+          "position": { "x": 600, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "parallel",
+          "kind": "runtime",
+          "label": "ThreadPoolExecutor.map",
+          "eyebrow": "read batch",
+          "body": "max_workers=4",
+          "detail": "Read-only batches run in parallel. map returns results in input order, so tool_result blocks stay aligned with tool_use order even if tools finish out of order.",
+          "position": { "x": 900, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "read-state",
+          "kind": "data",
+          "label": "ReadFileState lock",
+          "eyebrow": "shared state",
+          "body": "record() with Lock",
+          "detail": "Parallel read_file calls can write ctx.read_state.entries at the same time, so ReadFileState.record() wraps writes in threading.Lock.",
+          "position": { "x": 900, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "serial",
+          "kind": "tool",
+          "label": "serial write batch",
+          "eyebrow": "world mutation",
+          "body": "file_edit / bash",
+          "detail": "Write tools can mutate the filesystem or external state, so they run serially. Reads after a write should see the new state, which is why writes split batches.",
+          "position": { "x": 600, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "results",
+          "kind": "response",
+          "label": "tool_result blocks",
+          "eyebrow": "messages",
+          "body": "same order as tool_use",
+          "detail": "No matter how execution is scheduled internally, the user message returned to the model contains tool_result blocks in the original tool_use order.",
+          "position": { "x": 300, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "append user(content=blocks)",
+          "detail": "The assistant tool_use message and the following user tool_result message both enter context before the next complete call.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "calls-metadata", "source": "calls", "target": "metadata", "label": "lookup" },
+        { "id": "metadata-partition", "source": "metadata", "target": "partition", "label": "is_read_only" },
+        { "id": "partition-parallel", "source": "partition", "target": "parallel", "label": "read group" },
+        { "id": "parallel-lock", "source": "parallel", "target": "read-state", "label": "record", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "partition-serial", "source": "partition", "target": "serial", "label": "write group", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "parallel-results", "source": "parallel", "target": "results", "label": "ordered results", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "serial-results", "source": "serial", "target": "results", "label": "single result", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "results-messages", "source": "results", "target": "messages", "label": "append", "sourceHandle": "source-left", "targetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "plan-approval",
+      "label": "Plan approval",
+      "title": "The only path that unlocks writes in Plan Mode",
+      "summary": "Plan mode allows reads, todo tools, and plan tools; all other write tools are denied. Whether the model calls exit_plan_mode or returns final plan text, confirm_plan must be approved before permission_mode flips to acceptEdits.",
+      "defaultActiveNodeId": "confirm",
+      "nodes": [
+        {
+          "id": "plan",
+          "kind": "data",
+          "label": "permission_mode=plan",
+          "eyebrow": "runtime state",
+          "body": "/plan / shift+tab / enter_plan_mode",
+          "detail": "All three entry points modify RuntimeState.permission_mode. There is no second copy of mode state.",
+          "position": { "x": 0, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "permission",
+          "kind": "tool",
+          "label": "decide_permission",
+          "eyebrow": "permission gate",
+          "body": "allow reads, deny writes",
+          "detail": "Plan mode allows read-only tools, todo_read/todo_write, enter_plan_mode, and exit_plan_mode. file_write, file_edit, bash, and other write-like tools are denied.",
+          "position": { "x": 290, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "draft",
+          "kind": "model",
+          "label": "draft plan",
+          "eyebrow": "model",
+          "body": "read + todo + propose",
+          "detail": "The model can inspect code, update todos, and draft a plan, but it cannot modify files before approval.",
+          "position": { "x": 580, "y": 90 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "boundary",
+          "kind": "response",
+          "label": "exit_plan_mode or final text",
+          "eyebrow": "turn boundary",
+          "body": "plan_summary",
+          "detail": "Some models call exit_plan_mode(plan_summary); others return the plan as final text. Day 8 routes both through the same turn-boundary approval gate.",
+          "position": { "x": 870, "y": 90 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "confirm",
+          "kind": "runtime",
+          "label": "confirm_plan",
+          "eyebrow": "approval gate",
+          "body": "Approve? y/N",
+          "detail": "confirm_plan pauses the prompt with run_in_terminal, renders the Plan panel first, then asks the user. This is the only place writes unlock.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "skip",
+          "kind": "response",
+          "label": "same-turn writes skipped",
+          "eyebrow": "protocol safety",
+          "body": "is_error tool_result",
+          "detail": "If the model submits a plan and sneaks file_write into the same turn, the harness only processes the approval gate. The other tool_use blocks receive error tool_result blocks and are not executed.",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "accept",
+          "kind": "data",
+          "label": "acceptEdits",
+          "eyebrow": "approved state",
+          "body": "write tools unlock",
+          "detail": "After approval, RuntimeState.permission_mode becomes acceptEdits. File writes no longer ask one by one, but bash still requires command confirmation.",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 630 }
+        },
+        {
+          "id": "write",
+          "kind": "tool",
+          "label": "write tools",
+          "eyebrow": "world mutation",
+          "body": "file_write / file_edit",
+          "detail": "Only the next turn re-issues execution tools and actually mutates the filesystem.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        }
+      ],
+      "edges": [
+        { "id": "plan-permission", "source": "plan", "target": "permission", "label": "mode" },
+        { "id": "permission-draft", "source": "permission", "target": "draft", "label": "read/todo only" },
+        { "id": "draft-boundary", "source": "draft", "target": "boundary", "label": "plan ready" },
+        { "id": "boundary-confirm", "source": "boundary", "target": "confirm", "label": "review", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "boundary-skip", "source": "boundary", "target": "skip", "label": "same turn", "sourceHandle": "source-bottom", "targetHandle": "target-top" },
+        { "id": "confirm-accept", "source": "confirm", "target": "accept", "label": "approved", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "accept-write", "source": "accept", "target": "write", "label": "next turn", "sourceHandle": "source-left", "targetHandle": "target-right" },
+        { "id": "confirm-draft", "source": "confirm", "target": "draft", "label": "rejected -> revise", "sourceHandle": "source-top", "targetHandle": "target-bottom" }
+      ]
+    }
+  ]
+}

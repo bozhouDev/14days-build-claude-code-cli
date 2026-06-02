@@ -1,0 +1,596 @@
+---
+title: "Day 8：交互式 Shell + Plan Mode 闭环"
+description: "前 7 天的 agent-code 是一次性脚本式 REPL。今天把它升级成常驻交互 shell：输入输出分层、运行时模式切换、ESC 中断、多工具并发、TodoWrite 和真正的 Plan Mode 审批闭环。"
+---
+
+前 7 天，我们从零搭了一个能跑通的单 Agent CLI：模型接入、文件工具、安全编辑、bash 执行、权限控制、三层记忆、slash/hooks/cron。
+
+这些能力已经像一个 <Concept name="Harness">harness</Concept>，但它的交互手感还是脚本式的：`console.print` 直接打终端，`typer.prompt` 阻塞等输入，`permission_mode` 和 `model` 都是启动时写死的局部变量。
+
+今天把 `agent-code` 抬成常驻交互运行时。跑完之后，你会看到底部输入框一直在，Agent 回答时 trace 滚在上方；`shift+tab` 能切模式；ESC 能在步间中断；多个只读工具会并发；Plan Mode 里只有你批准计划，写工具才解锁。
+
+代码约 1200 行，新增约 600 行。今天故意分成 6 个可跑版本，因为交互 shell 的线程、队列、确认 UI 和权限边界必须拆开讲清楚。
+
+---
+
+### Day 8 主视觉：交互运行时的四条主线
+
+先看这张 Agent Logic Map。它不复述所有终端输出，只抓今天最容易写错的四个边界：主线程输入、turn 生命周期、并发工具编排、Plan Mode 审批门。
+
+<AgentLogicMap mapPath="/lessons/day-08/logic-map.json" />
+
+---
+
+今天从 Day 7 的 `agent-code` 项目继续改。仓库里的 `packages/day-*` 是参考答案快照，不是让你每天新建一个目录。
+
+## 起手：今天的起点
+
+Day 7 的 REPL 已经有 slash、hooks 和 cron，但它还是这条线：
+
+```txt
+typer.prompt(">") -> input_queue -> run_agent(...) -> console.print trace
+```
+
+这会带来三个问题：
+
+- Agent 回答时，`tool_call` / `observation` / `final` 和下一行输入混在一起。
+- Agent 跑的时候你没法清楚地继续打字、排队或中断。
+- `/model`、`/plan` 这些控制面还不能在运行时真正改共享状态。
+
+先加依赖：
+
+```bash
+uv add prompt_toolkit
+```
+
+`prompt_toolkit` 提供常驻底部输入框、键位绑定、状态栏和多线程安全重绘。今天会新增 `agent_code/interactive.py` 和 `agent_code/runtime.py`，再改 `cli.py`、`agent.py`、`tools.py`、`permissions.py`、`slash.py`、`prompt_ui.py`、`hooks.py`、`fs_safety.py`。
+
+---
+
+## v1：交互式 shell 骨架
+
+Day 7 的线程方向其实反了：输入在 worker 线程，Agent Loop 在主线程。今天要把输入框留在主线程，Agent Loop 挪到 worker。
+
+核心结构是：
+
+```txt
+main thread: PromptSession + key bindings + slash dispatch
+worker thread: run_agent + provider.complete + tools.run
+```
+
+先新增共享运行态：
+
+```python
+@dataclass
+class RuntimeState:
+    permission_mode: str = "default"
+    model: str = "deepseek-v4-pro"
+    provider: str = "anthropic"
+    abort_event: threading.Event = field(default_factory=threading.Event)
+    input_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
+```
+
+`permission_mode` 和 `model` 以后不再是 `cli.py` 的局部变量，而是主线程和 worker 共享的一份状态。
+
+交互 shell 的关键是 `patch_stdout()` 和 `run_in_terminal()`：
+
+```python
+async def _run() -> None:
+    loop = asyncio.get_running_loop()
+
+    def terminal_asker(func: Callable[[], Any]) -> Any:
+        async def ask_in_terminal() -> Any:
+            return await run_in_terminal(func)
+        return asyncio.run_coroutine_threadsafe(ask_in_terminal(), loop).result()
+
+    prompt_ui.set_terminal_asker(terminal_asker)
+
+    with patch_stdout():
+        while True:
+            text = (await session.prompt_async("> ")).strip()
+            if text.startswith("/"):
+                result = dispatch_slash(text, make_slash_context())
+                ...
+            job_queue.put(text)
+```
+
+普通 trace 走 `patch_stdout`，会安全排到输入框上方；确认编辑或批准计划时，worker 不能抢 `stdin`，所以通过 `_ask` 调回主线程，用 `run_in_terminal` 暂停输入框再问。
+
+跑一下：
+
+```bash
+$ uv run agent-code
+Agent Code
+cwd: /your/project
+provider: anthropic  model: deepseek-v4-pro
+
+输入 /help 查看命令，输入 /exit 退出。
+> 读一下 agent_code/cli.py 然后一句话说说它做什么
+tool_call: read_file {'path': 'agent_code/cli.py'}
+final: cli.py 是 CLI 入口，负责解析参数、分派 slash、跑 Agent Loop。
+ default · deepseek-v4-pro
+>
+```
+
+关键验收是：输入框钉在底部，Agent trace 出现在上方；one-shot `uv run agent-code "/help"` 仍然跑完即退，不进入交互 shell。
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v1-interactive-shell.diff"
+  title="v1 阶段：PromptSession + RuntimeState + worker thread"
+  description="新增交互 shell 和共享运行态；run_agent 改为读取 RuntimeState；确认 UI 通过 prompt_ui._ask 借回主线程。"
+/>
+
+---
+
+## v2：键位层 + 模式/模型运行时切换
+
+v1 的 shell 能交互了，但模式和模型还只是初始值。v2 做两件事：`shift+tab` 循环切权限模式，`/model` 改成运行时切换。
+
+`RuntimeState` 增加模式循环：
+
+```python
+def cycle_permission_mode(self) -> str:
+    """shift+tab 循环：default → acceptEdits → plan → default。只主线程调，无需锁。"""
+    order = ["default", "acceptEdits", "plan"]
+    idx = order.index(self.permission_mode) if self.permission_mode in order else 0
+    self.permission_mode = order[(idx + 1) % len(order)]
+    return self.permission_mode
+```
+
+`interactive.py` 把 `"s-tab"` 绑到这个方法：
+
+```python
+@kb.add("s-tab")
+def _(event: Any) -> None:
+    new_mode = state.cycle_permission_mode()
+    print(f"[mode → {new_mode}]")
+```
+
+`/model` 也不再拒绝切换。它只改 `state.model`，下一轮 `run_turn` 会按新模型重建 <Concept name="Provider">Provider</Concept>：
+
+```python
+def _cmd_model(args: list[str], ctx: SlashContext) -> SlashResult:
+    if not args:
+        return SlashResult(handled=True, message=f"provider: {ctx.provider}  model: {ctx.model}")
+    target = args[0]
+    if ctx.state is not None:
+        ctx.state.model = target
+    return SlashResult(handled=True, message=f"model → {target}（下一轮生效，当前轮不变）")
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code
+ default · deepseek-v4-pro
+> （按 shift+tab）
+[mode → acceptEdits]
+ accept edits · deepseek-v4-pro
+> /model deepseek-chat
+model → deepseek-chat（下一轮生效，当前轮不变）
+ accept edits · deepseek-chat
+```
+
+验收看两点：状态栏即时变；下一轮提问用新模型。当前正在跑的 turn 不受影响，这是刻意把 provider 绑定在 turn 边界上。
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v1-to-v2-runtime-controls.diff"
+  title="v2 阶段：shift+tab 模式循环与 /model 热切换"
+  description="RuntimeState 增加 cycle_permission_mode；PromptSession 绑定 s-tab；SlashContext 带 state，/model 改共享运行态。"
+/>
+
+---
+
+## v3：回合生命周期控制
+
+现在用户能在 Agent 运行时继续输入，但还缺两个边界：忙时输入排到哪里，ESC 什么时候生效。
+
+v3 加一个 `busy` 标志。worker 跑 turn 时置位；主线程看到 busy，就把新输入放进 `RuntimeState.input_queue`：
+
+```python
+if busy.is_set():
+    state.input_queue.put(text)
+    print("[queued] turn 结束后自动处理")
+else:
+    job_queue.put(text)
+```
+
+turn 结束后，worker drain 队列：
+
+```python
+finally:
+    busy.clear()
+while not state.input_queue.empty():
+    job_queue.put(state.input_queue.get())
+```
+
+ESC 不是强杀线程。它只设置 `abort_event`，`run_agent` 在模型返回、执行工具前检查：
+
+```python
+if state.abort_event.is_set():
+    emit("interrupted by user")
+    if response.tool_calls:
+        blocks = [
+            {"type": "tool_result", "tool_use_id": c.id,
+             "content": "Interrupted by user", "is_error": True}
+            for c in response.tool_calls
+        ]
+        messages.append({"role": "user", "content": blocks})
+    return AgentResult(final="interrupted", trace=trace, messages=messages)
+```
+
+这段的核心是配对不变量：模型给了 <Concept name="Tool Call">tool_use</Concept>，harness 即使不执行，也必须补一个错误形态的 <Concept name="Tool Result">tool_result</Concept>，否则下次请求会被 Anthropic Messages API 拒绝。
+
+v3 还加了 `Stop` hook。模型没有工具调用、准备结束时，hook 可以用非 0 退出码加输出，把模型再推一轮：
+
+```python
+if forced is not None:
+    continuation_count += 1
+    emit(f"continue: {forced}")
+    messages.append({"role": "user", "content": f"continue: {forced}"})
+    continue
+```
+
+跑一下 type-ahead：
+
+```bash
+> 读 agent_code/ 下所有 .py 文件，分别说一句它们做什么
+tool_call: read_file ...
+> 顺便数一下一共多少个 .py 文件
+[queued] turn 结束后自动处理
+...（上一轮结束后自动接着跑）
+```
+
+跑一下 ESC：
+
+```bash
+> 把 agent_code 每个文件都读一遍再逐个总结
+tool_call: read_file {'path': 'agent_code/agent.py'}
+（按 ESC）
+interrupted by user
+ default · deepseek-v4-pro
+>
+```
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v2-to-v3-turn-lifecycle.diff"
+  title="v3 阶段：type-ahead、ESC 半步中断、Stop hook"
+  description="busy Event 负责运行中输入排队；abort_event 在工具执行前检查并补 is_error tool_result；Stop hook 可强制续跑。"
+/>
+
+---
+
+## v4：并发工具编排
+
+模型一轮经常返回多个工具调用，例如同时读三个文件。读文件之间没有依赖，串行跑是在浪费 I/O；写工具会改变世界，不能随便并发。
+
+Day 8 的规则很小：
+
+```txt
+连续只读工具 -> 并行组
+写工具 / 未知工具 -> 单独串行组
+tool_result 回填顺序 -> 必须保持 tool_use 顺序
+```
+
+给 `Tool` 加一个元数据：
+
+```python
+@dataclass
+class Tool:
+    name: str
+    description: str
+    run: ToolFunc
+    parameters: dict[str, Any] = field(...)
+    is_read_only: bool = False
+```
+
+然后由 harness 分区：
+
+```python
+def partition_tool_calls(calls, tools) -> list[list]:
+    batches: list[list] = []
+    current: list = []
+    for call in calls:
+        tool = tools.get(call.name)
+        if tool is not None and tool.is_read_only:
+            current.append(call)
+        else:
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([call])
+    if current:
+        batches.append(current)
+    return batches
+```
+
+只读组用 `ThreadPoolExecutor.map` 跑：
+
+```python
+with ThreadPoolExecutor(max_workers=4) as ex:
+    results = list(
+        ex.map(lambda c: execute_one_tool_call(c, ctx, state, tools, emit), batch)
+    )
+tool_result_blocks.extend(results)
+```
+
+`map` 按输入顺序返回，这一点很重要：执行可以并发，回填给模型的 <Concept name="Messages">messages</Concept> 必须按原 `tool_use` 顺序。
+
+并行读还会同时写 `ReadFileState.entries`，所以 `record()` 要加锁：
+
+```python
+with self._lock:
+    self.entries[path] = (mtime_ns, len(content))
+```
+
+跑一下：
+
+```bash
+> 同时读 agent_code/agent.py、agent_code/cli.py、agent_code/tools.py，各一句话说职责
+tool_call: read_file {'path': 'agent_code/cli.py'}
+tool_call: read_file {'path': 'agent_code/agent.py'}
+tool_call: read_file {'path': 'agent_code/tools.py'}
+final: agent.py 跑 loop，cli.py 是入口，tools.py 是工具表。
+```
+
+验收看两件事：纯读工具不互相阻塞；中间夹写工具时，写工具会截断并行组、串行执行。
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v3-to-v4-parallel-tools.diff"
+  title="v4 阶段：Tool.is_read_only + 并发只读批处理"
+  description="ToolRegistry 增加 get；Tool 加 is_read_only；agent.py 抽出单工具执行和 partition_tool_calls，只读组用 ThreadPoolExecutor.map 并发。"
+/>
+
+---
+
+## v5：TodoWrite 待办板
+
+长任务要好几轮：读代码、定位、改文件、验证。模型隔几轮就容易忘了进度。v5 给它一块能读能写的共享待办板。
+
+数据结构很小：
+
+```python
+@dataclass
+class TodoItem:
+    content: str
+    status: str
+    active_form: str
+```
+
+`todo_write` 的语义是整表覆盖，不是增量追加。模型要改一条，也要把整张表传回来：
+
+```python
+def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    items = [
+        TodoItem(
+            content=t.get("content", ""),
+            status=t.get("status", "pending"),
+            active_form=t.get("activeForm", ""),
+        )
+        for t in args.get("todos", [])
+    ]
+    state.todo_store = items
+
+    lines = [_render_todos(items), "", "Todos updated."]
+    completed = sum(1 for t in items if t.status == "completed")
+    kws = ("test", "pytest", "verify", "lint", "check")
+    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
+    if completed >= 3 and not has_verify:
+        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
+    return "\n".join(lines)
+```
+
+这里还有一个小提醒：如果模型一次关掉 3+ 个任务，但整张 todo 里没有 `test` / `pytest` / `verify` / `lint` / `check`，结果末尾会提醒它先验证。
+
+`/todo` 读同一份 `RuntimeState.todo_store`：
+
+```python
+def _cmd_todo(_args: list[str], ctx: SlashContext) -> SlashResult:
+    items = ctx.state.todo_store if ctx.state else []
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    body = "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
+    return SlashResult(handled=True, message=body)
+```
+
+状态栏也会显示当前 `in_progress` 的 `active_form`：
+
+```python
+active = next((t.active_form for t in state.todo_store if t.status == "in_progress"), "")
+todo = f" · {active}" if active else ""
+return f" {mode} · {state.model}{todo} "
+```
+
+跑一下：
+
+```bash
+> 用 todo_write 列个计划再执行：1 读 cli.py 2 给 cli.py 顶部加注释 3 跑 git_status 验证。然后照着做
+tool_call: todo_write {...}
+  ◉ 读 cli.py
+  ○ 给 cli.py 顶部加注释
+  ○ 跑 git_status 验证
+Todos updated.
+> /todo
+  ✓ 读 cli.py
+  ✓ 给 cli.py 顶部加注释
+  ◉ 跑 git_status 验证
+```
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v4-to-v5-todo-write.diff"
+  title="v5 阶段：todo_write / todo_read / 状态栏待办"
+  description="RuntimeState 增加 todo_store；tools.py 注册 todo_write 和 todo_read；permissions 放行 todo 工具；/todo 和 bottom_toolbar 读取同一份共享态。"
+/>
+
+---
+
+## v6：Plan Mode 闭环
+
+Day 5 已经有 plan 模式底座：写工具会被 deny。Day 7 的 `/plan` 还只是提示你重启。v6 把它变成真正的审批闭环。
+
+两个工具负责进出 plan：
+
+```python
+def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    state.permission_mode = "plan"
+    return (
+        "Plan mode on. Write tools are denied. Draft a clear plan, then present it "
+        "(or call exit_plan_mode(plan_summary)). The harness will ask the user to "
+        "approve before writes unlock."
+    )
+
+
+def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    return "Plan approved. Write tools are now enabled."
+```
+
+但真正的审批不在工具函数里，而在 `agent.py` 的 harness 拦截块里：
+
+```python
+if call.name == "exit_plan_mode":
+    plan_summary = call.arguments.get("plan_summary", "")
+    if not confirm_plan(plan_summary):
+        obs = "Plan not approved. Revise the plan and call exit_plan_mode again."
+        return {"type": "tool_result", "tool_use_id": call.id, "content": obs, "is_error": True}
+    state.permission_mode = "acceptEdits"
+```
+
+还有一个现实兼容：有些模型不会调用 `exit_plan_mode`，而是直接把计划当 final 文本交出来。Day 8 把这种情况也收束到 turn 边界：
+
+```python
+if state.permission_mode == "plan" and final.strip():
+    if confirm_plan(final):
+        state.permission_mode = "acceptEdits"
+        messages.append({"role": "user", "content": "Plan approved. Implement it now."})
+    else:
+        messages.append({"role": "user", "content": "Plan not approved. Revise the plan and present it again."})
+    continue
+```
+
+`exit_plan_mode` 还是一个硬边界。同一轮里如果模型一边提交计划、一边夹带 `file_write`，harness 只处理审批门，其余工具补错误 `tool_result`，不执行。
+
+`confirm_plan` 的 UI 也要绕过 `patch_stdout`，因为 Plan 面板必须出现在确认问题前：
+
+```python
+def confirm_plan(plan_summary: str) -> bool:
+    def _do() -> bool:
+        buffer = StringIO()
+        Console(file=buffer, no_color=True).print(
+            Panel(plan_summary or "(empty plan)", title="Plan", border_style="blue")
+        )
+        panel = buffer.getvalue()
+        if _terminal_asker is not None:
+            _write_real_terminal(panel)
+        else:
+            typer.echo(panel, nl=False)
+        return typer.confirm("Approve this plan and exit plan mode?", default=False)
+
+    return _ask(_do)
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code --permission-mode plan
+ plan · deepseek-v4-pro
+> 写一个 day8_demo.py，放一个 fibonacci 函数和对应的 pytest 测试
+tool_call: read_file {'path': 'pyproject.toml'}
+...
+╭─ Plan ─────────────────────────────────────╮
+│ 1. 建 day8_demo.py                          │
+│ 2. 写 fibonacci                             │
+│ 3. 写 pytest 测试                           │
+╰─────────────────────────────────────────────╯
+Approve this plan and exit plan mode? [y/N]: y
+ accept edits · deepseek-v4-pro
+tool_call: file_write {'file_path': 'day8_demo.py', ...}
+```
+
+关键验收：面板出现并批准之前，没有任何写文件发生；批准后模式翻到 `acceptEdits`。如果计划里要跑 `bash`，它仍会单独确认。
+
+<DiffCard
+  diffPath="/lessons/day-08/diffs/v5-to-final-plan-mode.diff"
+  title="v6 阶段：enter_plan_mode / exit_plan_mode + confirm_plan 审批门"
+  description="Plan 模式只放行只读、todo 和 plan 工具；exit_plan_mode 与 turn 末 final 文本都汇到 confirm_plan；批准后才翻到 acceptEdits。"
+/>
+
+---
+
+### 终端 Replay 演示
+
+下面是 Plan Mode 主线的终端动画。注意它展示的是审批边界，不是完整功能测试：真正落盘前必须先看到 Plan 面板并输入 `y`。
+
+<TerminalReplay tracePath="/lessons/day-08/traces/plan-mode.json" />
+
+---
+
+## 今天有了什么
+
+- **交互式 shell**：`PromptSession` 常驻底部，worker 线程跑 Agent Loop，`patch_stdout` 让 trace 不冲掉输入行。
+- **运行时状态**：`RuntimeState` 统一承载 `permission_mode`、`model`、`abort_event`、type-ahead 队列和 todo。
+- **键位 + 模型切换**：`shift+tab` 循环三模式，`/model <name>` 改下一轮使用的模型。
+- **turn 生命周期**：busy 时输入排队，turn 末 drain；ESC 在步间生效，并保持 `tool_use` / `tool_result` 配对。
+- **并发工具编排**：只读工具按 `is_read_only` 分组并行，写工具串行；回填顺序仍遵守协议。
+- **TodoWrite 待办板**：模型能维护整表覆盖的待办列表，状态栏显示当前任务，`/todo` 可随时查看。
+- **Plan Mode 闭环**：plan 模式阻止写工具，`confirm_plan` 批准后才翻到 `acceptEdits` 解锁写。
+
+---
+
+## 常见问题
+
+**交互 shell 启动后输入框闪一下就没反应**
+
+先确认 `prompt_toolkit` 已安装：`uv add prompt_toolkit` 后再 `uv sync`。如果是在不兼容 VT100 的终端里跑，也可能出现输入框异常；Windows 建议用 Windows Terminal 或 WSL。
+
+**`shift+tab` 没反应**
+
+多半是终端把这个键吃掉了。先确认 `PromptSession` 没开 `multiline=True`。如果某些终端仍不触发，可以在 `build_key_bindings` 里再绑一个 `@kb.add("escape", "m")` 指向同一个 handler。
+
+**ESC 按了 Agent 还跑了一会儿才停**
+
+这是预期的半步中断。阻塞式 `provider.complete()` 取消不了已经发出去的 HTTP 请求；ESC 只在当前 model/tool 步返回后、下一步开始前生效。
+
+**Plan 审批或写确认弹不出来**
+
+检查三点：交互 shell 启动时是否调用 `prompt_ui.set_terminal_asker(terminal_asker)`；`confirm_edit` / `confirm_plan` 是否包了 `_ask`；`confirm_plan` 的面板是否走 `_write_real_terminal`，不要直接走普通 `Console().print()`。
+
+---
+
+## 课后挑战
+
+1. **流式 provider + 真即时中断**：给 `ModelProvider` 加 `complete_stream()`，在 streaming 循环里检查 `abort_event`。
+
+2. **bash 只读检测**：解析命令，不含重定向、删除、移动、写目录等操作时，把只读 bash 放进并行组。
+
+3. **声明式键位表**：把 `build_key_bindings` 扩成 action 字符串到 callable 的映射，支持 `.agent/keybindings.json` 覆盖。
+
+4. **todo 持久化**：现在 todo 只在内存里。可以落到 session JSONL 或 SQLite，`--resume` 时恢复。
+
+5. **plan 逐条确认**：把 plan 模式的 hard-deny 改成逐条 ask，让用户按每个写工具单独批准或拒绝。
+
+6. **cron 接进交互 shell**：Day 7 的 `CronScheduler` 还没接回新 shell。试着让 scheduler 到点把 pending prompt 塞进 `state.input_queue`。
+
+---
+
+## 思考题
+
+1. **为什么输入框必须跑主线程、Agent 必须跑 worker 线程？** 如果反过来，`patch_stdout` 和 `prompt_toolkit` 的事件循环会遇到什么问题？
+
+2. **ESC 中断时，未执行的 `tool_use` 为什么必须补 `is_error` 的 `tool_result`？** 如果不补，带着这段历史发下一次请求会怎样？
+
+3. **只读并行/写串行的边界由谁判定？** 为什么是 harness 按 `Tool.is_read_only` 分区，而不是让模型自己声明哪些能一起跑？
+
+4. **plan 模式的写解锁为什么必须等用户在 `confirm_plan` 点头？** 如果 `exit_plan_mode` 不经审批就翻 `permission_mode`，plan 模式还拦得住什么？
+
+---
+
+## 下一天
+
+今天把 `agent-code` 从一次性脚本升级成了常驻交互运行时。输入分层、模式切换、中断/排队、并发编排、todo 待办和 plan 审批，其实都在做同一件事：把运行时控制权收回 harness。
+
+Day 9 接 Skills 按需知识系统：让 Agent 在 `.agent/skills/` 下读领域知识，用到才加载，避免 system prompt 越堆越胖。

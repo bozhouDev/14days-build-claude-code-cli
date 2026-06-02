@@ -1,0 +1,61 @@
+--- agent_code/runtime.py
++++ agent_code/runtime.py
+@@ RuntimeState
+     input_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
++
++    def cycle_permission_mode(self) -> str:
++        """shift+tab 循环：default → acceptEdits → plan → default。只主线程调，无需锁。"""
++        order = ["default", "acceptEdits", "plan"]
++        idx = order.index(self.permission_mode) if self.permission_mode in order else 0
++        self.permission_mode = order[(idx + 1) % len(order)]
++        return self.permission_mode
+
+--- agent_code/interactive.py
++++ agent_code/interactive.py
+@@ build_key_bindings
+     @kb.add("escape")
+     def _(event: Any) -> None:
+         state.abort_event.set()
++
++    @kb.add("s-tab")
++    def _(event: Any) -> None:
++        new_mode = state.cycle_permission_mode()
++        print(f"[mode → {new_mode}]")
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ SlashContext
++from .runtime import RuntimeState
++
+ @dataclass
+ class SlashContext:
+     cwd: Path
+     permission_mode: str
+     model: str
+     provider: str
+     session_id: str | None
++    state: RuntimeState | None = None
+@@ _cmd_model
+ def _cmd_model(args: list[str], ctx: SlashContext) -> SlashResult:
+    if not args:
+        return SlashResult(handled=True, message=f"provider: {ctx.provider}  model: {ctx.model}")
+-    return SlashResult(
+-        handled=True,
+-        message=f"Cannot change model at runtime. Current: {ctx.provider}/{ctx.model}",
+-    )
++    target = args[0]
++    if ctx.state is not None:
++        ctx.state.model = target
++    return SlashResult(handled=True, message=f"model → {target}（下一轮生效，当前轮不变）")
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ make_slash_context
+         return SlashContext(
+             cwd=resolved_cwd,
+             permission_mode=state.permission_mode,
+             model=state.model,
+             provider=state.provider,
+             session_id=session.session_id if session else None,
++            state=state,
+         )

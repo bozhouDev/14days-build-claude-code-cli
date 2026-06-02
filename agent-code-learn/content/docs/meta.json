@@ -7,6 +7,7 @@
     "day-04-safe-edit",
     "day-05-bash-permissions",
     "day-06-session-memory",
-    "day-07-slash-hooks"
+    "day-07-slash-hooks",
+    "day-08-interactive-shell"
   ]
 }

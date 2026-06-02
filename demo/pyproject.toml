@@ -9,6 +9,7 @@ dependencies = [
   "httpx[socks]>=0.28.1",
   "openai>=2.37.0",
   "pathspec>=1.1.1",
+  "prompt-toolkit>=3.0.52",
   "rich>=13.7.0",
   "typer>=0.12.0",
 ]

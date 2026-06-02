@@ -1,36 +1,34 @@
-reference/claude-code-official/
+# Private/local agent state
+.agent/
+.agents/
+.claude/
+.gemini/
+.gstack/
+.superpowers/
+.obsidian/
+.bg/
+*.jsonl
+hook.log
+skills-lock.json
 
-node_modules/
-dist/
-coverage/
-.env
-.DS_Store
+# Python
 .venv/
 __pycache__/
 .pytest_cache/
 
-# Next.js / fumadocs (agent-code-learn)
+# Node / Next
+node_modules/
 .next/
 .source/
-out/
-.vercel/
 .turbo/
+.vercel/
 .swc/
+out/
 next-env.d.ts
 *.tsbuildinfo
 
-# agent-code runtime artifacts
-.agent/
-.bg/
+# Build/dependency locks intentionally omitted from tutorial snapshots
+uv.lock
 
-# Local agent / tool side-channels (avoid leaking private skills, hooks, audits)
-.gstack/
-.gemini/
-.claude/
-.agents/
-.superpowers/
-.obsidian/
-
-# Local template scaffolds
-docs/_template/
-packages/_template-python/
+# OS
+.DS_Store

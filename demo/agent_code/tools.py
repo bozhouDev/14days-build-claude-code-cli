@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .bash_runner import run_sync as _bash_run_sync
+
 import html2text
 import httpx
 
@@ -25,6 +27,7 @@ from .fs_safety import (
 from .model import ToolCall, ToolResult
 from .file_history import backup
 from .bash_runner import run_sync as _bash_run_sync
+from .runtime import RuntimeState, TodoItem
 
 
 @dataclass
@@ -33,6 +36,7 @@ class ToolContext:
     cwd: Path
     skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
     read_state: ReadFileState = field(default_factory=ReadFileState)
+    runtime_state: RuntimeState | None = None   # Day 8：工具读写共享运行态的入口
 
 
 ToolFunc = Callable[[dict[str, Any], ToolContext], str]
@@ -46,6 +50,7 @@ class Tool:
     parameters: dict[str, Any] = field(
         default_factory=lambda: {"type": "object", "properties": {}, "required": []}
     )
+    is_read_only: bool = False   # Day 8 v4：只读工具可并行
 
 
 def echo(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -403,6 +408,9 @@ class ToolRegistry:
     def list(self) -> list[Tool]:
         return list(self._tools.values())
 
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
     def run(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
         # 未知工具也返回 observation，不让 Agent Loop 崩掉。
         tool = self._tools.get(call.name)
@@ -440,8 +448,6 @@ def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     path.write_text(new_content, encoding="utf-8")
     ctx.read_state.record(path, new_content)
     return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
-
-
 def _git_status(args: dict[str, Any], ctx: ToolContext) -> str:
     """薄包装 git status——只读、默认 allow。"""
     return _bash_run_sync("git status", ctx.cwd, timeout=10)
@@ -460,6 +466,7 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
     timeout = int(args.get("timeout", 30))
     background = bool(args.get("background", False))
 
+    # v1 只做同步；v4 接 background=True 分支
     if background:
         # 后台执行：启动子进程后立即返回结构化信息，不阻塞 Agent Loop
         from .bg_manager import start_background
@@ -474,7 +481,6 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
 
     return _bash_run_sync(command, ctx.cwd, timeout=timeout)
 
-
 def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
     """由 agent.py 拦截块处理——工具函数本身不读 stdin。
     拦截块识别 call.name == "ask_user_question"，调 prompt_ui 后把结果作为 observation 返回。"""
@@ -487,7 +493,6 @@ def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
     # 实际交互在 agent.py 拦截块里完成——这里只返回占位。
     # 正常路径不会走到这里，因为拦截块会先处理。
     return "error: ask_user_question must be handled by the harness, not executed directly"
-
 
 def _memory_write(args: dict[str, Any], ctx: ToolContext) -> str:
     """写入一条长期记忆——工具函数只做薄包装。"""
@@ -532,6 +537,52 @@ def _memory_recall(args: dict[str, Any], ctx: ToolContext) -> str:
     except Exception as exc:
         return f"error: {exc}"
 
+def _render_todos(items: list[TodoItem]) -> str:
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    return "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
+
+
+def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """整表覆盖待办板。每次调用传来的 todos 就是新列表的全部。"""
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    items = [
+        TodoItem(content=t.get("content", ""), status=t.get("status", "pending"),
+                 active_form=t.get("activeForm", ""))
+        for t in args.get("todos", [])
+    ]
+    state.todo_store = items                  # 整表覆盖
+
+    lines = [_render_todos(items), "", "Todos updated."]
+    # verification nudge：本次关掉 3+ 个任务、且整张表没有任何验证项 → 提醒先验证
+    completed = sum(1 for t in items if t.status == "completed")
+    kws = ("test", "pytest", "verify", "lint", "check")
+    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
+    if completed >= 3 and not has_verify:
+        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
+    return "\n".join(lines)
+
+
+def todo_read(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    return _render_todos(state.todo_store) if state else "(no todos)"
+
+
+def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    """模型主动请求进 plan 模式。"""
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    state.permission_mode = "plan"
+    return ("Plan mode on. Draft a plan—write tools are denied. "
+            "Call exit_plan_mode(plan_summary) when the plan is ready for review.")
+
+
+def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    """函数体很薄——渲染计划、等批准、翻模式都在 agent.py 的拦截块里做。"""
+    return "Plan approved. Write tools are now enabled."
+
 
 def default_tools() -> ToolRegistry:
     registry = ToolRegistry()
@@ -540,6 +591,7 @@ def default_tools() -> ToolRegistry:
             name="echo",
             description="Return the input text.",
             run=echo,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {"text": {"type": "string", "description": "Text to return."}},
@@ -548,13 +600,14 @@ def default_tools() -> ToolRegistry:
         )
     )
     registry.register(
-        Tool(name="system_date", description="Return the current system date and time.", run=system_date)
+        Tool(name="system_date", description="Return the current system date and time.", run=system_date, is_read_only=True)
     )
     registry.register(
         Tool(
             name="read_file",
             description="Read a text file inside the project. Path is relative to cwd.",
             run=read_file,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -569,6 +622,7 @@ def default_tools() -> ToolRegistry:
             name="list_files",
             description="List files and directories at a path inside cwd.",
             run=list_files,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -587,6 +641,7 @@ def default_tools() -> ToolRegistry:
             name="glob",
             description="Find files by glob pattern, e.g. '**/*.py'.",
             run=glob,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -601,6 +656,7 @@ def default_tools() -> ToolRegistry:
             name="grep",
             description="Search file contents with a regular expression (ripgrep if available).",
             run=grep,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -626,6 +682,7 @@ def default_tools() -> ToolRegistry:
             name="project_tree",
             description="Show the project directory tree from cwd.",
             run=project_tree,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -723,6 +780,7 @@ def default_tools() -> ToolRegistry:
             name="git_status",
             description="Run git status to see the current state of the working directory.",
             run=_git_status,
+            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
         )
     )
@@ -731,6 +789,7 @@ def default_tools() -> ToolRegistry:
             name="git_diff",
             description="Run git diff to see unstaged changes in the working directory.",
             run=_git_diff,
+            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
         )
     )
@@ -788,8 +847,6 @@ def default_tools() -> ToolRegistry:
             },
         )
     )
-
-    # --- Day 6：长期记忆工具 ---
     registry.register(
         Tool(
             name="memory_write",
@@ -822,6 +879,7 @@ def default_tools() -> ToolRegistry:
                 "Use when you need to recall facts about the user, project, or past decisions."
             ),
             run=_memory_recall,
+            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -836,8 +894,6 @@ def default_tools() -> ToolRegistry:
             },
         )
     )
-
-    # --- Day 7：Cron 定时任务工具 ---
     from .cron_tools import cron_create, cron_list, cron_cancel
 
     registry.register(
@@ -864,6 +920,7 @@ def default_tools() -> ToolRegistry:
             name="cron_list",
             description="List all active cron jobs with their IDs, intervals, and last-run times.",
             run=cron_list,
+            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
         )
     )
@@ -881,5 +938,55 @@ def default_tools() -> ToolRegistry:
             },
         )
     )
-
+    registry.register(Tool(
+        name="todo_write",
+        description=(
+            "Create and manage a structured task list. Use for multi-step tasks (3+ steps). "
+            "Keep exactly ONE item in_progress. Mark completed immediately when done. "
+            "The todos array is a FULL replacement—always send the entire list."
+        ),
+        run=todo_write,
+        parameters={
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "Imperative task name."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "activeForm": {"type": "string", "description": "Present-continuous form."},
+                        },
+                        "required": ["content", "status", "activeForm"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+        is_read_only=False,
+    ))
+    registry.register(Tool(
+        name="todo_read",
+        description="Read the current todo list.",
+        run=todo_read,
+        parameters={"type": "object", "properties": {}, "required": []},
+        is_read_only=True,
+    ))
+    registry.register(Tool(
+        name="enter_plan_mode",
+        description="Enter plan mode: draft a plan before writing. Write tools are denied until you exit.",
+        run=enter_plan_mode,
+        parameters={"type": "object", "properties": {}, "required": []},
+    ))
+    registry.register(Tool(
+        name="exit_plan_mode",
+        description="Submit your plan for user approval. Write tools unlock only after the user approves.",
+        run=exit_plan_mode,
+        parameters={
+            "type": "object",
+            "properties": {"plan_summary": {"type": "string", "description": "The plan to review."}},
+            "required": ["plan_summary"],
+        },
+    ))
     return registry

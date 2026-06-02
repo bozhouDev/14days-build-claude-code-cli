@@ -1,0 +1,218 @@
+--- /dev/null
++++ agent_code/runtime.py
+@@ -0,0 +1,25 @@
++"""agent_code/runtime.py -- 跨主线程 / worker 线程共享的运行态。"""
++
++from __future__ import annotations
++
++import queue
++import threading
++from dataclasses import dataclass, field
++
++
++@dataclass
++class RuntimeState:
++    # 主线程（输入/键位/状态栏）写这些；worker 线程（Agent Loop）读这些。
++    permission_mode: str = "default"
++    model: str = "deepseek-v4-pro"
++    provider: str = "anthropic"
++    abort_event: threading.Event = field(default_factory=threading.Event)
++    input_queue: "queue.Queue[str]" = field(default_factory=queue.Queue)
++
+--- /dev/null
++++ agent_code/interactive.py
+@@ -0,0 +1,90 @@
++"""agent_code/interactive.py -- prompt_toolkit 交互 shell。"""
++
++from __future__ import annotations
++
++import asyncio
++import queue
++import threading
++from typing import Any, Callable
++
++from prompt_toolkit import PromptSession
++from prompt_toolkit.application import run_in_terminal
++from prompt_toolkit.key_binding import KeyBindings
++from prompt_toolkit.patch_stdout import patch_stdout
++
++from . import prompt_ui
++from .runtime import RuntimeState
++from .slash import SlashContext, dispatch_slash
++
++
++def run_interactive_shell(
++    state: RuntimeState,
++    run_turn: Callable[[str], None],
++    make_slash_context: Callable[[], SlashContext],
++) -> None:
++    """启动交互 REPL。主线程读输入 + 分派 slash，worker 线程跑 Agent Loop。"""
++    job_queue: "queue.Queue[str]" = queue.Queue()
++
++    def worker_loop() -> None:
++        while True:
++            text = job_queue.get()
++            if text == "__EXIT__":
++                break
++            state.abort_event.clear()
++            run_turn(text)
++
++    worker = threading.Thread(target=worker_loop, daemon=True)
++    worker.start()
++
++    session: PromptSession[str] = PromptSession(
++        key_bindings=build_key_bindings(state),
++        bottom_toolbar=lambda: bottom_toolbar(state),
++    )
++
++    async def _run() -> None:
++        loop = asyncio.get_running_loop()
++
++        def terminal_asker(func: Callable[[], Any]) -> Any:
++            async def ask_in_terminal() -> Any:
++                return await run_in_terminal(func)
++            return asyncio.run_coroutine_threadsafe(ask_in_terminal(), loop).result()
++
++        prompt_ui.set_terminal_asker(terminal_asker)
++
++        with patch_stdout():
++            while True:
++                try:
++                    text = (await session.prompt_async("> ")).strip()
++                except (KeyboardInterrupt, EOFError):
++                    break
++                if not text:
++                    continue
++                if text == "/exit":
++                    break
++                if text.startswith("/"):
++                    result = dispatch_slash(text, make_slash_context())
++                    if result.handled:
++                        if result.message:
++                            print(result.message)
++                        if result.should_query:
++                            job_queue.put(result.prompt)
++                        continue
++                job_queue.put(text)
++
++    asyncio.run(_run())
++    job_queue.put("__EXIT__")
++
++
++def build_key_bindings(state: RuntimeState) -> KeyBindings:
++    kb = KeyBindings()
++
++    @kb.add("escape")
++    def _(event: Any) -> None:
++        state.abort_event.set()
++
++    return kb
++
++
++def bottom_toolbar(state: RuntimeState) -> str:
++    mode = {"default": "default", "acceptEdits": "accept edits", "plan": "plan"}.get(
++        state.permission_mode, state.permission_mode
++    )
++    return f" {mode} · {state.model} "
++
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ run_agent signature
++from .runtime import RuntimeState
+-
+-    permission_mode: str = "default",
++    state: RuntimeState | None = None,
+@@ build ToolContext
++    state = state or RuntimeState()
+     ctx = ToolContext(
+         cwd=resolved_cwd,
+         skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
++        runtime_state=state,
+     )
+@@ permission request
+-                mode=permission_mode,
++                mode=state.permission_mode,
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ ToolContext
++from .runtime import RuntimeState
++
+ @dataclass
+ class ToolContext:
+     cwd: Path
+     skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
+     read_state: ReadFileState = field(default_factory=ReadFileState)
++    runtime_state: RuntimeState | None = None
+
+--- agent_code/prompt_ui.py
++++ agent_code/prompt_ui.py
+@@ confirmation injection
++_terminal_asker = None
++
++
++def set_terminal_asker(asker) -> None:
++    global _terminal_asker
++    _terminal_asker = asker
++
++
++def _ask(func):
++    """worker 要问用户时走这里；交互 shell 注入 asker 后丢回主线程事件循环问。"""
++    if _terminal_asker is not None:
++        return _terminal_asker(func)
++    return func()
+@@ confirm functions
+-    return typer.confirm(f"Apply this edit to {path}?", default=False)
++    return _ask(lambda: typer.confirm(f"Apply this edit to {path}?", default=False))
+-    return typer.confirm(f"Run this command?", default=False)
++    return _ask(lambda: typer.confirm("Run this command?", default=False))
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ imports
+-import threading
+-from queue import Empty, Queue
++from .runtime import RuntimeState
+@@ run_once
++    state = RuntimeState(permission_mode=permission_mode, model=model, provider=provider_name)
+     run_agent(
+-        prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd, permission_mode=permission_mode,
++        prompt, provider, default_tools(), max_steps=max_steps, cwd=cwd, state=state,
+         session=session, system_prompt=system_prompt,
+     )
+@@ REPL branch
+-    # 注释1：REPL 分支——命令后面没跟 prompt，走下面交互循环
+-    render_header(resolved_cwd, provider, model, base_url)
+-    scheduler = CronScheduler(resolved_cwd)
+-    ...
+-    while True:
+-        line = input_queue.get(timeout=0.5)
+-        run_user_input(line)
++    # Day 8 v1：交互式 shell（取代 Day 7 的 typer.prompt 输入线程循环）
++    from .interactive import run_interactive_shell
++
++    render_header(resolved_cwd, provider, model, base_url)
++    if session is None:
++        session = Session.create(resolved_cwd)
++
++    state = RuntimeState(permission_mode=permission_mode, model=model, provider=provider)
++    tools = default_tools()
++
++    def run_turn(line: str) -> None:
++        turn_provider = create_provider(state.provider, state.model, base_url)
++        run_agent(
++            line, turn_provider, tools, max_steps=max_steps, cwd=resolved_cwd,
++            state=state, session=session, system_prompt=system_prompt,
++        )
++
++    def make_slash_context() -> SlashContext:
++        return SlashContext(
++            cwd=resolved_cwd,
++            permission_mode=state.permission_mode,
++            model=state.model,
++            provider=state.provider,
++            session_id=session.session_id if session else None,
++        )
++
++    console.print("输入 /help 查看命令，输入 /exit 退出。")
++    run_interactive_shell(state, run_turn, make_slash_context)

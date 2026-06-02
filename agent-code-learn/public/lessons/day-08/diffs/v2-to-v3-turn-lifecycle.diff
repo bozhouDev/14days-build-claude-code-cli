@@ -1,0 +1,133 @@
+--- agent_code/interactive.py
++++ agent_code/interactive.py
+@@ run_interactive_shell
+     job_queue: "queue.Queue[str]" = queue.Queue()
++    busy = threading.Event()
+@@ worker_loop
+             if text == "__EXIT__":
+                 break
+             state.abort_event.clear()
+-            run_turn(text)
++            busy.set()
++            try:
++                run_turn(text)
++            except Exception as exc:
++                print(f"[error] {exc}")
++            finally:
++                busy.clear()
++            # turn 末 drain：把运行期间排队的输入接着跑
++            while not state.input_queue.empty():
++                job_queue.put(state.input_queue.get())
+@@ prompt loop
+-                job_queue.put(text)
++                if busy.is_set():
++                    state.input_queue.put(text)
++                    print("[queued] turn 结束后自动处理")
++                else:
++                    job_queue.put(text)
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ imports
+-from .hooks import run_hooks
++from .hooks import run_hooks, run_hooks_raw
+@@ run_agent setup
+     trace: list[str] = []
++    continuation_count = 0
+     for step in range(max_steps):
+@@ after assistant message
+         messages.append(_assistant_message(response))
++
++        # Day 8 v3：ESC 半步中断——在执行工具前检查 abort
++        if state.abort_event.is_set():
++            emit("interrupted by user")
++            if response.tool_calls:
++                blocks = [
++                    {"type": "tool_result", "tool_use_id": c.id,
++                     "content": "Interrupted by user", "is_error": True}
++                    for c in response.tool_calls
++                ]
++                messages.append({"role": "user", "content": blocks})
++                if session:
++                    session.append_messages(messages[-2:])
++            elif session:
++                session.append_messages([messages[-1]])
++            return AgentResult(final="interrupted", trace=trace, messages=messages)
+@@ final branch
+         if not response.tool_calls:
+             final = response.text or ""
++            # Day 8 v3：Stop hook——模型自认答完，给 hook 一次"再推一轮"的机会
++            forced: str | None = None
++            if continuation_count < 2:
++                payload = {
++                    "event": "Stop",
++                    "final_text": final,
++                    "cwd": str(ctx.cwd),
++                    "continuation_count": continuation_count,
++                }
++                for h in run_hooks_raw("Stop", payload, ctx.cwd):
++                    if not h["success"] and h["output"].strip():
++                        forced = h["output"].strip()
++                        break
++            if forced is not None:
++                continuation_count += 1
++                emit(f"continue: {forced}")
++                messages.append({"role": "user", "content": f"continue: {forced}"})
++                if session:
++                    session.append_messages(messages[-2:])
++                continue
+             emit(f"final: {final}")
+
+--- agent_code/hooks.py
++++ agent_code/hooks.py
+@@ end of file
++def run_hooks_raw(event: str, payload: dict[str, Any], cwd: Path) -> list[dict[str, Any]]:
++    """跑没有工具上下文的 hook（如 Stop）。payload 整个作为 stdin JSON 传给 hook。"""
++    config = load_hooks(cwd)
++    results: list[dict[str, Any]] = []
++    for entry in config.get(event, []):
++        matcher = entry.get("matcher", "*")
++        if matcher not in ("*", ""):
++            continue
++        commands: list[str] = []
++        if "run" in entry:
++            commands = [entry["run"]]
++        else:
++            for h in entry.get("hooks", []):
++                if isinstance(h, dict) and h.get("type") == "command" and h.get("command"):
++                    commands.append(h["command"])
++        for cmd in commands:
++            success, output = _run_hook_command(cmd, payload, cwd)
++            results.append({"event": event, "command": cmd, "success": success, "output": output})
++    return results
+
+--- tests/test_smoke.py
++++ tests/test_smoke.py
+@@ new lifecycle tests
++class AbortProvider:
++    def complete(self, messages, tools=None, system=None):
++        return ModelResponse(
++            tool_calls=[ToolCall(id="call_echo_abort", name="echo", arguments={"text": "hi"})],
++            stop_reason="tool_use",
++        )
++
++
++def test_abort_pairs_pending_tool_results() -> None:
++    state = RuntimeState()
++    state.abort_event.set()
++    result = run_agent("will abort", AbortProvider(), default_tools(), state=state)
++    assert result.final == "interrupted"
++    assert result.messages[-1]["content"][0]["is_error"] is True
++
++
++def test_stop_hook_can_force_one_more_turn(tmp_path: Path) -> None:
++    hooks = tmp_path / "hooks.json"
++    command = (
++        "python3 -c \"import json,sys; d=json.load(sys.stdin); "
++        "ok='test' in d.get('final_text',''); "
++        "sys.stderr.write('' if ok else 'add a unit test'); "
++        "sys.exit(0 if ok else 1)\""
++    )
++    hooks.write_text(json.dumps({"hooks": {"Stop": [{"matcher": "*", "run": command}]}}), encoding="utf-8")
++    result = run_agent("write code", FinalProvider(), default_tools(), cwd=tmp_path)
++    assert "continue: add a unit test" in result.trace

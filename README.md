@@ -55,7 +55,7 @@ export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 | 5 | Bash + Permission | 命令执行、权限请求、后台任务 |
 | 6 | Session + Memory | 会话 JSONL、项目记忆、memdir |
 | 7 | Slash + Hooks | slash command、hooks、cron `/loop` |
-| 8 | TodoWrite + Plan Mode | 计划模式、任务列表、执行约束 |
+| 8 | Interactive Shell + Plan Mode | 交互式 shell、TodoWrite、Plan Mode 审批闭环 |
 | 9 | Skills | 按需加载知识和工作流 |
 | 10 | Subagents | 子 Agent 派发和结果回填 |
 | 11 | Context Compact | 长上下文压缩、成本追踪 |
@@ -63,7 +63,7 @@ export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 | 13 | Worktree + Final Demo | worktree 隔离、端到端代码任务 |
 | 14 | MCP + ToolSearch | MCP 客户端、工具发现、工具扩展 |
 
-当前仓库已经包含前 7 天的教程和参考快照。后 7 天会继续在同一条路线里补齐。
+当前仓库已经包含前 8 天的教程和参考快照。后续内容会继续在同一条路线里补齐。
 
 ## 怎么开始
 
@@ -122,26 +122,6 @@ flowchart TD
   Permission --> Workspace
 ```
 
-## Claude Code 源码架构参考图
-
-`reference/claude-code-official/` 是公开可见源码快照的本地研究副本。我们只用它确认架构边界，不把官方 TypeScript 源码、prompt 或内部协议原样翻译进教程。
-
-```mermaid
-flowchart TD
-  Main["src/main.tsx<br/>CLI 入口"] --> Commands["src/commands/*<br/>Slash Commands"]
-  Main --> UI["React + Ink<br/>Terminal UI"]
-  Main --> Query["QueryEngine<br/>模型调用与工具循环"]
-
-  Query --> Tools["src/tools/*<br/>Bash / Read / Edit / MCP / Agent / Skill"]
-  Query --> Context["context / state / memdir<br/>上下文与记忆"]
-  Tools --> Permission["hooks/toolPermission<br/>权限检查"]
-  Tools --> Services["services/*<br/>API / MCP / Compact / LSP / Analytics"]
-
-  Main --> Bridge["bridge / remote / server<br/>IDE 与远程会话"]
-  Main --> Plugins["plugins / skills<br/>扩展系统"]
-  Query --> Coordinator["coordinator / tasks<br/>多 Agent 与任务系统"]
-```
-
 ## 项目结构
 
 ```txt
@@ -149,6 +129,7 @@ docs/                          14 天教程文档
 packages/day-*/                每一天独立可运行的教学快照
 demo/                          当前综合 demo 项目
 agent-code-learn/              网页版教程
+
 ```
 
 注意：教程读者不是每天新建一个 `packages/day-*`。这些目录是参考答案快照。真正学习时，我们是在自己的 `agent-code` 项目里从 Day 1 持续改到 Day 14。
@@ -168,7 +149,7 @@ agent-code-learn/              网页版教程
 
 ## 声明
 
-This is an educational implementation. We reference the public Claude Code source snapshot under `reference/claude-code-official/` to understand its architecture, but rewrite everything in Python with teaching-friendly simplifications. It is not affiliated with Anthropic.
+This is an educational implementation. We reference the publicly visible Claude Code source snapshot to understand its architecture, but rewrite everything in Python with teaching-friendly simplifications. It is not affiliated with Anthropic.
 
 ## License
 

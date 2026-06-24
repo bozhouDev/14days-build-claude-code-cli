@@ -1,0 +1,364 @@
+---
+title: "Day 9 — Skills + On-Demand Knowledge"
+description: "Day 8 gave us a resident interactive runtime, but project rules, debug flows, and writing style stuffed into AGENT.md or the system prompt will eventually blow the context budget. Today we add Skills: knowledge lives in .agent/skills/, startup only advertises what exists, and full bodies load on demand."
+---
+
+After Day 8, `agent-code` already has a resident interactive shell, runtime state, slash control plane, todo, Plan Mode, and tools that read files, run commands, and ask the user.
+
+The next problem is obvious: project rules, writing style, debug flows, and release flows all crammed into `AGENT.md` or the system prompt will eventually fill the context window.
+
+Today we add Skills: put "knowledge you might need" under `.agent/skills/`, tell the model at startup which skills exist, and load full bodies only when they are actually used.
+
+When you finish, you will see:
+
+- `/skills` lists local skills without spending a model request
+- The model can call `skill_list`, then `skill_load("debug-test")` to read the full body
+- `/skill debug-test ...` injects the skill body into this turn's task and narrows the tool whitelist for that turn only
+- `/output-style use explanatory` temporarily switches answer style; it does not persist after exit
+
+About 620 lines total, ~360 new. Four versions today: v1 defines the `SKILL.md` convention and `/skills`; v2 adds `skill_list` / `skill_load` and `/skill`; v3 turns `allowed_tools` into a real tool boundary; v4 adds output-styles and separates "knowledge" from "answer style".
+
+---
+
+### Day 9 Main Visual: Four Skill Lines
+
+Start with this Agent Logic Map. It does not replay every terminal line; it keeps the four boundaries that are easiest to get wrong today: skill catalog discovery, on-demand loading, the `/skill` allowed_tools lifecycle, and the output-style layer.
+
+<AgentLogicMap mapPath="/lessons/day-09/logic-map.json" />
+
+---
+
+Today we keep editing the Day 8 `agent-code` project. `packages/day-*` snapshots are reference answers, not directories you create every day.
+
+## Setup — Today's Starting Point
+
+Drop in a minimal skill first; every version below validates against it:
+
+```bash
+mkdir -p .agent/skills/debug-test
+cat > .agent/skills/debug-test/SKILL.md <<'EOF'
+---
+name: debug-test
+description: Debug failing Python tests by reading errors, inspecting related files, and proposing the smallest fix.
+allowed_tools: [read_file, grep]
+---
+
+# Debug Test
+
+Use this skill when a Python test fails.
+
+Work in this order:
+
+1. Read the failing test file.
+2. Search for the function, class, or fixture named in the failure.
+3. Explain the smallest likely fix before editing.
+4. Do not edit files unless the current task explicitly allows edits.
+EOF
+```
+
+Why under `.agent/`? Session, memory, history, and cron already live there. Skills are local <Concept name="Harness">harness</Concept> capabilities too — same tree, easier cleanup and backup.
+
+`SKILL.md` has two layers: frontmatter (`name`, `description`, `allowed_tools`) and the body (the actual workflow). v1 injects only `name` and `description` into the system prompt — the model learns "there is a playbook called `debug-test`", not the four-step debug flow yet.
+
+---
+
+## v1 — Treat Skills as a Directory Convention First
+
+This step solves two problems first: a broken skill must not crash the CLI; the system prompt carries only name + description, not the body.
+
+### 1.1 Add `agent_code/skills.py`
+
+Create `SkillLoader` with a hand-written frontmatter parser — no PyYAML. Parse `allowed_tools` now; v3 turns it into a permission boundary:
+
+```python
+@dataclass(frozen=True)
+class SkillMeta:
+    name: str
+    description: str
+    allowed_tools: list[str] | None
+    body: str
+    path: Path
+
+
+class SkillLoader:
+    def render_available_skills(self) -> str:
+        skills = self.list()
+        if not skills:
+            return ""
+        lines = ["<available-skills>"]
+        lines.extend(f"- {skill.name}: {skill.description}" for skill in skills)
+        lines.append("</available-skills>")
+        return "\n".join(lines)
+```
+
+`SkillLoader.list()` still reads the body into `SkillMeta` — v2's `skill_load` reuses the same loader. The v1 boundary is not "whether we read the body", but "what we inject into the system prompt".
+
+### 1.2 Inject the skill catalog into the system prompt
+
+In `agent_code/agent.py`, change `build_system_prompt` to accept `state: RuntimeState | None = None` and append the skill catalog after memory:
+
+```python
+def build_system_prompt(cwd: Path, state: RuntimeState | None = None) -> str:
+    from .skills import SkillLoader
+    ...
+    available_skills = SkillLoader(cwd).render_available_skills()
+    if available_skills:
+        # Catalog card only — full body waits for skill_load or /skill.
+        parts.append(available_skills)
+```
+
+`state` is unused for now. The parameter is reserved so v4 output-style does not require another signature change.
+
+### 1.3 Add `/skills`
+
+Add `_cmd_skills` in `slash.py`: read `.agent/skills/` locally, render the list, no model call.
+
+Run it:
+
+```bash
+$ uv run agent-code "/skills"
+debug-test  Debug failing Python tests by reading errors, inspecting related files, and proposing the smallest fix.
+```
+
+v1 achieves "discover skills", but the model still cannot read the body. It only knows the one-line description for `debug-test`, not the four-step workflow inside.
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v1-skill-loader.diff"
+  title="v1: SkillLoader + available-skills catalog + /skills"
+  description="New skills.py; build_system_prompt injects name + description only; /skills lists skills locally without a model request."
+/>
+
+---
+
+## v2 — Load Full Bodies On Demand
+
+Putting every skill body into the system prompt would crowd out working context. v2 adds two read-only tools: `skill_list()` and `skill_load(name)`. They only read knowledge; they do not change tool permissions.
+
+### 2.1 Add two tool functions in `tools.py`
+
+```python
+def skill_load(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Load a skill body on demand. Returns knowledge only; does not change the tool whitelist."""
+    from .skills import SkillLoader
+
+    name = str(args.get("name", "")).strip()
+    skill = SkillLoader(ctx.cwd).load(name)
+    if skill is None:
+        return f"error: skill not found: {name}"
+    return skill.body
+```
+
+Add `skill_list` and `skill_load` to `_READONLY_TOOLS` in `permissions.py`.
+
+### 2.2 `/skill` injects the body into this turn's task
+
+Sometimes you already know this turn should use `debug-test`:
+
+```python
+def _cmd_skill(args: list[str], ctx: SlashContext) -> SlashResult:
+    ...
+    prompt = (
+        f"Use this skill for the next task.\n\n"
+        f"<skill name=\"{skill.name}\">\n{skill.body}\n</skill>\n\n"
+        f"Task: {task}"
+    )
+    return SlashResult(handled=True, should_query=True, prompt=prompt)
+```
+
+Run it:
+
+```bash
+$ uv run agent-code --max-steps 4 "Call skill_list first, then skill_load debug-test, and in one sentence say what step one of that skill is"
+tool_call: skill_list {}
+tool_call: skill_load {'name': 'debug-test'}
+final: Step one of debug-test is to read the failing test file and locate where the failure happens.
+```
+
+The key signal is two <Concept name="Tool Call">tool_use</Concept> calls — not the entire `SKILL.md` baked into the system prompt from the start. `skill_load` and `/skill` are now separate: the model reads a manual vs the user assigns this turn's job.
+
+v2 still lacks one piece: `allowed_tools` in `SKILL.md` is only text; it does not actually block tools yet.
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v1-to-v2.diff"
+  title="v2: skill_list / skill_load + /skill body injection"
+  description="Two read-only tools let the model read playbooks on demand; /skill injects the body into this turn's prompt. allowed_tools not enforced yet."
+/>
+
+---
+
+## v3 — `allowed_tools` Cannot Stay on Paper
+
+`debug-test` frontmatter says `allowed_tools: [read_file, grep]`. Without harness enforcement, that is just a hint. Permissions cannot rely on hints.
+
+v3 adds two layers: filter the tool list the model sees; deny out-of-bounds calls in the permission layer. The whitelist travels with `AgentJob` into the worker and restores in `finally` — one turn only, no leak into later normal chat.
+
+### 3.1 Add turn-scoped whitelist to `RuntimeState`
+
+```python
+    skill_allowed_tools: list[str] | None = None   # temporary tool surface for /skill turns
+    output_style: str | None = None                # v4 uses this; placeholder now
+```
+
+### 3.2 `AgentJob` carries the whitelist
+
+Day 8's `job_queue` stored plain strings. `/skill` also needs `allowed_tools`, so queue items upgrade to a dataclass:
+
+```python
+@dataclass
+class AgentJob:
+    prompt: str
+    allowed_tools: list[str] | None = None
+```
+
+After dequeuing: save old whitelist → set `state.skill_allowed_tools` → run `run_turn` → restore in `finally`.
+
+### 3.3 Filter tools first + permission fallback
+
+```python
+    def filtered(self, allowed_names: list[str] | None) -> "ToolRegistry":
+        """Tool surface shown to the model. None = no narrowing; [] = no tools."""
+        ...
+```
+
+In the Agent Loop:
+
+```python
+        visible_tools = tools.filtered(state.skill_allowed_tools)
+        response = provider.complete(messages, tools=visible_tools.list(), system=system_prompt)
+```
+
+Permission layer:
+
+```python
+    if request.allowed_tools is not None and tool_name not in request.allowed_tools:
+        return PermissionDecision("deny", f"skill allowed_tools does not allow {tool_name}")
+```
+
+Run it:
+
+```bash
+$ uv run agent-code --max-steps 6 "/skill debug-test Read tests/test_smoke.py first, do not edit, only explain the most suspicious failure point"
+tool_call: read_file {'path': 'tests/test_smoke.py'}
+tool_call: grep {'pattern': 'def run_agent', 'path': 'agent_code/agent.py'}
+...
+```
+
+Do not fixate on `final` here. Every `tool_call` in this turn should be `read_file` or `grep` — no `file_edit`, no `bash`. Double gate: schema filtering hides out-of-bounds tools; permission deny catches leaks.
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v2-to-v3.diff"
+  title="v3: AgentJob + filtered tool surface + PermissionRequest fallback"
+  description="allowed_tools travels with the job; worker restores in finally; visible_tools filters schemas; decide_permission denies out-of-bounds calls."
+/>
+
+---
+
+## v4 — Keep Answer Style Separate from Skills
+
+Skills hold domain knowledge and workflows; output-style holds how to answer. v4 stores style files under `.agent/output-styles/<name>.md`, switches via `/output-style`, and appends `<output-style>` last when rebuilding the system prompt each turn.
+
+### 4.1 Final system prompt order
+
+```txt
+core prompt → AGENT.md → <project-memory> → <available-skills> → <output-style>
+```
+
+Style goes last because it shapes expression; it must not override project rules or permission boundaries.
+
+### 4.2 Add `/output-style`
+
+```python
+def _cmd_output_style(args: list[str], ctx: SlashContext) -> SlashResult:
+    ...
+    if subcommand == "use":
+        ctx.state.output_style = name
+        return SlashResult(handled=True, message=f"output style -> {name}")
+```
+
+The status bar also shows `style:explanatory` — a prompt_toolkit bottom-toolbar visual state, not a normal stdout line. Exit the process and style resets.
+
+Run it:
+
+```bash
+$ uv run agent-code
+> /output-style use explanatory
+output style -> explanatory
+> Explain skill_load vs /skill briefly
+final: skill_load is the model reading knowledge; /skill is the user assigning this turn to a skill. The former does not change the tool surface; the latter binds allowed_tools for one turn.
+```
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v3-to-final.diff"
+  title="v4: output-style layer + /output-style + status bar"
+  description="Skills hold task knowledge; output-style holds answer style; build_system_prompt rebuilds each turn with style appended last."
+/>
+
+---
+
+### Terminal Replay Demo
+
+Below is the terminal animation for the `skill_list` → `skill_load` on-demand path. It shows the model reading a playbook on its own — not the `/skill` body-injection path.
+
+<TerminalReplay tracePath="/lessons/day-09/traces/skill-load.json" />
+
+---
+
+## What You Have Now
+
+- **Skill discovery**: Only `name + description` in the prompt at startup so the model knows what knowledge exists.
+- **On-demand loading**: `skill_load` reads bodies when needed instead of keeping every workflow resident in context.
+- **Task contract**: `/skill <name>` means this turn explicitly runs under a skill, not just browsing a manual.
+- **Tool surface narrowing**: `allowed_tools` applies to both the tool pool and the permission layer; the whitelist lives for one turn only.
+- **Style layer**: output-style controls how to answer, separate from task knowledge.
+
+---
+
+## FAQ
+
+**`/skills` shows `(no skills found)`**
+
+Confirm you run `uv run agent-code` from the project root. Skills resolve relative to `cwd`: `.agent/skills/<name>/SKILL.md`. With `--cwd`, skills must live under that directory too.
+
+**`skill_load` cannot find `debug-test`**
+
+Check frontmatter for `name: debug-test`. Directory name and skill name should match, but lookup uses the frontmatter `name`.
+
+**After `/skill debug-test`, normal chat is read-only too**
+
+`interactive.py` is not restoring `state.skill_allowed_tools` in `finally`. Go back to v3's `worker_loop()` and confirm `finally: state.skill_allowed_tools = old_allowed_tools`.
+
+**Answers do not change after `/output-style use explanatory`**
+
+Confirm interactive `run_turn()` rebuilds `system_prompt = build_system_prompt(resolved_cwd, state)` every turn. If the system prompt is built once at CLI startup, style changes never reach the model.
+
+---
+
+## Stretch Goals
+
+1. **Multiline frontmatter**: Support YAML multiline arrays for `allowed_tools`, not just one-line `[read_file, grep]`.
+2. **Skill sample library**: Write three local skills — `debug-test`, `write-docs`, `review-diff` — and compare how their `allowed_tools` should narrow.
+3. **Persist output-style**: Write the current style to `.agent/settings.json` and restore on next startup.
+4. **Skill body attachments**: Let `SKILL.md` reference `examples/*.md` in the same directory; load them together in `skill_load`.
+5. **Broken skill diagnostics**: Add `--verbose` to `/skills` listing skipped files and reasons.
+
+---
+
+## Reflection Questions
+
+1. **Why can description live in the prompt permanently, but not the body?** Hint: with 20 skills in a project, which part is the catalog and which is the book?
+
+2. **Why does `skill_load` not change `RuntimeState.skill_allowed_tools`?** Hint: reading a manual and accepting a job are different actions.
+
+3. **Should the whitelist only filter the tool pool, or only run in permission checks?** Hint: consider "model cannot see the tool" vs "model still emits an out-of-bounds call".
+
+4. **Why must `/skill`'s whitelist travel with `AgentJob` into the worker?** Hint: after Day 8, main thread and worker can both be alive.
+
+---
+
+## Next Day
+
+Today we wired on-demand knowledge into the single-Agent CLI.
+
+Some tasks need more than a playbook — they need an isolated execution line: a review agent that only reads diffs, a docs agent that only writes, a test agent that only runs verification.
+
+Day 10 adds Subagents: upgrade the skill whitelist, prompt injection, and one-turn lifecycle into harness boundaries that can spawn child agents.

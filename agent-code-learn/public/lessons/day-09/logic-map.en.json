@@ -1,0 +1,311 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 9 — Skills + On-Demand Knowledge",
+  "subtitle": "This map keeps Day 9's four main lines: skill catalog discovery, on-demand loading, the /skill allowed_tools lifecycle, and the output-style layer.",
+  "diagrams": [
+    {
+      "id": "skill-catalog",
+      "label": "Skill catalog",
+      "title": "Why only name + description at startup",
+      "summary": "build_system_prompt scans .agent/skills/*/SKILL.md and injects only the <available-skills> catalog card into the system prompt. Bodies stay out of resident context; broken skills are skipped with warnings.",
+      "defaultActiveNodeId": "available-skills",
+      "nodes": [
+        {
+          "id": "cwd",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "uv run agent-code",
+          "detail": "The CLI resolves cwd, then enters the Agent Loop or slash dispatch. Skills live under .agent/skills/ relative to cwd.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "skills-dir",
+          "kind": "data",
+          "label": ".agent/skills",
+          "eyebrow": "local store",
+          "body": "*/SKILL.md",
+          "detail": "Each skill is a subdirectory plus SKILL.md. Frontmatter holds name, description, allowed_tools; the body is the workflow text.",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "loader",
+          "kind": "tool",
+          "label": "SkillLoader",
+          "eyebrow": "parse",
+          "body": "list() / load(name)",
+          "detail": "A hand-written frontmatter parser avoids PyYAML. Skills missing name or description are skipped so one bad file cannot break the CLI.",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "build-prompt",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "harness",
+          "body": "core + AGENT.md + memory",
+          "detail": "The system prompt is assembled in a fixed order. Day 9 appends the skill catalog after memory, not the body text.",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "slash-skills",
+          "kind": "tool",
+          "label": "/skills",
+          "eyebrow": "control plane",
+          "body": "local slash, no LLM",
+          "detail": "Slash dispatch calls SkillLoader.render_list() directly and prints name + description to the terminal without a model request.",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "available-skills",
+          "kind": "data",
+          "label": "<available-skills>",
+          "eyebrow": "catalog card",
+          "body": "name + description only",
+          "detail": "The model knows which playbooks exist, not the full four-step debug flow. With 20 skills, the catalog is a light index; bodies load on demand.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "cwd-skills-dir", "source": "cwd", "target": "skills-dir", "label": "resolve path", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "skills-dir-loader", "source": "skills-dir", "target": "loader", "label": "glob */SKILL.md", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "loader-build-prompt", "source": "loader", "target": "build-prompt", "label": "render_available_skills()", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "loader-slash-skills", "source": "loader", "target": "slash-skills", "label": "render_list()", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "build-prompt-available-skills", "source": "build-prompt", "target": "available-skills", "label": "append catalog", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "on-demand-load",
+      "label": "On-demand load",
+      "title": "Two entry paths: skill_load vs /skill",
+      "summary": "skill_list / skill_load are read-only tools: the model reads a playbook and the body returns through tool_result without changing RuntimeState.skill_allowed_tools. /skill is the user assigning this turn's task and injecting the body into the prompt.",
+      "defaultActiveNodeId": "skill-load",
+      "nodes": [
+        {
+          "id": "slash-skill",
+          "kind": "tool",
+          "label": "/skill <name>",
+          "eyebrow": "control plane",
+          "body": "inject <skill> block",
+          "detail": "Slash reads the body, builds a prompt with Task, and returns should_query=True. From v3 onward it also carries allowed_tools.",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "user-prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "call skill_load ...",
+          "detail": "A normal prompt enters the Agent Loop. The system prompt already contains the <available-skills> catalog, so the model may choose skill_load on its own.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider",
+          "eyebrow": "model",
+          "body": "complete(messages, tools)",
+          "detail": "The model sees skill_list and skill_load as read-only tool schemas and uses the same tool_use protocol as other tools.",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "skill-list",
+          "kind": "tool",
+          "label": "skill_list",
+          "eyebrow": "read-only",
+          "body": "render_list()",
+          "detail": "Shares SkillLoader with /skills and returns name + description text to the model.",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "skill-load",
+          "kind": "tool",
+          "label": "skill_load",
+          "eyebrow": "read-only",
+          "body": "return skill.body",
+          "detail": "Loads the SKILL.md body on demand and backfills it as a tool_result into messages. Does not change the tool whitelist — reading a manual is not accepting a job.",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "tool_result blocks",
+          "detail": "The skill_load body enters message history for later turns. Day 8 emit does not print observation lines to the terminal.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "slash-skill-user-prompt", "source": "slash-skill", "target": "user-prompt", "label": "AgentJob.prompt", "sourceHandle": "source-top", "targetHandle": "target-bottom", "mobileSourceHandle": "source-top", "mobileTargetHandle": "target-bottom" },
+        { "id": "user-prompt-provider", "source": "user-prompt", "target": "provider", "label": "Agent Loop", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "provider-skill-list", "source": "provider", "target": "skill-list", "label": "tool_use", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "skill-list-skill-load", "source": "skill-list", "target": "skill-load", "label": "then load", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "skill-load-messages", "source": "skill-load", "target": "messages", "label": "tool_result", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "tool-boundary",
+      "label": "Tool boundary",
+      "title": "Why allowed_tools lives for one turn only",
+      "summary": "allowed_tools from /skill is wrapped in AgentJob; the worker sets state.skill_allowed_tools before run_turn and restores it in finally. ToolRegistry.filtered plus PermissionRequest deny form a double gate against out-of-bounds tool calls.",
+      "defaultActiveNodeId": "filtered",
+      "nodes": [
+        {
+          "id": "slash-result",
+          "kind": "data",
+          "label": "SlashResult",
+          "eyebrow": "handoff",
+          "body": "prompt + allowed_tools",
+          "detail": "The slash handler runs on the main thread and does not mutate shared state directly. The whitelist travels with the next job so an in-flight turn is not polluted.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "agent-job",
+          "kind": "data",
+          "label": "AgentJob",
+          "eyebrow": "queue item",
+          "body": "prompt + allowed_tools",
+          "detail": "Day 8 job_queue stored str; Day 9 upgrades to a dataclass. Normal input uses allowed_tools=None.",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "worker",
+          "kind": "runtime",
+          "label": "worker thread",
+          "eyebrow": "lifecycle",
+          "body": "set → run → finally restore",
+          "detail": "After dequeuing a job, the worker saves the old whitelist, sets job.allowed_tools, runs run_turn, then restores in finally so later normal chat is not stuck read-only.",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "filtered",
+          "kind": "tool",
+          "label": "ToolRegistry.filtered",
+          "eyebrow": "schema gate",
+          "body": "visible_tools.list()",
+          "detail": "provider.complete only sees schemas inside the whitelist. debug-test allows read_file / grep; the model cannot see file_edit.",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "execute",
+          "kind": "runtime",
+          "label": "execute_one_tool_call",
+          "eyebrow": "harness",
+          "body": "visible_tools only",
+          "detail": "Execution also uses the filtered registry; hidden write tools cannot be reached from the original ToolRegistry.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "permission",
+          "kind": "tool",
+          "label": "PermissionRequest",
+          "eyebrow": "safety gate",
+          "body": "allowed_tools deny",
+          "detail": "Even if the model emits an out-of-bounds tool call from history, decide_permission denies it: skill allowed_tools does not allow X.",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "slash-result-agent-job", "source": "slash-result", "target": "agent-job", "label": "job_queue.put", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "agent-job-worker", "source": "agent-job", "target": "worker", "label": "worker_loop", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "worker-filtered", "source": "worker", "target": "filtered", "label": "skill_allowed_tools", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "filtered-execute", "source": "filtered", "target": "execute", "label": "run(call)", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "execute-permission", "source": "execute", "target": "permission", "label": "decide_permission", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-left", "mobileTargetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "output-style",
+      "label": "Output style",
+      "title": "Why style stays separate from skills",
+      "summary": "Skills hold task knowledge (how to debug, how to release). output-style holds answer style (more explanation, code-review tone). /output-style mutates RuntimeState.output_style; each rebuilt system prompt appends <output-style> last without changing tool permissions.",
+      "defaultActiveNodeId": "output-style-block",
+      "nodes": [
+        {
+          "id": "styles-dir",
+          "kind": "data",
+          "label": ".agent/output-styles",
+          "eyebrow": "local store",
+          "body": "*.md",
+          "detail": "Same .agent family as skills, different semantics: how to speak, not what task to run.",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "slash-style",
+          "kind": "tool",
+          "label": "/output-style",
+          "eyebrow": "control plane",
+          "body": "list / use / reset",
+          "detail": "Interactive shell only. use sets state.output_style; reset clears to None. Not persisted after process exit.",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "runtime-state",
+          "kind": "data",
+          "label": "RuntimeState",
+          "eyebrow": "shared",
+          "body": "output_style: str | None",
+          "detail": "Lives beside skill_allowed_tools in RuntimeState; main thread writes, worker reads.",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "rebuild-prompt",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "rebuild each turn",
+          "body": "core → rules → memory → skills → style",
+          "detail": "Day 9 fixes a latent bug: the system prompt cannot be built once at CLI startup. Both the skills catalog and style are runtime variables.",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "toolbar",
+          "kind": "output",
+          "label": "bottom_toolbar",
+          "eyebrow": "UI hint",
+          "body": "style:explanatory",
+          "detail": "The prompt_toolkit status bar shows the active style; it is not a normal stdout line.",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "output-style-block",
+          "kind": "data",
+          "label": "<output-style>",
+          "eyebrow": "last layer",
+          "body": "append after skills",
+          "detail": "Last because style shapes expression; it must not override AGENT.md rules or permission boundaries.",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "styles-dir-slash-style", "source": "styles-dir", "target": "slash-style", "label": "load_output_style", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "slash-style-runtime-state", "source": "slash-style", "target": "runtime-state", "label": "output_style =", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "slash-style-toolbar", "source": "slash-style", "target": "toolbar", "label": "status bar", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "runtime-state-rebuild-prompt", "source": "runtime-state", "target": "rebuild-prompt", "label": "each run_turn", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "rebuild-prompt-output-style-block", "source": "rebuild-prompt", "target": "output-style-block", "label": "render_output_style", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    }
+  ]
+}

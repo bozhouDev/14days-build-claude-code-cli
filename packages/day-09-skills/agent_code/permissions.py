@@ -49,14 +49,16 @@ _READONLY_TOOLS = frozenset({
     "git_status", "git_diff",
     "system_date", "echo",
     "memory_recall",
-    "cron_list",
-    "todo_read",          # 新增 todo_read
+    "cron_list", "todo_read",
     "skill_list", "skill_load",
 })
 
-# 写入范围被锁在 .agent/ 下的"低风险写"工具。
-# default / acceptEdits 直接放行；plan 模式仍然 deny。
-_LOW_RISK_WRITES = frozenset({"memory_write", "cron_create", "cron_cancel", "todo_write"})  # 新增 todo_write
+# 写入范围被锁在 .agent/ 下，或只改运行态的"低风险写"工具。
+# default / acceptEdits 直接放行；plan 模式里只有 todo / plan 工具额外放行。
+_LOW_RISK_WRITES = frozenset({
+    "memory_write", "cron_create", "cron_cancel",
+    "todo_write", "enter_plan_mode", "exit_plan_mode",
+})
 
 # 交互和网络都不是写入，但仍需要用户知道 Agent 正在停下来问人或访问外部资源。
 _ASK_TOOLS = frozenset({"ask_user_question", "web_fetch", "web_search"})
@@ -77,12 +79,11 @@ def decide_permission(request: PermissionRequest) -> PermissionDecision:
     if tool_name in _ASK_TOOLS:
         return PermissionDecision("ask")
 
-    # plan 模式：只允许只读工具；ask_user_question / web_* 仍会走 ask。
+    # plan 模式：只允许只读工具、todo 和 plan 工具；ask_user_question / web_* 仍会走 ask。
     # 写类工具一律 deny。
     if mode == "plan":
         if tool_name in _READONLY_TOOLS:
             return PermissionDecision("allow")
-        # 新增：plan 工具和 todo 在 plan 里也放行
         if tool_name in ("enter_plan_mode", "exit_plan_mode", "todo_write", "todo_read"):
             return PermissionDecision("allow")
         return PermissionDecision(

@@ -1,0 +1,80 @@
+--- /dev/null
++++ agent_code/skills.py
+@@ -0,0 +1,117 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++
++@dataclass(frozen=True)
++class SkillMeta:
++    name: str
++    description: str
++    allowed_tools: list[str] | None
++    body: str
++    path: Path
++
++
++def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
++    """只解析教程需要的 frontmatter 子集，不引入 YAML 依赖。"""
++    ...
++
++
++class SkillLoader:
++    def __init__(self, cwd: Path) -> None:
++        self.cwd = cwd
++        self.skills_dir = cwd / ".agent" / "skills"
++        self.warnings: list[str] = []
++
++    def render_list(self) -> str:
++        skills = self.list()
++        if not skills:
++            return "(no skills found)"
++        return "\n".join(f"{skill.name}  {skill.description}" for skill in skills)
++
++    def render_available_skills(self) -> str:
++        skills = self.list()
++        if not skills:
++            return ""
++        lines = ["<available-skills>"]
++        lines.extend(f"- {skill.name}: {skill.description}" for skill in skills)
++        lines.append("</available-skills>")
++        return "\n".join(lines)
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ -46,7 +46,7 @@
+-def build_system_prompt(cwd: Path) -> str:
+-    """组装 system prompt：核心指南 + AGENT.md + MEMORY.md 索引。"""
++def build_system_prompt(cwd: Path, state: RuntimeState | None = None) -> str:
++    """组装 system prompt：核心指南 + 项目规则 + 记忆索引 + skill 目录。"""
+     from .memdir.store import load_index as load_memory_index
++    from .skills import SkillLoader
+ 
+     parts: list[str] = [_SYSTEM_CORE]
+@@ -58,4 +58,9 @@
+     if memory_index:
+         parts.append(f"<project-memory>\n{memory_index}\n</project-memory>")
+ 
++    available_skills = SkillLoader(cwd).render_available_skills()
++    if available_skills:
++        # 这里只放 skill 目录卡片，不放正文；正文等 skill_load 或 /skill 再加载。
++        parts.append(available_skills)
++
+     return "\n\n".join(parts)
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ -140,0 +140,10 @@
++def _cmd_skills(_args: list[str], ctx: SlashContext) -> SlashResult:
++    from .skills import SkillLoader
++
++    loader = SkillLoader(ctx.cwd)
++    message = loader.render_list()
++    if loader.warnings:
++        message += "\n\nwarnings:\n" + "\n".join(f"- {w}" for w in loader.warnings)
++    return SlashResult(handled=True, message=message)
++
+@@ -301,0 +302,1 @@
++register("skills", "列出本地 .agent/skills 里的 skill", _cmd_skills)

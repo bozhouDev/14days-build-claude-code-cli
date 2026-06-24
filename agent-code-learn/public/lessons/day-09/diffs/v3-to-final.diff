@@ -1,0 +1,62 @@
+--- agent_code/skills.py
++++ agent_code/skills.py
+@@ SkillLoader 之后
++@dataclass(frozen=True)
++class OutputStyle:
++    name: str
++    description: str
++    body: str
++    path: Path
++
++
++def list_output_styles(cwd: Path) -> list[OutputStyle]:
++    styles_dir = cwd / ".agent" / "output-styles"
++    ...
++
++
++def render_output_style(cwd: Path, name: str | None) -> str:
++    if not name:
++        return ""
++    style = load_output_style(cwd, name)
++    if style is None:
++        return ""
++    return f"<output-style name=\"{style.name}\">\n{style.body}\n</output-style>"
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ available_skills 之后
++    if state is not None:
++        from .skills import render_output_style
++
++        output_style = render_output_style(cwd, state.output_style)
++        if output_style:
++            # 风格层放最后：它能影响表达方式，但不应该覆盖项目规则和权限边界。
++            parts.append(output_style)
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ _cmd_skill 之后
++def _cmd_output_style(args: list[str], ctx: SlashContext) -> SlashResult:
++    from .skills import list_output_styles, load_output_style
++
++    if ctx.state is None:
++        return SlashResult(handled=True, message="output-style 需要交互 shell")
++
++    subcommand = args[0] if args else "list"
++    if subcommand == "use":
++        ctx.state.output_style = name
++        return SlashResult(handled=True, message=f"output style -> {name}")
++    if subcommand == "reset":
++        ctx.state.output_style = None
++        return SlashResult(handled=True, message="output style reset")
++    ...
+
+@@ register
++register("output-style", "列出/切换/重置当前回答风格", _cmd_output_style)
+
+--- agent_code/interactive.py
++++ agent_code/interactive.py
+@@ bottom_toolbar
++    style = f" · style:{state.output_style}" if state.output_style else ""
+-    return f" {mode} · {state.model}{todo} "
++    return f" {mode} · {state.model}{style}{todo} "

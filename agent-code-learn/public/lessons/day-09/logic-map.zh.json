@@ -1,0 +1,311 @@
+{
+  "eyebrow": "Agent Logic Map",
+  "title": "Day 9 · Skills + 按需知识",
+  "subtitle": "这张图只放 Day 9 的四条主线：skill 目录发现、按需加载、/skill 工具白名单生命周期、output-style 风格层。",
+  "diagrams": [
+    {
+      "id": "skill-catalog",
+      "label": "Skill catalog",
+      "title": "启动时为什么只放 name + description",
+      "summary": "build_system_prompt 扫描 .agent/skills/*/SKILL.md，只把 <available-skills> 目录卡片注入 system prompt。body 不进常驻上下文，坏 skill 由 SkillLoader 跳过并记录 warnings。",
+      "defaultActiveNodeId": "available-skills",
+      "nodes": [
+        {
+          "id": "cwd",
+          "kind": "runtime",
+          "label": "CLI Runtime",
+          "eyebrow": "entry",
+          "body": "uv run agent-code",
+          "detail": "CLI 解析 cwd 后进入 Agent Loop 或 slash dispatch。Skills 目录相对 cwd 查找 .agent/skills/。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "skills-dir",
+          "kind": "data",
+          "label": ".agent/skills",
+          "eyebrow": "local store",
+          "body": "*/SKILL.md",
+          "detail": "每个 skill 是一个子目录 + SKILL.md。frontmatter 含 name、description、allowed_tools；body 是工作流正文。",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "loader",
+          "kind": "tool",
+          "label": "SkillLoader",
+          "eyebrow": "parse",
+          "body": "list() / load(name)",
+          "detail": "手写 frontmatter parser，不引入 PyYAML。缺 name 或 description 的 skill 会被跳过，不会拖垮 CLI。",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "build-prompt",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "harness",
+          "body": "core + AGENT.md + memory",
+          "detail": "system prompt 按固定顺序组装。Day 9 在 memory 之后追加 skill 目录，不放 body。",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "slash-skills",
+          "kind": "tool",
+          "label": "/skills",
+          "eyebrow": "control plane",
+          "body": "本地 slash，无 LLM",
+          "detail": "slash dispatch 直接调 SkillLoader.render_list()，终端打印 name + description，不消耗模型请求。",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "available-skills",
+          "kind": "data",
+          "label": "<available-skills>",
+          "eyebrow": "catalog card",
+          "body": "name + description only",
+          "detail": "模型知道有哪些手册可用，但不知道四步调试流程的全文。20 个 skill 时，目录是轻量索引，正文是按需加载。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "cwd-skills-dir", "source": "cwd", "target": "skills-dir", "label": "resolve path", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "skills-dir-loader", "source": "skills-dir", "target": "loader", "label": "glob */SKILL.md", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "loader-build-prompt", "source": "loader", "target": "build-prompt", "label": "render_available_skills()", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "loader-slash-skills", "source": "loader", "target": "slash-skills", "label": "render_list()", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "build-prompt-available-skills", "source": "build-prompt", "target": "available-skills", "label": "append catalog", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "on-demand-load",
+      "label": "On-demand load",
+      "title": "skill_load 和 /skill 的两条入口",
+      "summary": "skill_list / skill_load 是只读工具：模型翻手册，body 通过 tool_result 回填，不改变 RuntimeState.skill_allowed_tools。/skill 是用户指定本轮任务，把 body 注入 prompt。",
+      "defaultActiveNodeId": "skill-load",
+      "nodes": [
+        {
+          "id": "slash-skill",
+          "kind": "tool",
+          "label": "/skill <name>",
+          "eyebrow": "control plane",
+          "body": "inject <skill> block",
+          "detail": "slash 读取 body，拼成带 Task 的 prompt，返回 should_query=True。v3 起还携带 allowed_tools。",
+          "position": { "x": 0, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 630 }
+        },
+        {
+          "id": "user-prompt",
+          "kind": "runtime",
+          "label": "user prompt",
+          "eyebrow": "input",
+          "body": "调用 skill_load ...",
+          "detail": "普通 prompt 走 Agent Loop。system prompt 里已有 <available-skills> 目录，模型可主动选 skill_load。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "provider",
+          "kind": "model",
+          "label": "Provider",
+          "eyebrow": "model",
+          "body": "complete(messages, tools)",
+          "detail": "模型看到 skill_list / skill_load 两个只读工具的 schema，和其他工具一样走 tool_use 协议。",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "skill-list",
+          "kind": "tool",
+          "label": "skill_list",
+          "eyebrow": "read-only",
+          "body": "render_list()",
+          "detail": "和 /skills 共用 SkillLoader，返回 name + description 文本给模型。",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "skill-load",
+          "kind": "tool",
+          "label": "skill_load",
+          "eyebrow": "read-only",
+          "body": "return skill.body",
+          "detail": "按需读取 SKILL.md body，作为 tool_result 回填 messages。不改变工具白名单——翻手册 ≠ 接任务。",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "messages",
+          "kind": "data",
+          "label": "messages",
+          "eyebrow": "context",
+          "body": "tool_result blocks",
+          "detail": "skill_load 的正文进入 messages 历史，供后续轮次引用。Day 8 emit 不在终端打印 observation。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "slash-skill-user-prompt", "source": "slash-skill", "target": "user-prompt", "label": "AgentJob.prompt", "sourceHandle": "source-top", "targetHandle": "target-bottom", "mobileSourceHandle": "source-top", "mobileTargetHandle": "target-bottom" },
+        { "id": "user-prompt-provider", "source": "user-prompt", "target": "provider", "label": "Agent Loop", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "provider-skill-list", "source": "provider", "target": "skill-list", "label": "tool_use", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "skill-list-skill-load", "source": "skill-list", "target": "skill-load", "label": "then load", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "skill-load-messages", "source": "skill-load", "target": "messages", "label": "tool_result", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    },
+    {
+      "id": "tool-boundary",
+      "label": "Tool boundary",
+      "title": "allowed_tools 为什么只活一轮",
+      "summary": "/skill 返回的 allowed_tools 封进 AgentJob，worker 在 run_turn 前设置 state.skill_allowed_tools，finally 恢复。工具池 filtered + PermissionRequest 兜底 deny，双保险阻止越界 tool call。",
+      "defaultActiveNodeId": "filtered",
+      "nodes": [
+        {
+          "id": "slash-result",
+          "kind": "data",
+          "label": "SlashResult",
+          "eyebrow": "handoff",
+          "body": "prompt + allowed_tools",
+          "detail": "slash handler 跑主线程，不直接改共享 state。白名单跟着下一条 job 走，避免污染正在跑的 turn。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "agent-job",
+          "kind": "data",
+          "label": "AgentJob",
+          "eyebrow": "queue item",
+          "body": "prompt + allowed_tools",
+          "detail": "Day 8 job_queue 存 str；Day 9 升级为 dataclass，普通输入 allowed_tools=None。",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "worker",
+          "kind": "runtime",
+          "label": "worker thread",
+          "eyebrow": "lifecycle",
+          "body": "set → run → finally restore",
+          "detail": "worker 取出 job 后保存旧白名单、设 job.allowed_tools、跑 run_turn，finally 恢复，防止泄漏到后续普通对话。",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "filtered",
+          "kind": "tool",
+          "label": "ToolRegistry.filtered",
+          "eyebrow": "schema gate",
+          "body": "visible_tools.list()",
+          "detail": "provider.complete 只看到白名单内的工具 schema。debug-test 只允许 read_file / grep，模型看不见 file_edit。",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "execute",
+          "kind": "runtime",
+          "label": "execute_one_tool_call",
+          "eyebrow": "harness",
+          "body": "visible_tools only",
+          "detail": "执行阶段也用 filtered registry，不能从原始 ToolRegistry 找到被隐藏的写工具。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        },
+        {
+          "id": "permission",
+          "kind": "tool",
+          "label": "PermissionRequest",
+          "eyebrow": "safety gate",
+          "body": "allowed_tools deny",
+          "detail": "就算模型从历史上下文发出越界 tool call，decide_permission 也会 deny：skill allowed_tools does not allow X。",
+          "position": { "x": 580, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "slash-result-agent-job", "source": "slash-result", "target": "agent-job", "label": "job_queue.put", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "agent-job-worker", "source": "agent-job", "target": "worker", "label": "worker_loop", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "worker-filtered", "source": "worker", "target": "filtered", "label": "skill_allowed_tools", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "filtered-execute", "source": "filtered", "target": "execute", "label": "run(call)", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "execute-permission", "source": "execute", "target": "permission", "label": "decide_permission", "sourceHandle": "source-left", "targetHandle": "target-right", "mobileSourceHandle": "source-left", "mobileTargetHandle": "target-right" }
+      ]
+    },
+    {
+      "id": "output-style",
+      "label": "Output style",
+      "title": "风格层为什么和 skill 分开",
+      "summary": "Skills 是任务知识（怎么调试、怎么发版）；output-style 是回答方式（多解释、像 code review）。/output-style 改 RuntimeState.output_style，每轮 rebuild system prompt 时在最后追加 <output-style>，不影响工具权限。",
+      "defaultActiveNodeId": "output-style-block",
+      "nodes": [
+        {
+          "id": "styles-dir",
+          "kind": "data",
+          "label": ".agent/output-styles",
+          "eyebrow": "local store",
+          "body": "*.md",
+          "detail": "和 skills 同目录族，但语义不同：管怎么说，不管做什么任务。",
+          "position": { "x": 0, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "slash-style",
+          "kind": "tool",
+          "label": "/output-style",
+          "eyebrow": "control plane",
+          "body": "list / use / reset",
+          "detail": "交互 shell 专用。use 设置 state.output_style，reset 清回 None。进程退出不持久化。",
+          "position": { "x": 290, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 0 }
+        },
+        {
+          "id": "runtime-state",
+          "kind": "data",
+          "label": "RuntimeState",
+          "eyebrow": "shared",
+          "body": "output_style: str | None",
+          "detail": "和 skill_allowed_tools 一样放在 RuntimeState，主线程写、worker 读。",
+          "position": { "x": 580, "y": 80 },
+          "mobilePosition": { "x": 0, "y": 210 }
+        },
+        {
+          "id": "rebuild-prompt",
+          "kind": "runtime",
+          "label": "build_system_prompt",
+          "eyebrow": "每轮重建",
+          "body": "core → rules → memory → skills → style",
+          "detail": "Day 9 修了一个隐性 bug：system prompt 不能在 CLI 启动时只拼一次。skills 目录和 style 都是运行时变量。",
+          "position": { "x": 870, "y": 80 },
+          "mobilePosition": { "x": 280, "y": 210 }
+        },
+        {
+          "id": "toolbar",
+          "kind": "output",
+          "label": "bottom_toolbar",
+          "eyebrow": "UI hint",
+          "body": "style:explanatory",
+          "detail": "prompt_toolkit 状态栏显示当前 style，不是普通 stdout 一行。",
+          "position": { "x": 290, "y": 330 },
+          "mobilePosition": { "x": 0, "y": 420 }
+        },
+        {
+          "id": "output-style-block",
+          "kind": "data",
+          "label": "<output-style>",
+          "eyebrow": "last layer",
+          "body": "append after skills",
+          "detail": "放最后是因为 style 管表达方式，不能覆盖 AGENT.md 规则和权限边界。",
+          "position": { "x": 870, "y": 330 },
+          "mobilePosition": { "x": 280, "y": 420 }
+        }
+      ],
+      "edges": [
+        { "id": "styles-dir-slash-style", "source": "styles-dir", "target": "slash-style", "label": "load_output_style", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "slash-style-runtime-state", "source": "slash-style", "target": "runtime-state", "label": "output_style =", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "slash-style-toolbar", "source": "slash-style", "target": "toolbar", "label": "status bar", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" },
+        { "id": "runtime-state-rebuild-prompt", "source": "runtime-state", "target": "rebuild-prompt", "label": "each run_turn", "sourceHandle": "source-right", "targetHandle": "target-left", "mobileSourceHandle": "source-right", "mobileTargetHandle": "target-left" },
+        { "id": "rebuild-prompt-output-style-block", "source": "rebuild-prompt", "target": "output-style-block", "label": "render_output_style", "sourceHandle": "source-bottom", "targetHandle": "target-top", "mobileSourceHandle": "source-bottom", "mobileTargetHandle": "target-top" }
+      ]
+    }
+  ]
+}

@@ -1470,6 +1470,17 @@ register("todo", "显示当前 todo 列表", _cmd_todo)
 
 `/todo` 和 `todo_read` 读的是同一个 `RuntimeState.todo_store`，所以你看到的就是模型刚写的那份。
 
+状态栏也顺手接上当前 todo。`active_form` 这个字段就是为状态栏准备的——v1 的 `bottom_toolbar` 只显示模式和模型，现在让它读出正在做的那条。
+
+打开 `agent_code/interactive.py`，把 `bottom_toolbar()` 的最后一行 `return f" {mode} · {state.model} "` 替换成下面三行（上面的 `mode = {...}` 那段保留不动）：
+
+```python
+    # 状态栏读出当前 in_progress 那条 todo 的 active_form，挂在尾部
+    active = next((t.active_form for t in state.todo_store if t.status == "in_progress"), "")
+    todo = f" · {active}" if active else ""
+    return f" {mode} · {state.model}{todo} "
+```
+
 ### 5.4 跑验证
 
 ```bash
@@ -1492,6 +1503,8 @@ tool_call: read_file ...
 - 模型每次传的是完整列表，不是只追加一条。
 - `/todo` 看到的和模型写的是同一份。
 - 如果哪次模型关掉 3+ 个任务、整张表又没有验证项，结果尾巴会冒出 nudge 提醒。
+
+agent 干活时，底部状态栏还会多显示当前在做的那条 todo，例如 ` default · deepseek-v4-pro · 正在跑 git_status 验证 `——读的就是 `active_form`。
 
 v5 让 Agent 有了进度追踪。但 plan 模式还是个空壳——`/plan` 只能看，不能审批。v6 把它闭环。
 

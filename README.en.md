@@ -63,7 +63,7 @@ The first 7 days build a useful single-agent CLI. The next 7 days upgrade it int
 | 13 | Worktree + Final Demo | worktree isolation and end-to-end coding tasks |
 | 14 | MCP + ToolSearch | MCP client, tool discovery, tool authoring |
 
-The repository currently includes the first 8 days of tutorials and runnable snapshots. Later days will continue on the same route.
+The repository currently includes the first 9 days of tutorials and runnable snapshots. Later days will continue on the same route.
 
 ## Getting Started
 

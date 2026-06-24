@@ -1,4 +1,4 @@
-"""agent_code/runtime.py — 跨主线程 / worker 线程共享的运行态。"""
+"""agent_code/runtime.py -- 跨主线程 / worker 线程共享的运行态。"""
 
 from __future__ import annotations
 

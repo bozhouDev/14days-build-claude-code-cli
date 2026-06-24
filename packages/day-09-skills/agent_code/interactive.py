@@ -1,4 +1,4 @@
-"""agent_code/interactive.py — prompt_toolkit 交互 shell。
+"""agent_code/interactive.py -- prompt_toolkit 交互 shell。
 
 主线程 = PromptSession（输入、键位、状态栏 + slash 分派）；
 worker 线程 = run_agent（阻塞 provider.complete + 工具执行）。
@@ -6,20 +6,23 @@ worker 线程 = run_agent（阻塞 provider.complete + 工具执行）。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import asyncio
 import queue
 import threading
-from dataclasses import dataclass
 from typing import Any, Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
+from rich.console import Console
 
 from . import prompt_ui
 from .runtime import RuntimeState
 from .slash import SlashContext, dispatch_slash
+
+console = Console(no_color=True)
 
 
 @dataclass
@@ -35,7 +38,7 @@ def run_interactive_shell(
 ) -> None:
     """启动交互 REPL。主线程读输入 + 分派 slash，worker 线程跑 Agent Loop。"""
     job_queue: "queue.Queue[AgentJob | None]" = queue.Queue()
-    busy = threading.Event()
+    busy = threading.Event()                 # v3 新增：worker 跑 turn 时置位
 
     def worker_loop() -> None:
         while True:
@@ -48,11 +51,12 @@ def run_interactive_shell(
             busy.set()
             try:
                 run_turn(job.prompt)
-            except Exception as exc:
+            except Exception as exc:          # provider/工具异常别让 worker 静默死掉
                 print(f"[error] {exc}")
             finally:
                 state.skill_allowed_tools = old_allowed_tools
                 busy.clear()
+            # turn 末 drain：把运行期间排队的输入接着跑
             while not state.input_queue.empty():
                 job_queue.put(AgentJob(state.input_queue.get()))
 
@@ -69,11 +73,13 @@ def run_interactive_shell(
         # 线程拆开后，worker 要问用户（确认编辑、批准计划）不能直接抢 stdin——
         # terminal_asker 用 run_coroutine_threadsafe 把提问调度到这条循环上，
         # run_in_terminal 暂停输入框、问完再恢复，worker 阻塞在 .result() 等结果。
-        # set_terminal_asker 在 1.5 的 prompt_ui 里定义。
         loop = asyncio.get_running_loop()
 
         def terminal_asker(func: Callable[[], Any]) -> Any:
-            return asyncio.run_coroutine_threadsafe(run_in_terminal(func), loop).result()
+            async def ask_in_terminal() -> Any:
+                return await run_in_terminal(func)
+
+            return asyncio.run_coroutine_threadsafe(ask_in_terminal(), loop).result()
 
         prompt_ui.set_terminal_asker(terminal_asker)
 
@@ -93,11 +99,10 @@ def run_interactive_shell(
                     result = dispatch_slash(text, make_slash_context())
                     if result.handled:
                         if result.message:
-                            print(result.message)
+                            console.print(result.message)
                         if result.should_query:
                             job_queue.put(AgentJob(result.prompt, result.allowed_tools))
                         continue
-                # 原来这里是: job_queue.put(text)
                 if busy.is_set():
                     state.input_queue.put(text)        # 忙时入 type-ahead 队列
                     print("[queued] turn 结束后自动处理")
@@ -129,5 +134,7 @@ def bottom_toolbar(state: RuntimeState) -> str:
     mode = {"default": "default", "acceptEdits": "accept edits", "plan": "plan"}.get(
         state.permission_mode, state.permission_mode
     )
+    active = next((t.active_form for t in state.todo_store if t.status == "in_progress"), "")
     style = f" · style:{state.output_style}" if state.output_style else ""
-    return f" {mode} · {state.model}{style} "
+    todo = f" · {active}" if active else ""
+    return f" {mode} · {state.model}{style}{todo} "

@@ -1,0 +1,96 @@
+--- agent_code/runtime.py
++++ agent_code/runtime.py
+@@ todo_store 下面
++    skill_allowed_tools: list[str] | None = None               # /skill 本轮任务的临时工具面
++    output_style: str | None = None                            # v4 才用，先占位
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ SlashResult.__init__
++        allowed_tools: list[str] | None = None,
+     ) -> None:
+         ...
++        self.allowed_tools = allowed_tools
+
+@@ _cmd_skill return
+-    return SlashResult(handled=True, should_query=True, prompt=prompt)
++    return SlashResult(
++        handled=True,
++        should_query=True,
++        prompt=prompt,
++        allowed_tools=skill.allowed_tools,
++    )
+
+--- agent_code/interactive.py
++++ agent_code/interactive.py
+@@ 顶部
++from dataclasses import dataclass
++
++@dataclass
++class AgentJob:
++    prompt: str
++    allowed_tools: list[str] | None = None
+
+@@ worker_loop
+-    job_queue: "queue.Queue[str]" = queue.Queue()
++    job_queue: "queue.Queue[AgentJob | None]" = queue.Queue()
++
++            old_allowed_tools = state.skill_allowed_tools
++            state.skill_allowed_tools = job.allowed_tools
++            try:
++                run_turn(job.prompt)
++            finally:
++                state.skill_allowed_tools = old_allowed_tools
+
+@@ slash should_query
+-                            job_queue.put(result.prompt)
++                            job_queue.put(AgentJob(result.prompt, result.allowed_tools))
+
+--- agent_code/cli.py
++++ agent_code/cli.py
+@@ run_once
+-    system_prompt: str | None = None,
++    skill_allowed_tools: list[str] | None = None,
+@@
+-    system_prompt = build_system_prompt(cwd)
++    state.skill_allowed_tools = skill_allowed_tools
++    system_prompt = build_system_prompt(cwd, state)
+
+@@ run_turn
++        system_prompt = build_system_prompt(resolved_cwd, state)
+
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ ToolRegistry.get 后面
++    def filtered(self, allowed_names: list[str] | None) -> "ToolRegistry":
++        """给模型看的工具面。None 表示不收敛，[] 表示不给任何工具。"""
++        if allowed_names is None:
++            return self
++        registry = ToolRegistry()
++        for name in allowed_names:
++            tool = self.get(name)
++            if tool is not None:
++                registry.register(tool)
++        return registry
+
+--- agent_code/agent.py
++++ agent_code/agent.py
+@@ loop
+-        response = provider.complete(messages, tools=tools.list(), system=system_prompt)
++        visible_tools = tools.filtered(state.skill_allowed_tools)
++        response = provider.complete(messages, tools=visible_tools.list(), system=system_prompt)
+
+@@ execute_one_tool_call PermissionRequest
++        allowed_tools=state.skill_allowed_tools,
+
+--- agent_code/permissions.py
++++ agent_code/permissions.py
+@@ PermissionRequest
++    allowed_tools: list[str] | None = None
+
+@@ decide_permission 开头
++    if request.allowed_tools is not None and tool_name not in request.allowed_tools:
++        return PermissionDecision(
++            "deny",
++            f"skill allowed_tools does not allow {tool_name}",
++        )

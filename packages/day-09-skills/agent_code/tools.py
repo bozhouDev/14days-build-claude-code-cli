@@ -62,6 +62,80 @@ def system_date(args: dict[str, Any], ctx: ToolContext) -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _render_todos(items: list[TodoItem]) -> str:
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    return "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
+
+
+def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """整表覆盖待办板。每次调用传来的 todos 就是新列表的全部。"""
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    items = [
+        TodoItem(
+            content=t.get("content", ""),
+            status=t.get("status", "pending"),
+            active_form=t.get("activeForm", ""),
+        )
+        for t in args.get("todos", [])
+    ]
+    state.todo_store = items                  # 整表覆盖
+
+    lines = [_render_todos(items), "", "Todos updated."]
+    # verification nudge：本次关掉 3+ 个任务、且整张表没有任何验证项 → 提醒先验证
+    completed = sum(1 for t in items if t.status == "completed")
+    kws = ("test", "pytest", "verify", "lint", "check")
+    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
+    if completed >= 3 and not has_verify:
+        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
+    return "\n".join(lines)
+
+
+def todo_read(args: dict[str, Any], ctx: ToolContext) -> str:
+    state = ctx.runtime_state
+    return _render_todos(state.todo_store) if state else "(no todos)"
+
+
+def skill_list(args: dict[str, Any], ctx: ToolContext) -> str:
+    """给模型看的 skill 目录；和 /skills 共用同一份 loader。"""
+    from .skills import SkillLoader
+
+    loader = SkillLoader(ctx.cwd)
+    return loader.render_list()
+
+
+def skill_load(args: dict[str, Any], ctx: ToolContext) -> str:
+    """按需加载 skill 正文。它只返回知识，不改变当前工具白名单。"""
+    from .skills import SkillLoader
+
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return "error: missing required argument 'name'"
+    skill = SkillLoader(ctx.cwd).load(name)
+    if skill is None:
+        return f"error: skill not found: {name}"
+    return skill.body
+
+
+def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    """模型主动请求进 plan 模式。"""
+    state = ctx.runtime_state
+    if state is None:
+        return "error: no runtime state"
+    state.permission_mode = "plan"
+    return (
+        "Plan mode on. Write tools are denied. Draft a clear plan, then present it "
+        "(or call exit_plan_mode(plan_summary)). The harness will ask the user to "
+        "approve before writes unlock."
+    )
+
+
+def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    """函数体很薄——渲染计划、等批准、翻模式都在 agent.py 的拦截块里做。"""
+    return "Plan approved. Write tools are now enabled."
+
+
 def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
     # 模型只给相对路径；fs_safety 把它锁回 cwd 内，探测二进制，再卡大小上限。
     path_str = args.get("path", "")
@@ -548,74 +622,6 @@ def _memory_recall(args: dict[str, Any], ctx: ToolContext) -> str:
     except Exception as exc:
         return f"error: {exc}"
 
-def _render_todos(items: list[TodoItem]) -> str:
-    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
-    return "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items) or "(no todos)"
-
-
-def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
-    """整表覆盖待办板。每次调用传来的 todos 就是新列表的全部。"""
-    state = ctx.runtime_state
-    if state is None:
-        return "error: no runtime state"
-    items = [
-        TodoItem(content=t.get("content", ""), status=t.get("status", "pending"),
-                 active_form=t.get("activeForm", ""))
-        for t in args.get("todos", [])
-    ]
-    state.todo_store = items                  # 整表覆盖
-
-    lines = [_render_todos(items), "", "Todos updated."]
-    # verification nudge：本次关掉 3+ 个任务、且整张表没有任何验证项 → 提醒先验证
-    completed = sum(1 for t in items if t.status == "completed")
-    kws = ("test", "pytest", "verify", "lint", "check")
-    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
-    if completed >= 3 and not has_verify:
-        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
-    return "\n".join(lines)
-
-
-def todo_read(args: dict[str, Any], ctx: ToolContext) -> str:
-    state = ctx.runtime_state
-    return _render_todos(state.todo_store) if state else "(no todos)"
-
-
-def skill_list(args: dict[str, Any], ctx: ToolContext) -> str:
-    """给模型看的 skill 目录；和 /skills 共用同一份 loader。"""
-    from .skills import SkillLoader
-
-    loader = SkillLoader(ctx.cwd)
-    return loader.render_list()
-
-
-def skill_load(args: dict[str, Any], ctx: ToolContext) -> str:
-    """按需加载 skill 正文。它只返回知识，不改变当前工具白名单。"""
-    from .skills import SkillLoader
-
-    name = str(args.get("name", "")).strip()
-    if not name:
-        return "error: missing required argument 'name'"
-    skill = SkillLoader(ctx.cwd).load(name)
-    if skill is None:
-        return f"error: skill not found: {name}"
-    return skill.body
-
-
-def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
-    """模型主动请求进 plan 模式。"""
-    state = ctx.runtime_state
-    if state is None:
-        return "error: no runtime state"
-    state.permission_mode = "plan"
-    return ("Plan mode on. Draft a plan—write tools are denied. "
-            "Call exit_plan_mode(plan_summary) when the plan is ready for review.")
-
-
-def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
-    """函数体很薄——渲染计划、等批准、翻模式都在 agent.py 的拦截块里做。"""
-    return "Plan approved. Write tools are now enabled."
-
-
 def default_tools() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -623,12 +629,12 @@ def default_tools() -> ToolRegistry:
             name="echo",
             description="Return the input text.",
             run=echo,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {"text": {"type": "string", "description": "Text to return."}},
                 "required": ["text"],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -636,10 +642,98 @@ def default_tools() -> ToolRegistry:
     )
     registry.register(
         Tool(
+            name="todo_write",
+            description=(
+                "Create and manage a structured task list. Use for multi-step tasks (3+ steps). "
+                "Keep exactly ONE item in_progress. Mark completed immediately when done. "
+                "The todos array is a FULL replacement—always send the entire list."
+            ),
+            run=todo_write,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Imperative task name."},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "activeForm": {"type": "string", "description": "Present-continuous form."},
+                            },
+                            "required": ["content", "status", "activeForm"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+            is_read_only=False,
+        )
+    )
+    registry.register(
+        Tool(
+            name="todo_read",
+            description="Read the current todo list.",
+            run=todo_read,
+            parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
+        )
+    )
+    registry.register(
+        Tool(
+            name="skill_list",
+            description="List available local skills with their descriptions.",
+            run=skill_list,
+            parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
+        )
+    )
+    registry.register(
+        Tool(
+            name="skill_load",
+            description="Load the full body of a local skill by name.",
+            run=skill_load,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name, e.g. debug-test."},
+                },
+                "required": ["name"],
+            },
+            is_read_only=True,
+        )
+    )
+    registry.register(
+        Tool(
+            name="enter_plan_mode",
+            description=(
+                "Enter plan mode: draft a plan before writing. Write tools are denied until approval. "
+                "Present the plan or call exit_plan_mode(plan_summary); the harness asks the user to approve."
+            ),
+            run=enter_plan_mode,
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+    )
+    registry.register(
+        Tool(
+            name="exit_plan_mode",
+            description=(
+                "Submit your plan for user approval. Use this when the plan is ready. "
+                "Write tools unlock only after the user approves."
+            ),
+            run=exit_plan_mode,
+            parameters={
+                "type": "object",
+                "properties": {"plan_summary": {"type": "string", "description": "The plan to review."}},
+                "required": ["plan_summary"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
             name="read_file",
             description="Read a text file inside the project. Path is relative to cwd.",
             run=read_file,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -647,6 +741,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": ["path"],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -654,7 +749,6 @@ def default_tools() -> ToolRegistry:
             name="list_files",
             description="List files and directories at a path inside cwd.",
             run=list_files,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -666,6 +760,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": [],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -673,7 +768,6 @@ def default_tools() -> ToolRegistry:
             name="glob",
             description="Find files by glob pattern, e.g. '**/*.py'.",
             run=glob,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -681,6 +775,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": ["pattern"],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -688,7 +783,6 @@ def default_tools() -> ToolRegistry:
             name="grep",
             description="Search file contents with a regular expression (ripgrep if available).",
             run=grep,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -707,6 +801,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": ["pattern"],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -714,7 +809,6 @@ def default_tools() -> ToolRegistry:
             name="project_tree",
             description="Show the project directory tree from cwd.",
             run=project_tree,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -726,6 +820,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": [],
             },
+            is_read_only=True,
         )
     )
     registry.register(
@@ -812,8 +907,8 @@ def default_tools() -> ToolRegistry:
             name="git_status",
             description="Run git status to see the current state of the working directory.",
             run=_git_status,
-            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
         )
     )
     registry.register(
@@ -821,8 +916,8 @@ def default_tools() -> ToolRegistry:
             name="git_diff",
             description="Run git diff to see unstaged changes in the working directory.",
             run=_git_diff,
-            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
         )
     )
     registry.register(
@@ -911,7 +1006,6 @@ def default_tools() -> ToolRegistry:
                 "Use when you need to recall facts about the user, project, or past decisions."
             ),
             run=_memory_recall,
-            is_read_only=True,
             parameters={
                 "type": "object",
                 "properties": {
@@ -924,6 +1018,7 @@ def default_tools() -> ToolRegistry:
                 },
                 "required": ["query"],
             },
+            is_read_only=True,
         )
     )
     from .cron_tools import cron_create, cron_list, cron_cancel
@@ -952,8 +1047,8 @@ def default_tools() -> ToolRegistry:
             name="cron_list",
             description="List all active cron jobs with their IDs, intervals, and last-run times.",
             run=cron_list,
-            is_read_only=True,
             parameters={"type": "object", "properties": {}, "required": []},
+            is_read_only=True,
         )
     )
     registry.register(
@@ -970,79 +1065,4 @@ def default_tools() -> ToolRegistry:
             },
         )
     )
-    registry.register(Tool(
-        name="todo_write",
-        description=(
-            "Create and manage a structured task list. Use for multi-step tasks (3+ steps). "
-            "Keep exactly ONE item in_progress. Mark completed immediately when done. "
-            "The todos array is a FULL replacement—always send the entire list."
-        ),
-        run=todo_write,
-        parameters={
-            "type": "object",
-            "properties": {
-                "todos": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string", "description": "Imperative task name."},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                            "activeForm": {"type": "string", "description": "Present-continuous form."},
-                        },
-                        "required": ["content", "status", "activeForm"],
-                    },
-                },
-            },
-            "required": ["todos"],
-        },
-        is_read_only=False,
-    ))
-    registry.register(Tool(
-        name="todo_read",
-        description="Read the current todo list.",
-        run=todo_read,
-        parameters={"type": "object", "properties": {}, "required": []},
-        is_read_only=True,
-    ))
-    registry.register(
-        Tool(
-            name="skill_list",
-            description="List available local skills with their descriptions.",
-            run=skill_list,
-            parameters={"type": "object", "properties": {}, "required": []},
-            is_read_only=True,
-        )
-    )
-    registry.register(
-        Tool(
-            name="skill_load",
-            description="Load the full body of a local skill by name.",
-            run=skill_load,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Skill name, e.g. debug-test."},
-                },
-                "required": ["name"],
-            },
-            is_read_only=True,
-        )
-    )
-    registry.register(Tool(
-        name="enter_plan_mode",
-        description="Enter plan mode: draft a plan before writing. Write tools are denied until you exit.",
-        run=enter_plan_mode,
-        parameters={"type": "object", "properties": {}, "required": []},
-    ))
-    registry.register(Tool(
-        name="exit_plan_mode",
-        description="Submit your plan for user approval. Write tools unlock only after the user approves.",
-        run=exit_plan_mode,
-        parameters={
-            "type": "object",
-            "properties": {"plan_summary": {"type": "string", "description": "The plan to review."}},
-            "required": ["plan_summary"],
-        },
-    ))
     return registry

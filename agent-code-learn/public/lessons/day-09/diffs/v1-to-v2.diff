@@ -1,0 +1,80 @@
+--- agent_code/tools.py
++++ agent_code/tools.py
+@@ -todo_read 之后
++def skill_list(args: dict[str, Any], ctx: ToolContext) -> str:
++    """给模型看的 skill 目录；和 /skills 共用同一份 loader。"""
++    from .skills import SkillLoader
++
++    loader = SkillLoader(ctx.cwd)
++    return loader.render_list()
++
++
++def skill_load(args: dict[str, Any], ctx: ToolContext) -> str:
++    """按需加载 skill 正文。它只返回知识，不改变当前工具白名单。"""
++    from .skills import SkillLoader
++
++    name = str(args.get("name", "")).strip()
++    if not name:
++        return "error: missing required argument 'name'"
++    skill = SkillLoader(ctx.cwd).load(name)
++    if skill is None:
++        return f"error: skill not found: {name}"
++    return skill.body
+
+@@ default_tools() todo_read 后面
++    registry.register(
++        Tool(
++            name="skill_list",
++            description="List available local skills with their descriptions.",
++            run=skill_list,
++            parameters={"type": "object", "properties": {}, "required": []},
++            is_read_only=True,
++        )
++    )
++    registry.register(
++        Tool(
++            name="skill_load",
++            description="Load the full body of a local skill by name.",
++            run=skill_load,
++            parameters={
++                "type": "object",
++                "properties": {
++                    "name": {"type": "string", "description": "Skill name, e.g. debug-test."},
++                },
++                "required": ["name"],
++            },
++            is_read_only=True,
++        )
++    )
+
+--- agent_code/permissions.py
++++ agent_code/permissions.py
+@@ _READONLY_TOOLS
+     "cron_list", "todo_read",
++    "skill_list", "skill_load",
+ })
+
+--- agent_code/slash.py
++++ agent_code/slash.py
+@@ _cmd_skills 之后
++def _cmd_skill(args: list[str], ctx: SlashContext) -> SlashResult:
++    from .skills import SkillLoader
++
++    if not args:
++        return SlashResult(handled=True, message="用法: /skill <name> [任务]")
++
++    name = args[0]
++    task = " ".join(args[1:]).strip() or "按这个 skill 的流程完成当前任务。"
++    skill = SkillLoader(ctx.cwd).load(name)
++    if skill is None:
++        return SlashResult(handled=True, message=f"skill not found: {name}")
++
++    prompt = (
++        f"Use this skill for the next task.\n\n"
++        f"<skill name=\"{skill.name}\">\n{skill.body}\n</skill>\n\n"
++        f"Task: {task}"
++    )
++    return SlashResult(handled=True, should_query=True, prompt=prompt)
+
+@@ register
++register("skill", "用指定 skill 执行本轮任务", _cmd_skill)

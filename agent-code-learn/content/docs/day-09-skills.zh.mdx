@@ -1,0 +1,364 @@
+---
+title: "Day 9：Skills + 按需知识"
+description: "Day 8 把 agent-code 抬成了常驻交互运行时，但项目规则、调试流程、写作风格全塞进 AGENT.md 或 system prompt 迟早会把上下文挤满。今天做 Skills：知识放 .agent/skills/，启动时只告诉模型有哪些 skill，真正用到时再加载全文。"
+---
+
+Day 8 以后，`agent-code` 已经有常驻交互 shell、运行时状态、slash 控制面、todo、Plan Mode，还有一套能读写文件、跑命令、问人的工具。
+
+新的问题也跟着来了：项目规则、写作风格、调试流程、发布流程，全都塞进 `AGENT.md` 或 system prompt，迟早会把上下文挤满。
+
+今天做 Skills：把"可能会用到的知识"放在 `.agent/skills/`，启动时只告诉模型有哪些 skill，真正用到时再加载全文。
+
+跑完之后你会看到：
+
+- `/skills` 能列出本地可用 skill，但不消耗一次模型请求
+- 模型可以先调用 `skill_list`，再用 `skill_load("debug-test")` 读取完整内容
+- `/skill debug-test ...` 会把 skill 正文注入本轮任务，并在这一轮里收敛工具白名单
+- `/output-style use explanatory` 能临时切换回答风格，退出进程后不持久化
+
+代码约 620 行，新增代码约 360 行。今天分四个版本：v1 做 `SKILL.md` 约定和 `/skills`；v2 做 `skill_list` / `skill_load` 和 `/skill`；v3 把 `allowed_tools` 变成真正的工具边界；v4 加 output-styles，把"知识"和"回答风格"分开。
+
+---
+
+### Day 9 主视觉：Skills 的四条主线
+
+先看这张 Agent Logic Map。它不复述所有终端输出，只抓今天最容易写错的四个边界：skill 目录发现、按需加载、`/skill` 工具白名单生命周期、output-style 风格层。
+
+<AgentLogicMap mapPath="/lessons/day-09/logic-map.json" />
+
+---
+
+今天从 Day 8 的 `agent-code` 项目继续改。仓库里的 `packages/day-*` 是参考答案快照，不是让你每天新建一个目录。
+
+## 起手：今天的起点
+
+先放一个最小 skill，后面每一版都用它验证：
+
+```bash
+mkdir -p .agent/skills/debug-test
+cat > .agent/skills/debug-test/SKILL.md <<'EOF'
+---
+name: debug-test
+description: Debug failing Python tests by reading errors, inspecting related files, and proposing the smallest fix.
+allowed_tools: [read_file, grep]
+---
+
+# Debug Test
+
+Use this skill when a Python test fails.
+
+Work in this order:
+
+1. Read the failing test file.
+2. Search for the function, class, or fixture named in the failure.
+3. Explain the smallest likely fix before editing.
+4. Do not edit files unless the current task explicitly allows edits.
+EOF
+```
+
+为什么放在 `.agent/`？前几天 session、memory、history、cron 都已经归到这个运行目录里。Skills 也是 <Concept name="Harness">harness</Concept> 的本地能力，放一起方便清理和备份。
+
+`SKILL.md` 里有两层内容：frontmatter（`name`、`description`、`allowed_tools`）和 body（真正的工作流说明）。v1 只把 frontmatter 里的 `name` 和 `description` 注入 system prompt——启动时告诉模型"这里有一本叫 `debug-test` 的手册"，body 先留着不进上下文。
+
+---
+
+## v1：先只把 skill 当成目录约定
+
+这一步先解决两个问题：skill 坏了不能拖垮 CLI；system prompt 里只放 name + description，不放 body。
+
+### 1.1 新增 `agent_code/skills.py`
+
+新建 `SkillLoader`，手写 frontmatter parser，不引入 PyYAML。`allowed_tools` 先解析出来，v3 才变成权限边界：
+
+```python
+@dataclass(frozen=True)
+class SkillMeta:
+    name: str
+    description: str
+    allowed_tools: list[str] | None
+    body: str
+    path: Path
+
+
+class SkillLoader:
+    def render_available_skills(self) -> str:
+        skills = self.list()
+        if not skills:
+            return ""
+        lines = ["<available-skills>"]
+        lines.extend(f"- {skill.name}: {skill.description}" for skill in skills)
+        lines.append("</available-skills>")
+        return "\n".join(lines)
+```
+
+`SkillLoader.list()` 会把 body 也读进 `SkillMeta`——这是为了 v2 的 `skill_load` 复用同一个 loader。v1 的边界不在"读不读 body"，而在"只把 `name` + `description` 注入 system prompt"。
+
+### 1.2 把 skill 列表注入 system prompt
+
+打开 `agent_code/agent.py`，把 `build_system_prompt` 改成接收 `state: RuntimeState | None = None`，并在 memory 之后追加 skill 目录：
+
+```python
+def build_system_prompt(cwd: Path, state: RuntimeState | None = None) -> str:
+    from .skills import SkillLoader
+    ...
+    available_skills = SkillLoader(cwd).render_available_skills()
+    if available_skills:
+        # 这里只放 skill 目录卡片，不放正文；正文等 skill_load 或 /skill 再加载。
+        parts.append(available_skills)
+```
+
+`state` 现在还没用上。先把参数留出来，是为了 v4 的 output-style 不再改一次函数签名。
+
+### 1.3 新增 `/skills`
+
+在 `slash.py` 里加 `_cmd_skills`，本地读 `.agent/skills/`，渲染列表，不进入模型。
+
+跑一下：
+
+```bash
+$ uv run agent-code "/skills"
+debug-test  Debug failing Python tests by reading errors, inspecting related files, and proposing the smallest fix.
+```
+
+v1 做到了"发现 skill"，但模型还拿不到 skill 正文。现在它只知道 `debug-test` 的一句描述，不知道里面的四步调试流程。
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v1-skill-loader.diff"
+  title="v1 阶段：SkillLoader + available-skills 目录卡片 + /skills"
+  description="新增 skills.py；build_system_prompt 只注入 name + description；/skills 本地列出 skill，不消耗模型请求。"
+/>
+
+---
+
+## v2：用到时再加载全文
+
+如果把所有 skill body 都放进 system prompt，上下文会被常驻知识挤掉。所以 v2 加两个只读工具：`skill_list()` 和 `skill_load(name)`。它们都只是读知识，不改变工具权限。
+
+### 2.1 在 `tools.py` 里加两个工具函数
+
+```python
+def skill_load(args: dict[str, Any], ctx: ToolContext) -> str:
+    """按需加载 skill 正文。它只返回知识，不改变当前工具白名单。"""
+    from .skills import SkillLoader
+
+    name = str(args.get("name", "")).strip()
+    skill = SkillLoader(ctx.cwd).load(name)
+    if skill is None:
+        return f"error: skill not found: {name}"
+    return skill.body
+```
+
+在 `permissions.py` 的 `_READONLY_TOOLS` 里加上 `skill_list` 和 `skill_load`。
+
+### 2.2 `/skill` 把正文注入本轮任务
+
+有时候你已经知道这轮就要用 `debug-test`，应该能直接输入 `/skill debug-test 请检查 tests/test_smoke.py`：
+
+```python
+def _cmd_skill(args: list[str], ctx: SlashContext) -> SlashResult:
+    ...
+    prompt = (
+        f"Use this skill for the next task.\n\n"
+        f"<skill name=\"{skill.name}\">\n{skill.body}\n</skill>\n\n"
+        f"Task: {task}"
+    )
+    return SlashResult(handled=True, should_query=True, prompt=prompt)
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code --max-steps 4 "先调用 skill_list，再调用 skill_load 读取 debug-test，最后用一句话说明这个 skill 的第一步是什么"
+tool_call: skill_list {}
+tool_call: skill_load {'name': 'debug-test'}
+final: debug-test 的第一步是先读取失败的测试文件，确认失败发生在哪里。
+```
+
+关键是看到 `skill_list`、`skill_load` 两个 <Concept name="Tool Call">tool_use</Concept>，而不是一开始就把整份 `SKILL.md` 放进 system prompt。`skill_load` 和 `/skill` 已经分开了：前者是模型翻手册，后者是用户指定这一轮按某份手册做事。
+
+v2 还缺一块：`SKILL.md` 里的 `allowed_tools` 现在只是文字，没有真的拦工具。
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v1-to-v2.diff"
+  title="v2 阶段：skill_list / skill_load + /skill 注入正文"
+  description="两个只读工具让模型按需翻手册；/skill 把 body 拼进本轮 prompt。allowed_tools 尚未生效。"
+/>
+
+---
+
+## v3：`allowed_tools` 不能只写在纸上
+
+`debug-test` 的 frontmatter 写了 `allowed_tools: [read_file, grep]`。如果 harness 不执行它，这行只是提醒模型"最好别乱用工具"。但权限不能靠提醒。
+
+v3 做两层保护：给模型的工具列表先过滤；权限层再兜底 deny。白名单跟着 `AgentJob` 进 worker，跑完在 `finally` 里恢复——只活一轮，不会泄漏到后面的普通对话。
+
+### 3.1 `RuntimeState` 加本轮 skill 白名单
+
+```python
+    skill_allowed_tools: list[str] | None = None   # /skill 本轮任务的临时工具面
+    output_style: str | None = None                # v4 才用，先占位
+```
+
+### 3.2 `AgentJob` 携带白名单
+
+Day 8 的 `job_queue` 里放的是纯字符串。`/skill` 这一轮还要带上 `allowed_tools`，所以队列项升级成 dataclass：
+
+```python
+@dataclass
+class AgentJob:
+    prompt: str
+    allowed_tools: list[str] | None = None
+```
+
+worker 取到 job 后：保存旧白名单 → 设 `state.skill_allowed_tools` → 跑 `run_turn` → `finally` 恢复。
+
+### 3.3 工具列表先过滤 + 权限层兜底
+
+```python
+    def filtered(self, allowed_names: list[str] | None) -> "ToolRegistry":
+        """给模型看的工具面。None 表示不收敛，[] 表示不给任何工具。"""
+        ...
+```
+
+Agent Loop 里：
+
+```python
+        visible_tools = tools.filtered(state.skill_allowed_tools)
+        response = provider.complete(messages, tools=visible_tools.list(), system=system_prompt)
+```
+
+权限层：
+
+```python
+    if request.allowed_tools is not None and tool_name not in request.allowed_tools:
+        return PermissionDecision("deny", f"skill allowed_tools does not allow {tool_name}")
+```
+
+跑一下：
+
+```bash
+$ uv run agent-code --max-steps 6 "/skill debug-test 请先读 tests/test_smoke.py，然后不要修改文件，只说明最可疑的失败点"
+tool_call: read_file {'path': 'tests/test_smoke.py'}
+tool_call: grep {'pattern': 'def run_agent', 'path': 'agent_code/agent.py'}
+...
+```
+
+这一段要看的不是 `final`，而是这一轮**每个 `tool_call` 都是 `read_file` 或 `grep`**——没有 `file_edit`、`bash`。这就是双保险：工具池过滤让模型看不见越界工具；权限兜底让漏网的也执行不了。
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v2-to-v3.diff"
+  title="v3 阶段：AgentJob + filtered 工具面 + PermissionRequest 兜底"
+  description="allowed_tools 跟着 job 走，worker finally 恢复；visible_tools 过滤 schema；decide_permission deny 越界调用。"
+/>
+
+---
+
+## v4：回答风格不要混进 skill
+
+Skills 放的是领域知识和工作流；output-style 管回答方式。v4 把风格文件放到 `.agent/output-styles/<name>.md`，通过 `/output-style` 切换，每轮 rebuild system prompt 时在最后追加 `<output-style>`。
+
+### 4.1 system prompt 最终顺序
+
+```txt
+core prompt → AGENT.md → <project-memory> → <available-skills> → <output-style>
+```
+
+style 放最后，是因为它管"怎么说"，不能覆盖项目规则和权限边界。
+
+### 4.2 新增 `/output-style`
+
+```python
+def _cmd_output_style(args: list[str], ctx: SlashContext) -> SlashResult:
+    ...
+    if subcommand == "use":
+        ctx.state.output_style = name
+        return SlashResult(handled=True, message=f"output style -> {name}")
+```
+
+状态栏也会显示 `style:explanatory`——这是 prompt_toolkit 底部工具栏的视觉状态，不是普通 stdout 一行。退出进程再进来会恢复默认。
+
+跑一下：
+
+```bash
+$ uv run agent-code
+> /output-style use explanatory
+output style -> explanatory
+> 解释 skill_load 和 /skill 的区别，短一点
+final: `skill_load` 是模型读取知识；`/skill` 是用户指定本轮任务按某份 skill 执行。前者不改工具面，后者会把 `allowed_tools` 绑定到这一轮。
+```
+
+<DiffCard
+  diffPath="/lessons/day-09/diffs/v3-to-final.diff"
+  title="v4 阶段：output-style 风格层 + /output-style + 状态栏"
+  description="Skills 管任务知识，output-style 管回答方式；build_system_prompt 每轮重建，style 追加在最后。"
+/>
+
+---
+
+### 终端 Replay 演示
+
+下面是 `skill_list` → `skill_load` 按需加载主线的终端动画。注意它展示的是模型主动翻手册，不是 `/skill` 注入正文那条路径。
+
+<TerminalReplay tracePath="/lessons/day-09/traces/skill-load.json" />
+
+---
+
+## 今天有了什么
+
+- **Skill 发现**：启动时只把 `name + description` 放进 prompt，让模型知道有哪些知识可用。
+- **按需加载**：`skill_load` 让模型在需要时读取正文，避免所有工作流常驻上下文。
+- **任务契约**：`/skill <name>` 表示本轮明确使用某份 skill，不只是翻手册。
+- **工具面收敛**：`allowed_tools` 同时作用在工具池和权限层，白名单只活一轮。
+- **风格层**：output-style 管回答方式，不和任务知识混在一起。
+
+---
+
+## 常见问题
+
+**`/skills` 显示 `(no skills found)`**
+
+先确认你在项目根目录运行 `uv run agent-code`。Skills 目录是相对 `cwd` 查的：`.agent/skills/<name>/SKILL.md`。如果你用了 `--cwd`，skill 也要放在那个目录下面。
+
+**`skill_load` 找不到 `debug-test`**
+
+检查 `SKILL.md` 的 frontmatter 里有没有 `name: debug-test`。目录名和 skill name 最好一致，但真正用于查找的是 frontmatter 里的 `name`。
+
+**`/skill debug-test` 后普通对话也只能读文件**
+
+这说明 `interactive.py` 没有在 `finally` 里恢复 `state.skill_allowed_tools`。回到 v3 的 `worker_loop()`，确认 `finally: state.skill_allowed_tools = old_allowed_tools` 存在。
+
+**`/output-style use explanatory` 后回答没变化**
+
+先确认交互模式里的 `run_turn()` 每轮都重新调用了 `system_prompt = build_system_prompt(resolved_cwd, state)`。如果 system prompt 仍然是在 CLI 启动时只拼一次，style 状态改了，模型也看不到。
+
+---
+
+## 课后挑战
+
+1. **多行 frontmatter**：把 `allowed_tools` 支持成 YAML 多行数组，而不只是一行 `[read_file, grep]`。
+2. **skill 示例库**：写三个本地 skill：`debug-test`、`write-docs`、`review-diff`，比较它们的 `allowed_tools` 应该怎么收敛。
+3. **output-style 持久化**：把当前 style 写进 `.agent/settings.json`，下次启动自动恢复。
+4. **skill body 附件**：允许 `SKILL.md` 引用同目录下的 `examples/*.md`，`skill_load` 时一起读取。
+5. **坏 skill 诊断**：给 `/skills` 增加 `--verbose`，列出被跳过的文件和原因。
+
+---
+
+## 思考题
+
+1. **为什么 description 可以常驻 prompt，body 不应该常驻？** 提示：想想一个项目里有 20 个 skill 时，哪部分是"目录"，哪部分是"正文"。
+
+2. **`skill_load` 为什么不改变 `RuntimeState.skill_allowed_tools`？** 提示：翻手册和接一单任务不是同一个动作。
+
+3. **工具白名单应该只做工具池过滤，还是只做权限判断？** 提示：分别考虑"模型看不见工具"和"模型仍然发出越界调用"两种情况。
+
+4. **`/skill` 的白名单为什么要跟着 `AgentJob` 进 worker？** 提示：Day 8 以后，主线程和 worker 线程可能同时活着。
+
+---
+
+## 下一天
+
+今天把"按需知识"接进了单 Agent CLI。
+
+但有些任务不只是需要一份知识，而是需要隔离一条新的执行线：比如让一个 review agent 只读 diff，让一个 docs agent 只写文档，让一个 test agent 专心跑验证。
+
+Day 10 做 Subagents：把 skill 里的工具白名单、prompt 注入和一轮生命周期，升级成可以启动子 Agent 的 harness 边界。

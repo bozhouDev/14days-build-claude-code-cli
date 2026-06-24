@@ -1,0 +1,11 @@
+{
+  "command": "uv run agent-code --max-steps 4 \"Call skill_list first, then skill_load debug-test, and in one sentence say what step one of that skill is\"",
+  "outputFrames": [
+    { "time": 100, "text": "Agent Code\r\n" },
+    { "time": 300, "text": "cwd: /Users/xc/my/agent-code\r\n" },
+    { "time": 500, "text": "provider: anthropic  model: deepseek-v4-pro\r\n\r\n" },
+    { "time": 1200, "text": "\u001b[33mtool_call\u001b[0m: skill_list {}\r\n" },
+    { "time": 2400, "text": "\u001b[33mtool_call\u001b[0m: skill_load {'name': 'debug-test'}\r\n" },
+    { "time": 4200, "text": "\u001b[32mfinal\u001b[0m: Step one of debug-test is to read the failing test file and locate where the failure happens.\r\n" }
+  ]
+}

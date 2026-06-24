@@ -63,7 +63,7 @@ export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 | 13 | Worktree + Final Demo | worktree 隔离、端到端代码任务 |
 | 14 | MCP + ToolSearch | MCP 客户端、工具发现、工具扩展 |
 
-当前仓库已经包含前 8 天的教程和参考快照。后续内容会继续在同一条路线里补齐。
+当前仓库已经包含前 9 天的教程和参考快照。后续内容会继续在同一条路线里补齐。
 
 ## 怎么开始
 

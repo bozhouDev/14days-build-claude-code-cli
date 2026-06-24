@@ -189,11 +189,19 @@ function LogicNode({ data }: NodeProps<LogicFlowNode>) {
   );
 }
 
+function edgeEndpoints(edge: LogicMapEdge, index: number) {
+  const source = edge.source ?? (edge as { from?: string }).from ?? '';
+  const target = edge.target ?? (edge as { to?: string }).to ?? '';
+  const id = edge.id || `${source}-${target}-${index}`;
+  return { id, source, target };
+}
+
 function activeEdges(edges: LogicMapEdge[], activeNodeId: string): Set<string> {
   const out = new Set<string>();
-  edges.forEach((edge) => {
-    if (edge.source === activeNodeId || edge.target === activeNodeId) {
-      out.add(edge.id);
+  edges.forEach((edge, index) => {
+    const { id, source, target } = edgeEndpoints(edge, index);
+    if (source === activeNodeId || target === activeNodeId) {
+      out.add(id);
     }
   });
   return out;
@@ -265,13 +273,16 @@ export default function AgentLogicMap({ mapPath }: AgentLogicMapProps) {
 
   const edges = useMemo<LogicFlowEdge[]>(() => {
     if (!diagram) return [];
-    return diagram.edges.map((edge) => {
-      const isHot = hotEdges.has(edge.id);
+    return diagram.edges.map((edge, index) => {
+      const source = edge.source ?? (edge as { from?: string }).from ?? '';
+      const target = edge.target ?? (edge as { to?: string }).to ?? '';
+      const edgeId = edge.id || `${source}-${target}-${index}`;
+      const isHot = hotEdges.has(edgeId);
       const color = isHot ? 'var(--ntn-primary)' : 'var(--ntn-hairline-strong)';
       return {
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
+        id: edgeId,
+        source,
+        target,
         sourceHandle: isCompact
           ? edge.mobileSourceHandle ?? edge.sourceHandle ?? 'source-right'
           : edge.sourceHandle ?? 'source-right',

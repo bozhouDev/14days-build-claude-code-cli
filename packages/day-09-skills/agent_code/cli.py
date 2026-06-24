@@ -12,7 +12,7 @@ from .session import Session
 from .slash import SlashContext, dispatch_slash
 from .runtime import RuntimeState
 
-console = Console()
+console = Console(no_color=True)
 app = typer.Typer(add_completion=False)
 
 
@@ -120,7 +120,6 @@ def main_command(
         run_user_input(text)
         return
 
-    # 注释1：REPL 分支——命令后面没跟 prompt，走下面交互循环
     # Day 8 v1：交互式 shell（取代 Day 7 的 typer.prompt 输入线程循环）
     from .interactive import run_interactive_shell
 
@@ -148,7 +147,7 @@ def main_command(
             model=state.model,
             provider=state.provider,
             session_id=session.session_id if session else None,
-            state=state,                    # v2 新增
+            state=state,
         )
 
     console.print("输入 /help 查看命令，输入 /exit 退出。")
